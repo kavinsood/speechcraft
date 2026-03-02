@@ -247,69 +247,70 @@ class FileBackedRepository:
         source_file_ids: dict[str, str] = {}
         working_asset_ids: dict[str, str] = {}
 
-        for raw_line in jsonl_path.read_text().splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
+        with jsonl_path.open("r") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
 
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                skipped_count += 1
-                continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped_count += 1
+                    continue
 
-            if not isinstance(entry, dict):
-                skipped_count += 1
-                continue
+                if not isinstance(entry, dict):
+                    skipped_count += 1
+                    continue
 
-            audio_path = str(entry.get("audio", "")).strip()
-            transcript_text = str(entry.get("text", "")).strip()
-            if not audio_path or not transcript_text:
-                skipped_count += 1
-                continue
+                audio_path = str(entry.get("audio", "")).strip()
+                transcript_text = str(entry.get("text", "")).strip()
+                if not audio_path or not transcript_text:
+                    skipped_count += 1
+                    continue
 
-            parsed_duration = self._parse_duration(entry.get("duration"))
-            sample_rate, channels, file_duration = self._read_wave_metadata(audio_path)
-            duration_seconds = parsed_duration if parsed_duration is not None else file_duration
-            if duration_seconds is None or duration_seconds <= 0:
-                skipped_count += 1
-                continue
+                parsed_duration = self._parse_duration(entry.get("duration"))
+                sample_rate, channels, file_duration = self._read_wave_metadata(audio_path)
+                duration_seconds = parsed_duration if parsed_duration is not None else file_duration
+                if duration_seconds is None or duration_seconds <= 0:
+                    skipped_count += 1
+                    continue
 
-            if audio_path not in source_file_ids:
-                source_file_ids[audio_path] = f"src-{len(source_file_ids) + 1:04d}"
-                working_asset_ids[audio_path] = f"asset-{len(working_asset_ids) + 1:04d}"
+                if audio_path not in source_file_ids:
+                    source_file_ids[audio_path] = f"src-{len(source_file_ids) + 1:04d}"
+                    working_asset_ids[audio_path] = f"asset-{len(working_asset_ids) + 1:04d}"
 
-            clip = Clip(
-                id=f"clip-{uuid4().hex[:8]}",
-                project_id=project_id,
-                order_index=(imported_count + 1) * 10,
-                source_file_id=source_file_ids[audio_path],
-                working_asset_id=working_asset_ids[audio_path],
-                original_start_time=0.0,
-                original_end_time=round(duration_seconds, 2),
-                clip_edl=[],
-                review_status=ReviewStatus.CANDIDATE,
-                edit_state=EditState.CLEAN,
-                speaker_name=payload.speaker_name.strip() or "speaker_a",
-                language=payload.language.strip() or "en",
-                transcript=Transcript(
-                    text_current=transcript_text,
-                    text_initial=transcript_text,
-                    source="import",
-                    confidence=None,
-                ),
-                tags=[ClipTag(name="candidate", color="#8a7a3d")],
-                duration_seconds=round(duration_seconds, 2),
-                sample_rate=sample_rate,
-                channels=channels,
-            )
-            self.clips_by_project[project_id].append(clip)
-            self.commits_by_clip[clip.id] = []
-            self.history_by_clip[clip.id] = ClipHistoryState(
-                cursor=0,
-                snapshots=[self._snapshot_from_clip(clip)],
-            )
-            imported_count += 1
+                clip = Clip(
+                    id=f"clip-{uuid4().hex[:8]}",
+                    project_id=project_id,
+                    order_index=(imported_count + 1) * 10,
+                    source_file_id=source_file_ids[audio_path],
+                    working_asset_id=working_asset_ids[audio_path],
+                    original_start_time=0.0,
+                    original_end_time=round(duration_seconds, 2),
+                    clip_edl=[],
+                    review_status=ReviewStatus.CANDIDATE,
+                    edit_state=EditState.CLEAN,
+                    speaker_name=payload.speaker_name.strip() or "speaker_a",
+                    language=payload.language.strip() or "en",
+                    transcript=Transcript(
+                        text_current=transcript_text,
+                        text_initial=transcript_text,
+                        source="import",
+                        confidence=None,
+                    ),
+                    tags=[ClipTag(name="candidate", color="#8a7a3d")],
+                    duration_seconds=round(duration_seconds, 2),
+                    sample_rate=sample_rate,
+                    channels=channels,
+                )
+                self.clips_by_project[project_id].append(clip)
+                self.commits_by_clip[clip.id] = []
+                self.history_by_clip[clip.id] = ClipHistoryState(
+                    cursor=0,
+                    snapshots=[self._snapshot_from_clip(clip)],
+                )
+                imported_count += 1
 
         if imported_count == 0:
             del self.projects[project_id]
