@@ -797,11 +797,6 @@ export default function App() {
     setDragMode(null);
   }
 
-  function handleScrubberChange(value: number) {
-    pausePlayback();
-    setAudioCurrentTime(value);
-  }
-
   function handleZoomChange(nextZoom: number) {
     const safeZoom = Math.max(minWaveformZoom, Math.min(nextZoom, maxWaveformZoom));
     if (!activeClip) {
@@ -820,11 +815,6 @@ export default function App() {
 
     setWaveformZoom(safeZoom);
     setViewportStartRatio(Number(centeredStart.toFixed(4)));
-  }
-
-  function handleViewportScroll(nextRatio: number) {
-    const maxStartRatio = Math.max(1 - visibleWindowRatio, 0);
-    setViewportStartRatio(Math.max(0, Math.min(nextRatio, maxStartRatio)));
   }
 
   async function handleTogglePlayback() {
@@ -945,10 +935,6 @@ export default function App() {
       : 0;
   const normalizedSelectionStart = Math.min(selectionStart, selectionEnd);
   const normalizedSelectionEnd = Math.max(selectionStart, selectionEnd);
-  const selectionDuration = Math.max(
-    Number((normalizedSelectionEnd - normalizedSelectionStart).toFixed(2)),
-    0,
-  );
   const visibleSelectionStart = Math.max(normalizedSelectionStart, visibleStartSeconds);
   const visibleSelectionEnd = Math.min(normalizedSelectionEnd, visibleEndSeconds);
   const visibleSelectionDuration = Math.max(visibleSelectionEnd - visibleSelectionStart, 0);
@@ -1228,66 +1214,6 @@ export default function App() {
                       Reset Zoom
                     </button>
                   </div>
-                  <label>
-                    Scroll Window
-                    <input
-                      type="range"
-                      min={0}
-                      max={Math.max(1 - visibleWindowRatio, 0)}
-                      step={0.001}
-                      value={visibleStartRatio}
-                      disabled={waveformZoom === 1}
-                      onChange={(event) => handleViewportScroll(Number(event.target.value))}
-                    />
-                  </label>
-                </div>
-
-                <div className="scrubber-panel">
-                  <div className="selection-header">
-                    <strong>Playhead</strong>
-                    <span>{formatSeconds(playheadSeconds)}</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={activeClip.duration_seconds}
-                    step={0.01}
-                    value={playheadSeconds}
-                    onChange={(event) => handleScrubberChange(Number(event.target.value))}
-                  />
-                </div>
-
-                <div className="selection-panel">
-                  <div className="selection-header">
-                    <strong>Selection</strong>
-                    <span>
-                      {formatSeconds(normalizedSelectionStart)} to{" "}
-                      {formatSeconds(normalizedSelectionEnd)} (
-                      {formatSeconds(selectionDuration)})
-                    </span>
-                  </div>
-                  <label>
-                    Start
-                    <input
-                      type="range"
-                      min={0}
-                      max={activeClip.duration_seconds}
-                      step={0.01}
-                      value={selectionStart}
-                      onChange={(event) => setSelectionStart(Number(event.target.value))}
-                    />
-                  </label>
-                  <label>
-                    End
-                    <input
-                      type="range"
-                      min={0}
-                      max={activeClip.duration_seconds}
-                      step={0.01}
-                      value={selectionEnd}
-                      onChange={(event) => setSelectionEnd(Number(event.target.value))}
-                    />
-                  </label>
                 </div>
 
                 <div className="editor-actions">
