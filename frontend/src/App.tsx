@@ -53,9 +53,6 @@ const statusLabels: Record<ReviewStatus, string> = {
   rejected: "Rejected",
 };
 
-const minWaveformZoom = 1;
-const maxWaveformZoom = 4;
-
 type HistoryFlags = {
   can_undo: boolean;
   can_redo: boolean;
@@ -194,8 +191,6 @@ export default function App() {
   const [selectionEnd, setSelectionEnd] = useState(0);
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [waveformZoom, setWaveformZoom] = useState(1);
-  const [viewportStartRatio, setViewportStartRatio] = useState(0);
   const [waveformPeaks, setWaveformPeaks] = useState<WaveformPeaks | null>(null);
   const [isWaveformLoading, setIsWaveformLoading] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
@@ -270,8 +265,6 @@ export default function App() {
     setSelectionEnd(Number(activeClip.duration_seconds.toFixed(2)));
     setPlayheadSeconds(0);
     setIsPlaying(false);
-    setWaveformZoom(1);
-    setViewportStartRatio(0);
   }, [activeClip?.id]);
 
   useEffect(() => {
@@ -283,7 +276,7 @@ export default function App() {
     let cancelled = false;
     setIsWaveformLoading(true);
 
-    const requestedBins = Math.max(160, Math.min(512, Math.round(160 * waveformZoom)));
+    const requestedBins = 320;
 
     void fetchWaveformPeaks(activeClip.id, requestedBins).then((peaks) => {
       if (cancelled) {
@@ -297,31 +290,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeClip?.id, waveformZoom]);
-
-  useEffect(() => {
-    if (!activeClip) {
-      return;
-    }
-
-    const visibleWindowRatio = 1 / waveformZoom;
-    const maxStartRatio = Math.max(1 - visibleWindowRatio, 0);
-    const normalizedPlayhead =
-      activeClip.duration_seconds > 0 ? playheadSeconds / activeClip.duration_seconds : 0;
-
-    if (viewportStartRatio > maxStartRatio) {
-      setViewportStartRatio(maxStartRatio);
-      return;
-    }
-
-    if (normalizedPlayhead < viewportStartRatio || normalizedPlayhead > viewportStartRatio + visibleWindowRatio) {
-      const centeredStart = Math.max(
-        0,
-        Math.min(normalizedPlayhead - visibleWindowRatio / 2, maxStartRatio),
-      );
-      setViewportStartRatio(Number(centeredStart.toFixed(4)));
-    }
-  }, [activeClip, playheadSeconds, viewportStartRatio, waveformZoom]);
+  }, [activeClip?.id]);
 
   useEffect(() => {
     if (!activeClip) {
@@ -797,26 +766,6 @@ export default function App() {
     setDragMode(null);
   }
 
-  function handleZoomChange(nextZoom: number) {
-    const safeZoom = Math.max(minWaveformZoom, Math.min(nextZoom, maxWaveformZoom));
-    if (!activeClip) {
-      setWaveformZoom(safeZoom);
-      return;
-    }
-
-    const currentCenterRatio =
-      activeClip.duration_seconds > 0 ? playheadSeconds / activeClip.duration_seconds : 0;
-    const nextWindowRatio = 1 / safeZoom;
-    const maxStartRatio = Math.max(1 - nextWindowRatio, 0);
-    const centeredStart = Math.max(
-      0,
-      Math.min(currentCenterRatio - nextWindowRatio / 2, maxStartRatio),
-    );
-
-    setWaveformZoom(safeZoom);
-    setViewportStartRatio(Number(centeredStart.toFixed(4)));
-  }
-
   async function handleTogglePlayback() {
     if (!activeClip || !audioRef.current) {
       return;
@@ -920,11 +869,8 @@ export default function App() {
   const activeHistory = activeClip
     ? historyByClip[activeClip.id] ?? { can_undo: false, can_redo: false }
     : { can_undo: false, can_redo: false };
-  const visibleWindowRatio = 1 / waveformZoom;
-  const visibleStartRatio = Math.max(
-    0,
-    Math.min(viewportStartRatio, Math.max(1 - visibleWindowRatio, 0)),
-  );
+  const visibleWindowRatio = 1;
+  const visibleStartRatio = 0;
   const visibleStartSeconds =
     activeClip && activeClip.duration_seconds > 0
       ? activeClip.duration_seconds * visibleStartRatio
@@ -1188,32 +1134,6 @@ export default function App() {
                   <span>{formatSeconds(activeClip.original_start_time + visibleStartSeconds)}</span>
                   <span>Visible Window</span>
                   <span>{formatSeconds(activeClip.original_start_time + visibleEndSeconds)}</span>
-                </div>
-
-                <div className="waveform-toolbar">
-                  <div className="editor-actions">
-                    <button
-                      type="button"
-                      onClick={() => handleZoomChange(waveformZoom - 1)}
-                      disabled={waveformZoom <= minWaveformZoom}
-                    >
-                      Zoom Out
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleZoomChange(waveformZoom + 1)}
-                      disabled={waveformZoom >= maxWaveformZoom}
-                    >
-                      Zoom In
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleZoomChange(1)}
-                      disabled={waveformZoom === 1}
-                    >
-                      Reset Zoom
-                    </button>
-                  </div>
                 </div>
 
                 <div className="editor-actions">

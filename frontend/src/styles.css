@@ -111,6 +111,10 @@ button:disabled {
   min-height: calc(100vh - 8rem);
 }
 
+.workspace-grid > * {
+  min-width: 0;
+}
+
 .panel {
   background: rgba(255, 252, 246, 0.82);
   border: 1px solid rgba(97, 91, 74, 0.12);
@@ -124,6 +128,10 @@ button:disabled {
   padding: 1rem;
 }
 
+.inspector-column {
+  overflow-x: auto;
+}
+
 .editor-column {
   display: grid;
   grid-template-rows: minmax(320px, 1fr) minmax(220px, auto);
@@ -133,6 +141,7 @@ button:disabled {
 .waveform-panel,
 .transcript-panel {
   padding: 1rem;
+  min-width: 0;
 }
 
 .panel-header {
@@ -300,6 +309,7 @@ button:disabled {
 
 .waveform-stage {
   position: relative;
+  width: 100%;
   min-height: 15rem;
   display: flex;
   align-items: flex-end;
@@ -385,7 +395,7 @@ button:disabled {
   z-index: 2;
   flex: 1;
   border-radius: 999px 999px 0 0;
-  min-width: 3px;
+  min-width: 0;
   background: linear-gradient(180deg, #78d2cd, #3c8d9f);
 }
 
