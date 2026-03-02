@@ -1,8 +1,9 @@
 .PHONY: help setup setup-backend setup-frontend bootstrap dev-backend dev-frontend check check-backend check-frontend backend-docs
 
 UV_CACHE_DIR ?= /tmp/uv-cache
-BACKEND_DIR := /home/kavin/github/speechcraft/backend
-FRONTEND_DIR := /home/kavin/github/speechcraft/frontend
+ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+BACKEND_DIR := $(ROOT_DIR)/backend
+FRONTEND_DIR := $(ROOT_DIR)/frontend
 
 help:
 	@printf "\nSpeechcraft commands:\n"
@@ -37,7 +38,7 @@ dev-frontend:
 check: check-backend check-frontend
 
 check-backend:
-	cd /home/kavin/github/speechcraft && python3 -m compileall backend/app
+	cd $(ROOT_DIR) && python3 -m compileall backend/app
 
 check-frontend:
 	cd $(FRONTEND_DIR) && npm run build

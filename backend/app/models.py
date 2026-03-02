@@ -109,6 +109,20 @@ class ProjectDetail(BaseModel):
     clips: list[Clip]
 
 
+class VoxCpmImportRequest(BaseModel):
+    jsonl_path: str
+    project_name: str | None = None
+    project_id: str | None = None
+    speaker_name: str = "speaker_a"
+    language: str = "en"
+
+
+class ProjectImportResult(BaseModel):
+    project_detail: ProjectDetail
+    imported_clip_count: int
+    skipped_line_count: int
+
+
 class ClipCommit(BaseModel):
     id: str
     clip_id: str
