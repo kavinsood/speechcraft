@@ -19,7 +19,9 @@ from .models import (
     ExportPreview,
     Project,
     ProjectDetail,
+    ProjectImportResult,
     WaveformPeaks,
+    VoxCpmImportRequest,
 )
 from .repository import repository
 
@@ -55,6 +57,16 @@ def get_project_detail(project_id: str) -> ProjectDetail:
         return repository.get_project_detail(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/import/voxcpm-jsonl", response_model=ProjectImportResult)
+def import_voxcpm_jsonl(payload: VoxCpmImportRequest) -> ProjectImportResult:
+    try:
+        return repository.import_voxcpm_jsonl(payload)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/projects/{project_id}/clips", response_model=list[Clip])
