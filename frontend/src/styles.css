@@ -218,6 +218,24 @@ button:disabled {
   padding-right: 0.1rem;
 }
 
+.clip-queue-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.55rem;
+}
+
+.clip-queue-tools .search-input {
+  flex: 1;
+  max-width: none;
+  min-width: 0;
+}
+
+.clip-queue-tools .tag-filter-bar {
+  flex: 1;
+  margin: 0;
+}
+
 .clip-list-item {
   width: 100%;
   border: 1px solid transparent;
@@ -412,6 +430,77 @@ button:disabled {
   border-radius: 1rem;
   background: rgba(244, 240, 231, 0.88);
   border: 1px solid rgba(97, 91, 74, 0.08);
+}
+
+.tag-filter-bar {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.35rem;
+  margin: 0.45rem 0 0.55rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 1rem;
+  background: rgba(244, 240, 231, 0.88);
+  border: 1px solid rgba(97, 91, 74, 0.08);
+}
+
+.tag-filter-trigger {
+  border: 1px solid rgba(59, 72, 78, 0.12);
+  background: rgba(252, 249, 241, 0.96);
+  color: #223036;
+  padding: 0.5rem 0.8rem;
+  border-radius: 0.8rem;
+}
+
+.tag-filter-current {
+  font-size: 0.82rem;
+  color: #51626a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag-filter-popover {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  top: calc(100% + 0.4rem);
+  padding: 0.85rem;
+  border-radius: 1rem;
+  background: rgba(255, 252, 246, 0.98);
+  border: 1px solid rgba(97, 91, 74, 0.2);
+  box-shadow: 0 18px 32px rgba(36, 50, 57, 0.18);
+  backdrop-filter: blur(8px);
+}
+
+.tag-filter-list {
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.tag-filter-list li {
+  margin: 0;
+}
+
+.tag-filter-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  text-align: left;
+  border: 1px solid rgba(59, 72, 78, 0.12);
+  background: rgba(252, 249, 241, 0.96);
+  color: #223036;
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.8rem;
+}
+
+.tag-filter-item.selected {
+  border-color: rgba(31, 95, 102, 0.4);
+  background: rgba(222, 238, 239, 0.95);
 }
 
 .scrubber-panel {

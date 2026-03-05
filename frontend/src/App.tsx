@@ -13,6 +13,7 @@ import {
   commitClip,
   fetchClipCommits,
   fetchExportPreview,
+  fetchProjects,
   fetchProjectDetail,
   fetchProjectExports,
   fetchWaveformPeaks,
@@ -52,6 +53,14 @@ const statusLabels: Record<ReviewStatus, string> = {
   accepted: "Accepted",
   rejected: "Rejected",
 };
+
+const defaultTagNames = [
+  "candidate",
+  "accepted",
+  "needs_attention",
+  "in_review",
+  "rejected",
+];
 
 type HistoryFlags = {
   can_undo: boolean;
@@ -148,14 +157,19 @@ function replaceClipInProject(detail: ProjectDetail, updatedClip: Clip): Project
 function clipMatchesFilters(
   clip: Clip,
   query: string,
-  tagFilter: string,
+  selectedFilterTags: string[],
   hideResolved: boolean,
 ): boolean {
   if (hideResolved && (clip.review_status === "accepted" || clip.review_status === "rejected")) {
     return false;
   }
 
-  if (tagFilter && !clip.tags.some((tag) => tag.name.toLowerCase().includes(tagFilter))) {
+  if (
+    selectedFilterTags.length > 0 &&
+    !selectedFilterTags.some((selectedTag) =>
+      clip.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
+    )
+  ) {
     return false;
   }
 
@@ -185,7 +199,9 @@ export default function App() {
   const [draftTranscript, setDraftTranscript] = useState("");
   const [draftTags, setDraftTags] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
-  const [tagFilter, setTagFilter] = useState("");
+  const [selectedFilterTags, setSelectedFilterTags] = useState<string[]>([]);
+  const [isTagFilterMenuOpen, setIsTagFilterMenuOpen] = useState(false);
+  const [newTagDraft, setNewTagDraft] = useState("");
   const [hideResolved, setHideResolved] = useState(false);
   const [selectionStart, setSelectionStart] = useState(0);
   const [selectionEnd, setSelectionEnd] = useState(0);
@@ -206,17 +222,31 @@ export default function App() {
     null,
   );
   const deferredSearch = useDeferredValue(searchQuery.trim().toLowerCase());
-  const deferredTagFilter = useDeferredValue(tagFilter.trim().toLowerCase());
   const waveformRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const tagFilterRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadWorkspace() {
+      const projects = await fetchProjects();
+      const urlProjectId = new URLSearchParams(window.location.search)
+        .get("project")
+        ?.trim();
+      const sortedProjects = [...projects].sort(
+        (left, right) =>
+          new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+      );
+      const fallbackProjectId = sortedProjects[0]?.id ?? "phase1-demo";
+      const selectedProjectId =
+        urlProjectId && projects.some((project) => project.id === urlProjectId)
+          ? urlProjectId
+          : fallbackProjectId;
+
       const [detail, exports] = await Promise.all([
-        fetchProjectDetail(),
-        fetchProjectExports(),
+        fetchProjectDetail(selectedProjectId),
+        fetchProjectExports(selectedProjectId),
       ]);
 
       if (cancelled) {
@@ -236,12 +266,43 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isTagFilterMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!tagFilterRef.current) {
+        return;
+      }
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        return;
+      }
+      if (!tagFilterRef.current.contains(target)) {
+        setIsTagFilterMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+    };
+  }, [isTagFilterMenuOpen]);
+
   const queueClips = useMemo(() => {
     const clips = projectDetail?.clips ?? [];
     return sortClipsForQueue(clips).filter((clip) =>
-      clipMatchesFilters(clip, deferredSearch, deferredTagFilter, hideResolved),
+      clipMatchesFilters(clip, deferredSearch, selectedFilterTags, hideResolved),
     );
-  }, [projectDetail?.clips, deferredSearch, deferredTagFilter, hideResolved]);
+  }, [projectDetail?.clips, deferredSearch, selectedFilterTags, hideResolved]);
+
+  const availableFilterTags = useMemo(() => {
+    const allClipTags = (projectDetail?.clips ?? []).flatMap((clip) =>
+      clip.tags.map((tag) => tag.name.toLowerCase()),
+    );
+    return Array.from(new Set([...defaultTagNames, ...allClipTags])).sort();
+  }, [projectDetail?.clips]);
 
   const activeClip = useMemo(() => {
     const allClips = projectDetail?.clips ?? [];
@@ -402,6 +463,43 @@ export default function App() {
       setActiveClipId(nextClipId);
       setEditorNotice(null);
     });
+  }
+
+  function toggleFilterTag(tagName: string) {
+    setSelectedFilterTags((current) =>
+      current.includes(tagName)
+        ? current.filter((entry) => entry !== tagName)
+        : [...current, tagName],
+    );
+  }
+
+  function addTagToDraft(tagName: string) {
+    const normalized = tagName.trim();
+    if (!normalized) {
+      return;
+    }
+    const currentTags = parseTagDraft(draftTags).map((tag) => tag.name);
+    if (currentTags.some((tag) => tag.toLowerCase() === normalized.toLowerCase())) {
+      return;
+    }
+    const nextTags = [...currentTags, normalized];
+    setDraftTags(nextTags.join(", "));
+  }
+
+  function removeTagFromDraft(tagName: string) {
+    const nextTags = parseTagDraft(draftTags)
+      .map((tag) => tag.name)
+      .filter((name) => name.toLowerCase() !== tagName.toLowerCase());
+    setDraftTags(nextTags.join(", "));
+  }
+
+  function handleAddCustomTag() {
+    const value = newTagDraft.trim();
+    if (!value) {
+      return;
+    }
+    addTagToDraft(value);
+    setNewTagDraft("");
   }
 
   function pausePlayback() {
@@ -968,11 +1066,7 @@ export default function App() {
 
       <main className="workspace-grid">
         <aside className="clip-queue panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Queue</p>
-              <h2>Clip Review</h2>
-            </div>
+          <div className="clip-queue-tools">
             <input
               aria-label="Search clips"
               className="search-input"
@@ -980,49 +1074,59 @@ export default function App() {
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
             />
-          </div>
-
-          <div className="stats-grid">
-            <div className="stat-card">
-              <span>Total</span>
-              <strong>{stats?.total_clips ?? 0}</strong>
-            </div>
-            <div className="stat-card">
-              <span>Accepted</span>
-              <strong>{stats?.accepted_clips ?? 0}</strong>
-            </div>
-            <div className="stat-card">
-              <span>Needs Attention</span>
-              <strong>{stats?.needs_attention_clips ?? 0}</strong>
-            </div>
-            <div className="stat-card">
-              <span>Visible</span>
-              <strong>{visibleQueueCount}</strong>
-            </div>
-          </div>
-
-          <div className="selection-panel">
-            <label>
-              Filter Tag
-              <input
-                className="search-input"
-                value={tagFilter}
-                onChange={(event) => setTagFilter(event.target.value)}
-                placeholder="Tag name"
-              />
-            </label>
-            <div className="editor-actions">
-              <button type="button" onClick={() => setHideResolved((current) => !current)}>
-                {hideResolved ? "Show Resolved" : "Hide Resolved"}
+            <div className="tag-filter-bar" ref={tagFilterRef}>
+              <button
+                type="button"
+                className="tag-filter-trigger"
+                onClick={() => setIsTagFilterMenuOpen((current) => !current)}
+              >
+                {selectedFilterTags.length > 0
+                  ? `Tags (${selectedFilterTags.length})`
+                  : "Filter Tags"}
               </button>
-              <button type="button" onClick={handleJumpToNextUnresolved}>
-                Next Unresolved
-              </button>
+              <div className="tag-filter-current">
+                {selectedFilterTags.length > 0 ? selectedFilterTags.join(", ") : "All tags"}
+              </div>
+              {isTagFilterMenuOpen ? (
+                <div className="tag-filter-popover">
+                  <div className="selection-header">
+                    <strong>Select Tags</strong>
+                    <button type="button" onClick={() => setIsTagFilterMenuOpen(false)}>
+                      Done
+                    </button>
+                  </div>
+                  <ul className="tag-filter-list">
+                    {availableFilterTags.map((tagName) => (
+                      <li key={`filter-${tagName}`}>
+                        <button
+                          type="button"
+                          className={`tag-filter-item ${selectedFilterTags.includes(tagName) ? "selected" : ""}`}
+                          onClick={() => toggleFilterTag(tagName)}
+                        >
+                          <span>{tagName}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="clip-list-meta">
+                    <span>
+                      {selectedFilterTags.length > 0
+                        ? `Filtering: ${selectedFilterTags.join(", ")}`
+                        : "No tag filter"}
+                    </span>
+                    {selectedFilterTags.length > 0 ? (
+                      <button type="button" onClick={() => setSelectedFilterTags([])}>
+                        Clear
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
 
           <div className="clip-list">
-            {queueClips.map((clip) => (
+            {queueClips.map((clip, index) => (
               <button
                 key={clip.id}
                 className={`clip-list-item ${clip.id === activeClip?.id ? "active" : ""}`}
@@ -1031,7 +1135,7 @@ export default function App() {
               >
                 <div className="clip-list-row">
                   <strong>
-                    <span className="order-pill">#{clip.order_index}</span> {clip.id}
+                    <span className="order-pill">{index + 1}.</span>
                   </strong>
                   <span className={`review-chip status-${clip.review_status}`}>
                     {statusLabels[clip.review_status]}
@@ -1052,7 +1156,7 @@ export default function App() {
             <div className="panel-header">
               <div>
                 <p className="eyebrow">Clip Editor</p>
-                <h2>{activeClip?.id ?? "No clip selected"}</h2>
+                <h2>{activeClip ? "Selected Clip" : "No clip selected"}</h2>
               </div>
               {activeClip ? (
                 <div className="metadata-strip">
@@ -1193,6 +1297,45 @@ export default function App() {
                   Save Tags
                 </button>
               </div>
+              <p className="muted-copy">
+                Export uses clip status (`accepted`) + commit state. Tags are for filtering/QA.
+              </p>
+              <div className="tag-list">
+                {parseTagDraft(draftTags).map((tag) => (
+                  <button
+                    key={`draft-${tag.name}`}
+                    type="button"
+                    className="tag-pill"
+                    style={{ backgroundColor: tag.color }}
+                    onClick={() => removeTagFromDraft(tag.name)}
+                    title="Remove tag"
+                  >
+                    {tag.name} ×
+                  </button>
+                ))}
+              </div>
+              <div className="editor-actions">
+                {defaultTagNames.map((tagName) => (
+                  <button
+                    key={`default-tag-${tagName}`}
+                    type="button"
+                    onClick={() => addTagToDraft(tagName)}
+                  >
+                    + {tagName}
+                  </button>
+                ))}
+              </div>
+              <div className="editor-actions">
+                <input
+                  className="search-input"
+                  value={newTagDraft}
+                  onChange={(event) => setNewTagDraft(event.target.value)}
+                  placeholder="Create custom tag"
+                />
+                <button type="button" onClick={handleAddCustomTag}>
+                  Add Tag
+                </button>
+              </div>
               <label>
                 Comma-separated tags
                 <input
@@ -1224,7 +1367,7 @@ export default function App() {
           <div className="panel-header">
             <div>
               <p className="eyebrow">Inspector</p>
-              <h2>Clip State</h2>
+              <h2>Clip Review</h2>
             </div>
           </div>
 
