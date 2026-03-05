@@ -5,6 +5,7 @@ import type {
   ClipMutationResult,
   ExportRun,
   ExportPreview,
+  Project,
   ProjectDetail,
   ReviewStatus,
   WaveformPeaks,
@@ -266,6 +267,14 @@ export async function redoClip(clipId: string): Promise<ClipHistoryResult | null
   }
 }
 
+export async function fetchProjects(): Promise<Project[]> {
+  try {
+    return await fetchProjectsStrict();
+  } catch {
+    return [fallbackProject.project];
+  }
+}
+
 export async function fetchProjectExports(projectId = "phase1-demo"): Promise<ExportRun[]> {
   try {
     return await fetchProjectExportsStrict(projectId);
@@ -301,6 +310,11 @@ export function buildClipAudioUrl(clipId: string): string {
 export async function fetchHealthStrict(): Promise<{ status: string }> {
   const response = await fetch(`${API_BASE}/healthz`);
   return await parseJson<{ status: string }>(response);
+}
+
+export async function fetchProjectsStrict(): Promise<Project[]> {
+  const response = await fetch(`${API_BASE}/api/projects`);
+  return await parseJson<Project[]>(response);
 }
 
 export async function fetchProjectDetailStrict(
