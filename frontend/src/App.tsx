@@ -5,8 +5,8 @@ import {
   useMemo,
   useRef,
   useState,
-  type PointerEvent as ReactPointerEvent,
 } from "react";
+import type WaveSurfer from "wavesurfer.js";
 import {
   appendClipEdlOperation,
   buildClipAudioUrl,
@@ -16,7 +16,6 @@ import {
   fetchProjects,
   fetchProjectDetail,
   fetchProjectExports,
-  fetchWaveformPeaks,
   mergeWithNextClip,
   redoClip,
   runProjectExport,
@@ -27,6 +26,7 @@ import {
   updateClipTranscript,
 } from "./api";
 import BackendTestPage from "./BackendTestPage";
+import WaveformPane from "./WaveformPane";
 import type {
   Clip,
   ClipCommit,
@@ -35,7 +35,6 @@ import type {
   ExportRun,
   ProjectDetail,
   ReviewStatus,
-  WaveformPeaks,
 } from "./types";
 
 const queuePriorityOrder: ReviewStatus[] = [
@@ -166,8 +165,10 @@ function clipMatchesFilters(
 
   if (
     selectedFilterTags.length > 0 &&
-    !selectedFilterTags.some((selectedTag) =>
-      clip.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
+    !selectedFilterTags.some(
+      (selectedTag) =>
+        clip.review_status.toLowerCase() === selectedTag ||
+        clip.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
     )
   ) {
     return false;
@@ -206,9 +207,8 @@ export default function App() {
   const [selectionStart, setSelectionStart] = useState(0);
   const [selectionEnd, setSelectionEnd] = useState(0);
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
+  const [playbackStartSeconds, setPlaybackStartSeconds] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [waveformPeaks, setWaveformPeaks] = useState<WaveformPeaks | null>(null);
-  const [isWaveformLoading, setIsWaveformLoading] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [isExportPreviewLoading, setIsExportPreviewLoading] = useState(false);
@@ -218,13 +218,10 @@ export default function App() {
   const [isCommittingClip, setIsCommittingClip] = useState(false);
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
-  const [dragMode, setDragMode] = useState<"selection" | "start-handle" | "end-handle" | null>(
-    null,
-  );
   const deferredSearch = useDeferredValue(searchQuery.trim().toLowerCase());
-  const waveformRef = useRef<HTMLDivElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const waveSurferRef = useRef<WaveSurfer | null>(null);
   const tagFilterRef = useRef<HTMLDivElement | null>(null);
+  const shouldAutoPlayAfterClipChangeRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -290,6 +287,46 @@ export default function App() {
     };
   }, [isTagFilterMenuOpen]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) {
+        return;
+      }
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        void handleTogglePlayback();
+        return;
+      }
+
+      if (event.code === "Enter") {
+        event.preventDefault();
+        void handleAcceptCommitNextAndPlay();
+        return;
+      }
+
+      if (event.code === "KeyC") {
+        event.preventDefault();
+        void handleCommitClip(true);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  });
+
   const queueClips = useMemo(() => {
     const clips = projectDetail?.clips ?? [];
     return sortClipsForQueue(clips).filter((clip) =>
@@ -323,34 +360,17 @@ export default function App() {
     setDraftTranscript(activeClip.transcript.text_current);
     setDraftTags(activeClip.tags.map((tag) => tag.name).join(", "));
     setSelectionStart(0);
-    setSelectionEnd(Number(activeClip.duration_seconds.toFixed(2)));
+    setSelectionEnd(0);
     setPlayheadSeconds(0);
+    setPlaybackStartSeconds(0);
     setIsPlaying(false);
-  }, [activeClip?.id]);
 
-  useEffect(() => {
-    if (!activeClip) {
-      setWaveformPeaks(null);
-      return;
+    if (shouldAutoPlayAfterClipChangeRef.current) {
+      shouldAutoPlayAfterClipChangeRef.current = false;
+      window.setTimeout(() => {
+        void handleTogglePlayback();
+      }, 180);
     }
-
-    let cancelled = false;
-    setIsWaveformLoading(true);
-
-    const requestedBins = 320;
-
-    void fetchWaveformPeaks(activeClip.id, requestedBins).then((peaks) => {
-      if (cancelled) {
-        return;
-      }
-
-      setWaveformPeaks(peaks);
-      setIsWaveformLoading(false);
-    });
-
-    return () => {
-      cancelled = true;
-    };
   }, [activeClip?.id]);
 
   useEffect(() => {
@@ -379,38 +399,6 @@ export default function App() {
       cancelled = true;
     };
   }, [activeClip?.id, clipCommits]);
-
-  useEffect(() => {
-    if (!activeClip || !audioRef.current) {
-      return;
-    }
-
-    const audio = audioRef.current;
-    const nextUrl = buildClipAudioUrl(activeClip.id);
-    if (audio.src !== nextUrl) {
-      audio.src = nextUrl;
-    }
-    audio.currentTime = 0;
-    audio.load();
-
-    const handleTimeUpdate = () => {
-      setPlayheadSeconds(Number(audio.currentTime.toFixed(2)));
-    };
-
-    const handleEnded = () => {
-      setIsPlaying(false);
-      setPlayheadSeconds(Number(activeClip.duration_seconds.toFixed(2)));
-    };
-
-    audio.addEventListener("timeupdate", handleTimeUpdate);
-    audio.addEventListener("ended", handleEnded);
-
-    return () => {
-      audio.pause();
-      audio.removeEventListener("timeupdate", handleTimeUpdate);
-      audio.removeEventListener("ended", handleEnded);
-    };
-  }, [activeClip?.id, activeClip?.duration_seconds]);
 
   function updateCurrentClip(updatedClip: Clip) {
     if (!projectDetail) {
@@ -446,7 +434,7 @@ export default function App() {
     setDraftTranscript(result.clip.transcript.text_current);
     setDraftTags(result.clip.tags.map((tag) => tag.name).join(", "));
     setSelectionStart(0);
-    setSelectionEnd(Number(result.clip.duration_seconds.toFixed(2)));
+    setSelectionEnd(0);
     setPlayheadSeconds(0);
     setExportPreview(null);
     setHistoryByClip((current) => ({
@@ -463,6 +451,23 @@ export default function App() {
       setActiveClipId(nextClipId);
       setEditorNotice(null);
     });
+  }
+
+  function getNextClipId(currentClipId: string): string | null {
+    if (queueClips.length === 0) {
+      return null;
+    }
+
+    const currentIndex = queueClips.findIndex((clip) => clip.id === currentClipId);
+    if (currentIndex < 0) {
+      return queueClips[0]?.id ?? null;
+    }
+
+    const nextClip = queueClips[currentIndex + 1] ?? queueClips[0] ?? null;
+    if (!nextClip || nextClip.id === currentClipId) {
+      return null;
+    }
+    return nextClip.id;
   }
 
   function toggleFilterTag(tagName: string) {
@@ -503,14 +508,28 @@ export default function App() {
   }
 
   function pausePlayback() {
-    if (audioRef.current) {
-      audioRef.current.pause();
-    }
+    waveSurferRef.current?.pause();
     setIsPlaying(false);
+  }
+
+  function setWaveSurferTime(nextTime: number) {
+    const waveSurfer = waveSurferRef.current;
+    if (!waveSurfer || !activeClip || activeClip.duration_seconds <= 0) {
+      return;
+    }
+    const clamped = Math.max(0, Math.min(nextTime, activeClip.duration_seconds));
+    const progress = clamped / activeClip.duration_seconds;
+    waveSurfer.seekTo(progress);
+    setPlayheadSeconds(Number(clamped.toFixed(2)));
   }
 
   async function handleStatusChange(reviewStatus: ReviewStatus) {
     if (!activeClip) {
+      return;
+    }
+
+    if (reviewStatus === "accepted") {
+      await handleCommitClip(true);
       return;
     }
 
@@ -621,12 +640,10 @@ export default function App() {
     }
 
     updateCurrentClip(updatedClip);
-    setSelectionStart(0);
-    setSelectionEnd(Number(updatedClip.duration_seconds.toFixed(2)));
+    setSelectionStart(Math.min(start, updatedClip.duration_seconds));
+    setSelectionEnd(Math.min(start, updatedClip.duration_seconds));
     setPlayheadSeconds(Math.min(start, updatedClip.duration_seconds));
-    if (audioRef.current) {
-      audioRef.current.currentTime = Math.min(start, updatedClip.duration_seconds);
-    }
+    setWaveSurferTime(Math.min(start, updatedClip.duration_seconds));
     setEditorNotice("Deleted the selected region.");
   }
 
@@ -653,8 +670,8 @@ export default function App() {
     }
 
     updateCurrentClip(updatedClip);
-    setSelectionStart(0);
-    setSelectionEnd(Number(updatedClip.duration_seconds.toFixed(2)));
+    setSelectionStart(Math.min(start, updatedClip.duration_seconds));
+    setSelectionEnd(Math.min(start, updatedClip.duration_seconds));
     setPlayheadSeconds(Math.min(start, updatedClip.duration_seconds));
     setEditorNotice(`Inserted ${formatSeconds(silenceDuration)} of silence.`);
   }
@@ -691,9 +708,9 @@ export default function App() {
     setEditorNotice("Re-applied the next local state.");
   }
 
-  async function handleCommitClip() {
+  async function handleCommitClip(forceAccepted = false): Promise<boolean> {
     if (!activeClip || !projectDetail) {
-      return;
+      return false;
     }
 
     setIsCommittingClip(true);
@@ -720,6 +737,17 @@ export default function App() {
       }
     }
 
+    if (forceAccepted && workingClip.review_status !== "accepted") {
+      const statusClip = await updateClipStatus(workingClip.id, "accepted");
+      if (!statusClip) {
+        setIsCommittingClip(false);
+        setEditorNotice("Could not mark clip as accepted before commit.");
+        return false;
+      }
+      workingClip = statusClip;
+      setProjectDetail((current) => (current ? replaceClipInProject(current, statusClip) : current));
+    }
+
     const message =
       workingClip.review_status === "accepted"
         ? "Accepted clip snapshot"
@@ -730,7 +758,7 @@ export default function App() {
 
     if (!createdCommit) {
       setEditorNotice("Commit failed. Check the backend.");
-      return;
+      return false;
     }
 
     const committedClip: Clip = {
@@ -749,141 +777,60 @@ export default function App() {
       [workingClip.id]: { can_undo: true, can_redo: false },
     }));
     setEditorNotice(`Committed clip snapshot: ${createdCommit.message}`);
+    return true;
   }
 
-  function getPointerTime(
-    clientX: number,
-    rect: DOMRect,
-    durationSeconds: number,
-    startRatio: number,
-    windowRatio: number,
-  ): number {
-    const ratio = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
-    const absoluteRatio = startRatio + ratio * windowRatio;
-    return Number((absoluteRatio * durationSeconds).toFixed(2));
-  }
-
-  function setAudioCurrentTime(nextTime: number) {
-    if (audioRef.current) {
-      audioRef.current.currentTime = nextTime;
-    }
-    setPlayheadSeconds(nextTime);
-  }
-
-  function handleWaveformPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!activeClip) {
+  async function handleAcceptCommitNextAndPlay() {
+    if (!activeClip || isCommittingClip || isApplyingEdit) {
       return;
     }
 
-    pausePlayback();
-    const rect = event.currentTarget.getBoundingClientRect();
-    const nextTime = getPointerTime(
-      event.clientX,
-      rect,
-      activeClip.duration_seconds,
-      visibleStartRatio,
-      visibleWindowRatio,
-    );
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setSelectionStart(nextTime);
-    setSelectionEnd(nextTime);
-    setAudioCurrentTime(nextTime);
-    setDragMode("selection");
-  }
-
-  function handleWaveformPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!activeClip || dragMode !== "selection") {
+    const nextClipId = getNextClipId(activeClip.id);
+    const committed = await handleCommitClip(true);
+    if (!committed) {
       return;
     }
 
-    const rect = event.currentTarget.getBoundingClientRect();
-    const nextTime = getPointerTime(
-      event.clientX,
-      rect,
-      activeClip.duration_seconds,
-      visibleStartRatio,
-      visibleWindowRatio,
-    );
-    setSelectionEnd(nextTime);
-    setAudioCurrentTime(nextTime);
-  }
-
-  function handleWaveformPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    setDragMode(null);
-  }
-
-  function handleSelectionHandlePointerDown(
-    which: "start-handle" | "end-handle",
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) {
-    event.stopPropagation();
-    pausePlayback();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setDragMode(which);
-  }
-
-  function handleSelectionHandlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!activeClip || !dragMode || !waveformRef.current) {
+    if (!nextClipId) {
+      setEditorNotice("Committed. No next clip in the current queue.");
       return;
     }
 
-    const isStartHandle = dragMode === "start-handle";
-    const isEndHandle = dragMode === "end-handle";
-
-    if (!isStartHandle && !isEndHandle) {
-      return;
-    }
-
-    const rect = waveformRef.current.getBoundingClientRect();
-    const nextTime = getPointerTime(
-      event.clientX,
-      rect,
-      activeClip.duration_seconds,
-      visibleStartRatio,
-      visibleWindowRatio,
-    );
-
-    if (isStartHandle) {
-      setSelectionStart(nextTime);
-    }
-
-    if (isEndHandle) {
-      setSelectionEnd(nextTime);
-    }
-
-    setAudioCurrentTime(nextTime);
-  }
-
-  function handleSelectionHandlePointerUp(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    setDragMode(null);
+    shouldAutoPlayAfterClipChangeRef.current = true;
+    handleClipSelect(nextClipId);
   }
 
   async function handleTogglePlayback() {
-    if (!activeClip || !audioRef.current) {
+    if (!activeClip || !waveSurferRef.current) {
       return;
     }
 
-    const audio = audioRef.current;
+    const waveSurfer = waveSurferRef.current;
+    const cursorTime = Number(waveSurfer.getCurrentTime().toFixed(2));
+    const selectionDuration = normalizedSelectionEnd - normalizedSelectionStart;
+    const hasSelection = selectionDuration > 0.01;
 
     if (isPlaying) {
       pausePlayback();
+      setWaveSurferTime(playbackStartSeconds);
       return;
     }
 
-    if (playheadSeconds >= activeClip.duration_seconds) {
-      const resetPoint = normalizedSelectionStart > 0 ? normalizedSelectionStart : 0;
-      audio.currentTime = resetPoint;
-      setPlayheadSeconds(resetPoint);
+    let nextStart = cursorTime;
+    let nextEnd: number | undefined;
+
+    if (hasSelection) {
+      nextStart = normalizedSelectionStart;
+      nextEnd = normalizedSelectionEnd;
+    } else if (cursorTime >= activeClip.duration_seconds) {
+      nextStart = normalizedSelectionStart > 0 ? normalizedSelectionStart : 0;
     }
 
+    setWaveSurferTime(nextStart);
+    setPlaybackStartSeconds(nextStart);
+
     try {
-      await audio.play();
+      await waveSurfer.play(nextStart, nextEnd);
       setIsPlaying(true);
       setEditorNotice(null);
     } catch {
@@ -962,77 +909,17 @@ export default function App() {
     handleClipSelect(nextClip.id);
   }
 
-  const stats = projectDetail?.stats;
   const activeCommits = activeClip ? clipCommits[activeClip.id] ?? [] : [];
   const activeHistory = activeClip
     ? historyByClip[activeClip.id] ?? { can_undo: false, can_redo: false }
     : { can_undo: false, can_redo: false };
-  const visibleWindowRatio = 1;
-  const visibleStartRatio = 0;
-  const visibleStartSeconds =
-    activeClip && activeClip.duration_seconds > 0
-      ? activeClip.duration_seconds * visibleStartRatio
-      : 0;
-  const visibleEndSeconds =
-    activeClip && activeClip.duration_seconds > 0
-      ? activeClip.duration_seconds * Math.min(visibleStartRatio + visibleWindowRatio, 1)
-      : 0;
+  const visibleStartSeconds = 0;
+  const visibleEndSeconds = activeClip?.duration_seconds ?? 0;
   const normalizedSelectionStart = Math.min(selectionStart, selectionEnd);
   const normalizedSelectionEnd = Math.max(selectionStart, selectionEnd);
-  const visibleSelectionStart = Math.max(normalizedSelectionStart, visibleStartSeconds);
-  const visibleSelectionEnd = Math.min(normalizedSelectionEnd, visibleEndSeconds);
-  const visibleSelectionDuration = Math.max(visibleSelectionEnd - visibleSelectionStart, 0);
-  const selectionOffsetPercent =
-    activeClip && activeClip.duration_seconds > 0
-      ? ((visibleSelectionStart / activeClip.duration_seconds - visibleStartRatio) / visibleWindowRatio) * 100
-      : 0;
-  const selectionWidthPercent =
-    activeClip && activeClip.duration_seconds > 0
-      ? Math.max(
-          ((visibleSelectionDuration / activeClip.duration_seconds) / visibleWindowRatio) * 100,
-          visibleSelectionDuration > 0 ? 0.8 : 0,
-        )
-      : 0;
-  const selectionStartInView = normalizedSelectionStart >= visibleStartSeconds && normalizedSelectionStart <= visibleEndSeconds;
-  const selectionEndInView = normalizedSelectionEnd >= visibleStartSeconds && normalizedSelectionEnd <= visibleEndSeconds;
-  const selectionStartPercent =
-    activeClip && activeClip.duration_seconds > 0
-      ? (((normalizedSelectionStart / activeClip.duration_seconds) - visibleStartRatio) / visibleWindowRatio) * 100
-      : 0;
-  const selectionEndPercent =
-    activeClip && activeClip.duration_seconds > 0
-      ? (((normalizedSelectionEnd / activeClip.duration_seconds) - visibleStartRatio) / visibleWindowRatio) * 100
-      : 0;
-  const playheadPercent =
-    activeClip && activeClip.duration_seconds > 0
-      ? Math.min(
-          Math.max(
-            (((playheadSeconds / activeClip.duration_seconds) - visibleStartRatio) / visibleWindowRatio) * 100,
-            0,
-          ),
-          100,
-        )
-      : 0;
-  const waveformBars = useMemo(() => {
-    const peaks = waveformPeaks?.peaks ?? [];
-    if (peaks.length === 0) {
-      return [];
-    }
-
-    const startIndex = Math.floor(peaks.length * visibleStartRatio);
-    const endIndex = Math.max(
-      startIndex + 1,
-      Math.ceil(peaks.length * Math.min(visibleStartRatio + visibleWindowRatio, 1)),
-    );
-
-    return peaks.slice(startIndex, endIndex);
-  }, [visibleStartRatio, visibleWindowRatio, waveformPeaks?.peaks]);
-  const visibleQueueCount = queueClips.length;
 
   return (
     <div className="app-shell">
-      <audio ref={audioRef} preload="metadata" />
-
       <header className="topbar">
         <div>
           <p className="eyebrow">Speechcraft</p>
@@ -1089,12 +976,6 @@ export default function App() {
               </div>
               {isTagFilterMenuOpen ? (
                 <div className="tag-filter-popover">
-                  <div className="selection-header">
-                    <strong>Select Tags</strong>
-                    <button type="button" onClick={() => setIsTagFilterMenuOpen(false)}>
-                      Done
-                    </button>
-                  </div>
                   <ul className="tag-filter-list">
                     {availableFilterTags.map((tagName) => (
                       <li key={`filter-${tagName}`}>
@@ -1171,72 +1052,26 @@ export default function App() {
 
             {activeClip ? (
               <>
-                <div
-                  ref={waveformRef}
-                  className="waveform-stage"
-                  aria-label="Interactive waveform selection"
-                  onPointerDown={handleWaveformPointerDown}
-                  onPointerMove={handleWaveformPointerMove}
-                  onPointerUp={handleWaveformPointerUp}
-                  onPointerCancel={handleWaveformPointerUp}
-                >
-                  {visibleSelectionDuration > 0 ? (
-                    <div
-                      className="selection-overlay"
-                      style={{
-                        left: `${selectionOffsetPercent}%`,
-                        width: `${selectionWidthPercent}%`,
-                      }}
-                    />
-                  ) : null}
-                  <div
-                    className="playhead"
-                    style={{
-                      left: `${playheadPercent}%`,
-                    }}
-                  />
-                  {selectionStartInView ? (
-                    <div
-                      className="selection-handle start"
-                      style={{ left: `${selectionStartPercent}%` }}
-                      onPointerDown={(event) =>
-                        handleSelectionHandlePointerDown("start-handle", event)
-                      }
-                      onPointerMove={handleSelectionHandlePointerMove}
-                      onPointerUp={handleSelectionHandlePointerUp}
-                      onPointerCancel={handleSelectionHandlePointerUp}
-                    />
-                  ) : null}
-                  {selectionEndInView ? (
-                    <div
-                      className="selection-handle end"
-                      style={{ left: `${selectionEndPercent}%` }}
-                      onPointerDown={(event) =>
-                        handleSelectionHandlePointerDown("end-handle", event)
-                      }
-                      onPointerMove={handleSelectionHandlePointerMove}
-                      onPointerUp={handleSelectionHandlePointerUp}
-                      onPointerCancel={handleSelectionHandlePointerUp}
-                    />
-                  ) : null}
-                  {waveformBars.length > 0 ? (
-                    waveformBars.map((peak, index) => (
-                      <span
-                        key={`${activeClip.id}-${index}`}
-                        className="wave-bar"
-                        style={{ height: `${14 + peak * 74}%` }}
-                      />
-                    ))
-                  ) : (
-                    <div className="empty-state">
-                      {isWaveformLoading ? "Loading waveform..." : "No waveform data yet."}
-                    </div>
-                  )}
-                </div>
+                <WaveformPane
+                  audioUrl={buildClipAudioUrl(activeClip.id)}
+                  durationSeconds={activeClip.duration_seconds}
+                  peaks={null}
+                  selectionStart={selectionStart}
+                  selectionEnd={selectionEnd}
+                  onSelectionChange={(start, end) => {
+                    setSelectionStart(start);
+                    setSelectionEnd(end);
+                  }}
+                  onCursorChange={(time) => setPlayheadSeconds(time)}
+                  onReady={(instance) => {
+                    waveSurferRef.current = instance;
+                  }}
+                  onPlayingChange={setIsPlaying}
+                />
 
                 <div className="timeline-strip">
                   <span>{formatSeconds(activeClip.original_start_time + visibleStartSeconds)}</span>
-                  <span>Visible Window</span>
+                  <span>Full Clip</span>
                   <span>{formatSeconds(activeClip.original_start_time + visibleEndSeconds)}</span>
                 </div>
 
@@ -1261,9 +1096,6 @@ export default function App() {
                   </button>
                   <button type="button" onClick={handleInsertSilence} disabled={isApplyingEdit}>
                     Insert Silence
-                  </button>
-                  <button type="button" onClick={handleCommitClip} disabled={isCommittingClip}>
-                    {isCommittingClip ? "Committing..." : "Commit Clip"}
                   </button>
                 </div>
               </>
@@ -1384,6 +1216,23 @@ export default function App() {
                     {statusLabels[status]}
                   </button>
                 ))}
+              </div>
+
+              <div className="editor-actions">
+                <button
+                  type="button"
+                  onClick={() => void handleCommitClip(true)}
+                  disabled={isCommittingClip}
+                >
+                  {isCommittingClip ? "Committing..." : "Commit (C)"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleAcceptCommitNextAndPlay()}
+                  disabled={isCommittingClip}
+                >
+                  Commit + Next (Enter)
+                </button>
               </div>
 
               <section className="inspector-block">

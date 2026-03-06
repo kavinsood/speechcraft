@@ -37,6 +37,7 @@ export type Clip = {
   order_index: number;
   source_file_id: string;
   working_asset_id: string;
+  audio_path?: string | null;
   original_start_time: number;
   original_end_time: number;
   clip_edl: ClipEdlOperation[];

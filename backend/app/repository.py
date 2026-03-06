@@ -464,6 +464,7 @@ class FileBackedRepository:
             order_index=clip.order_index,
             source_file_id=clip.source_file_id,
             working_asset_id=clip.working_asset_id,
+            audio_path=clip.audio_path,
             original_start_time=clip.original_start_time,
             original_end_time=round(clip.original_start_time + split_at, 2),
             clip_edl=[],
@@ -490,6 +491,7 @@ class FileBackedRepository:
             order_index=clip.order_index + 1,
             source_file_id=clip.source_file_id,
             working_asset_id=clip.working_asset_id,
+            audio_path=clip.audio_path,
             original_start_time=round(clip.original_start_time + split_at, 2),
             original_end_time=clip.original_end_time,
             clip_edl=[],
@@ -576,6 +578,7 @@ class FileBackedRepository:
             order_index=min(first_clip.order_index, second_clip.order_index),
             source_file_id=first_clip.source_file_id,
             working_asset_id=first_clip.working_asset_id,
+            audio_path=first_clip.audio_path,
             original_start_time=first_clip.original_start_time,
             original_end_time=second_clip.original_end_time,
             clip_edl=[],
@@ -707,14 +710,19 @@ class FileBackedRepository:
     def get_waveform_peaks(self, clip_id: str, bins: int = 120) -> WaveformPeaks:
         clip = self._find_clip(clip_id)
         safe_bins = max(16, min(bins, 512))
-        peaks = [
-            round(self._synthetic_peak_value(clip, index / safe_bins), 4)
-            for index in range(safe_bins)
-        ]
+        peaks = self._extract_waveform_peaks_from_file(clip, safe_bins)
+        if peaks is None:
+            peaks = [
+                round(self._synthetic_peak_value(clip, index / safe_bins), 4)
+                for index in range(safe_bins)
+            ]
         return WaveformPeaks(clip_id=clip.id, bins=safe_bins, peaks=peaks)
 
     def get_clip_audio_bytes(self, clip_id: str) -> bytes:
         clip = self._find_clip(clip_id)
+        audio_path = self._resolve_clip_audio_path(clip)
+        if audio_path is not None and audio_path.exists():
+            return audio_path.read_bytes()
         return self._render_clip_wave_bytes(clip)
 
     def _ensure_runtime_state(self) -> None:
@@ -835,6 +843,63 @@ class FileBackedRepository:
                 wave_file.writeframesraw(frame)
 
         return buffer.getvalue()
+
+    def _resolve_clip_audio_path(self, clip: Clip) -> Path | None:
+        if not clip.audio_path:
+            return None
+        path = Path(clip.audio_path).expanduser()
+        if not path.exists():
+            return None
+        return path
+
+    def _extract_waveform_peaks_from_file(self, clip: Clip, bins: int) -> list[float] | None:
+        audio_path = self._resolve_clip_audio_path(clip)
+        if audio_path is None or audio_path.suffix.lower() != ".wav":
+            return None
+
+        try:
+            with wave.open(str(audio_path), "rb") as wav_file:
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                frame_count = wav_file.getnframes()
+
+                if frame_count <= 0 or channels <= 0 or sample_width != 2:
+                    return None
+
+                raw = wav_file.readframes(frame_count)
+        except wave.Error:
+            return None
+
+        total_samples = frame_count
+        samples_per_bin = max(total_samples // bins, 1)
+        peaks: list[float] = []
+        max_pcm = 32767.0
+
+        for bin_index in range(bins):
+            start_frame = bin_index * samples_per_bin
+            end_frame = min((bin_index + 1) * samples_per_bin, total_samples)
+            if start_frame >= total_samples:
+                peaks.append(0.04)
+                continue
+
+            max_abs = 0
+            for frame_index in range(start_frame, end_frame):
+                frame_base = frame_index * channels * sample_width
+                frame_peak = 0
+                for channel_index in range(channels):
+                    offset = frame_base + channel_index * sample_width
+                    sample = int.from_bytes(
+                        raw[offset : offset + sample_width],
+                        byteorder="little",
+                        signed=True,
+                    )
+                    frame_peak = max(frame_peak, abs(sample))
+                max_abs = max(max_abs, frame_peak)
+
+            normalized = max_abs / max_pcm if max_pcm > 0 else 0.0
+            peaks.append(round(max(normalized, 0.04), 4))
+
+        return peaks
 
     def _find_clip(self, clip_id: str) -> Clip:
         for clips in self.clips_by_project.values():

@@ -68,6 +68,7 @@ class Clip(BaseModel):
     order_index: int = 0
     source_file_id: str
     working_asset_id: str
+    audio_path: str | None = None
     original_start_time: float
     original_end_time: float
     clip_edl: list[ClipEdlOperation] = Field(default_factory=list)

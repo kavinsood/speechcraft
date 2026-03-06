@@ -343,6 +343,15 @@ button:disabled {
   touch-action: none;
 }
 
+.wavesurfer-host {
+  min-height: 15rem;
+  border-radius: 1.25rem;
+  padding: 0.35rem;
+  background:
+    linear-gradient(180deg, rgba(31, 53, 61, 0.96), rgba(20, 33, 37, 0.98)),
+    linear-gradient(90deg, rgba(250, 222, 157, 0.08), transparent);
+}
+
 .waveform-stage::after {
   content: "";
   position: absolute;
