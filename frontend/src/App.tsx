@@ -591,6 +591,11 @@ export default function App() {
       return;
     }
 
+    if (reviewStatus === "rejected") {
+      await handleCommitClip("rejected");
+      return;
+    }
+
     pausePlayback();
     const updatedClip = await updateClipStatus(activeClip.id, reviewStatus);
     if (!updatedClip) {
