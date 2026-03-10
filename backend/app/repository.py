@@ -693,7 +693,7 @@ class FileBackedRepository:
 
             for clip in committed:
                 rendered_path = rendered_root / f"{clip.id}.wav"
-                rendered_path.write_bytes(self.get_clip_audio_bytes(clip.id))
+                rendered_path.write_bytes(self._get_clip_audio_bytes_for_clip(clip))
                 manifest_lines.append(
                     f"{rendered_path}|{clip.speaker_name}|{clip.language}|{clip.transcript.text_current}"
                 )
@@ -733,7 +733,10 @@ class FileBackedRepository:
     def get_waveform_peaks(self, clip_id: str, bins: int = 120) -> WaveformPeaks:
         clip = self._find_clip(clip_id)
         safe_bins = max(16, min(bins, 512))
-        peaks = self._extract_waveform_peaks_from_file(clip, safe_bins)
+        peaks = self._extract_waveform_peaks_from_bytes(
+            self.get_clip_audio_bytes(clip.id),
+            safe_bins,
+        )
         if peaks is None:
             peaks = [
                 round(self._synthetic_peak_value(clip, index / safe_bins), 4)
@@ -743,9 +746,15 @@ class FileBackedRepository:
 
     def get_clip_audio_bytes(self, clip_id: str) -> bytes:
         clip = self._find_clip(clip_id)
+        return self._get_clip_audio_bytes_for_clip(clip)
+
+    def _get_clip_audio_bytes_for_clip(self, clip: Clip) -> bytes:
         audio_path = self._resolve_clip_audio_path(clip)
         if audio_path is not None and audio_path.exists():
-            return audio_path.read_bytes()
+            audio_bytes = audio_path.read_bytes()
+            if audio_path.suffix.lower() == ".wav":
+                return self._apply_clip_edl_to_wav_bytes(clip, audio_bytes)
+            return audio_bytes
         return self._render_clip_wave_bytes(clip)
 
     def _ensure_runtime_state(self) -> None:
@@ -941,20 +950,75 @@ class FileBackedRepository:
             return None
         return path
 
-    def _extract_waveform_peaks_from_file(self, clip: Clip, bins: int) -> list[float] | None:
-        audio_path = self._resolve_clip_audio_path(clip)
-        if audio_path is None or audio_path.suffix.lower() != ".wav":
-            return None
+    def _apply_clip_edl_to_wav_bytes(self, clip: Clip, audio_bytes: bytes) -> bytes:
+        if not clip.clip_edl:
+            return audio_bytes
 
         try:
-            with wave.open(str(audio_path), "rb") as wav_file:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                sample_rate = wav_file.getframerate()
+                frame_count = wav_file.getnframes()
+                raw = wav_file.readframes(frame_count)
+        except wave.Error:
+            return audio_bytes
+
+        if channels <= 0 or sample_width != 2 or sample_rate <= 0:
+            return audio_bytes
+
+        bytes_per_frame = channels * sample_width
+        working_raw = raw
+
+        for operation in clip.clip_edl:
+            if operation.op == "delete_range" and operation.range is not None:
+                total_frames = len(working_raw) // bytes_per_frame
+                start_frame = max(
+                    0,
+                    min(int(operation.range.start_seconds * sample_rate), total_frames),
+                )
+                end_frame = max(
+                    start_frame,
+                    min(int(operation.range.end_seconds * sample_rate), total_frames),
+                )
+                start_offset = start_frame * bytes_per_frame
+                end_offset = end_frame * bytes_per_frame
+                working_raw = working_raw[:start_offset] + working_raw[end_offset:]
+                continue
+
+            if operation.op == "insert_silence":
+                duration = max(operation.duration_seconds or 0.0, 0.0)
+                if duration <= 0:
+                    continue
+                total_frames = len(working_raw) // bytes_per_frame
+                insert_at_seconds = 0.0
+                if operation.range is not None:
+                    insert_at_seconds = max(operation.range.start_seconds, 0.0)
+                insert_frame = max(0, min(int(insert_at_seconds * sample_rate), total_frames))
+                insert_offset = insert_frame * bytes_per_frame
+                silence_frames = max(int(duration * sample_rate), 1)
+                silence = b"\x00" * (silence_frames * bytes_per_frame)
+                working_raw = working_raw[:insert_offset] + silence + working_raw[insert_offset:]
+
+        if not working_raw:
+            working_raw = b"\x00" * bytes_per_frame
+
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wave_file:
+            wave_file.setnchannels(channels)
+            wave_file.setsampwidth(sample_width)
+            wave_file.setframerate(sample_rate)
+            wave_file.writeframes(working_raw)
+        return output.getvalue()
+
+    def _extract_waveform_peaks_from_bytes(self, audio_bytes: bytes, bins: int) -> list[float] | None:
+        try:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
                 channels = wav_file.getnchannels()
                 sample_width = wav_file.getsampwidth()
                 frame_count = wav_file.getnframes()
-
                 if frame_count <= 0 or channels <= 0 or sample_width != 2:
                     return None
-
                 raw = wav_file.readframes(frame_count)
         except wave.Error:
             return None
