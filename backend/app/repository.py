@@ -174,6 +174,9 @@ class FileBackedRepository:
                     transcript_snapshot="This one is already ready for export.",
                     review_status_snapshot=ReviewStatus.ACCEPTED,
                     clip_edl_snapshot=[],
+                    duration_seconds=2.4,
+                    speaker_name="speaker_a",
+                    language="en",
                 )
             ],
         }
@@ -333,6 +336,7 @@ class FileBackedRepository:
     def update_clip_status(self, clip_id: str, payload: ClipStatusUpdate) -> Clip:
         clip = self._find_clip(clip_id)
         clip.review_status = payload.review_status
+        clip.edit_state = EditState.DIRTY
         clip.updated_at = utc_now()
         self._record_history(clip)
         self._touch_project(clip.project_id)
@@ -402,7 +406,10 @@ class FileBackedRepository:
             message=payload.message,
             transcript_snapshot=clip.transcript.text_current,
             review_status_snapshot=clip.review_status,
-            clip_edl_snapshot=clip.clip_edl,
+            clip_edl_snapshot=[entry.model_copy(deep=True) for entry in clip.clip_edl],
+            duration_seconds=clip.duration_seconds,
+            speaker_name=clip.speaker_name,
+            language=clip.language,
         )
 
         commits.append(commit)
@@ -677,21 +684,37 @@ class FileBackedRepository:
         project.updated_at = utc_now()
         self._save()
 
-        accepted = self._get_export_eligible_clips(project_id)
+        committed = self._get_export_eligible_clips(project_id)
 
         try:
             rendered_root.mkdir(parents=True, exist_ok=True)
             manifest_lines: list[str] = []
+            jsonl_lines: list[str] = []
 
-            for clip in accepted:
+            for clip in committed:
                 rendered_path = rendered_root / f"{clip.id}.wav"
                 rendered_path.write_bytes(self.get_clip_audio_bytes(clip.id))
                 manifest_lines.append(
                     f"{rendered_path}|{clip.speaker_name}|{clip.language}|{clip.transcript.text_current}"
                 )
+                jsonl_lines.append(
+                    json.dumps(
+                        {
+                            "audio": str(rendered_path),
+                            "text": clip.transcript.text_current,
+                            "duration": round(clip.duration_seconds, 2),
+                        },
+                        ensure_ascii=True,
+                    )
+                )
 
             manifest_path.write_text("\n".join(manifest_lines))
-            export_run.accepted_clip_count = len(accepted)
+            dataset_jsonl_path = self._resolve_project_jsonl_output_path(project_id, committed)
+            if dataset_jsonl_path is not None:
+                dataset_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                dataset_jsonl_path.write_text("\n".join(jsonl_lines))
+
+            export_run.accepted_clip_count = len(committed)
             export_run.status = ExportRunStatus.SUCCEEDED
             export_run.completed_at = utc_now()
             project.export_status = ExportStatus.EXPORT_SUCCEEDED
@@ -700,7 +723,7 @@ class FileBackedRepository:
             return export_run
         except Exception:
             export_run.status = ExportRunStatus.FAILED
-            export_run.failed_clip_count = len(accepted)
+            export_run.failed_clip_count = len(committed)
             export_run.completed_at = utc_now()
             project.export_status = ExportStatus.EXPORT_FAILED
             project.updated_at = utc_now()
@@ -732,6 +755,13 @@ class FileBackedRepository:
         for clips in self.clips_by_project.values():
             for clip in clips:
                 self.commits_by_clip.setdefault(clip.id, [])
+                for commit in self.commits_by_clip[clip.id]:
+                    if commit.duration_seconds <= 0:
+                        commit.duration_seconds = clip.duration_seconds
+                    if not commit.speaker_name.strip():
+                        commit.speaker_name = clip.speaker_name
+                    if not commit.language.strip():
+                        commit.language = clip.language
                 self.history_by_clip.setdefault(
                     clip.id,
                     ClipHistoryState(
@@ -793,15 +823,74 @@ class FileBackedRepository:
         )
 
     def _get_export_eligible_clips(self, project_id: str) -> list[Clip]:
-        return [
-            clip
-            for clip in self._get_active_project_clips(project_id)
-            if clip.review_status == ReviewStatus.ACCEPTED
-            and clip.edit_state == EditState.COMMITTED
-            and clip.transcript.text_current.strip()
-            and clip.speaker_name.strip()
-            and clip.language.strip()
-        ]
+        committed_clips: list[Clip] = []
+        for clip in self._get_active_project_clips(project_id):
+            latest_commit = self._get_latest_commit(clip.id)
+            if latest_commit is None:
+                continue
+
+            committed_clip = self._build_export_clip_from_commit(clip, latest_commit)
+            if (
+                committed_clip.review_status == ReviewStatus.ACCEPTED
+                and committed_clip.transcript.text_current.strip()
+                and committed_clip.speaker_name.strip()
+                and committed_clip.language.strip()
+            ):
+                committed_clips.append(committed_clip)
+        return committed_clips
+
+    def _get_latest_commit(self, clip_id: str) -> ClipCommit | None:
+        commits = self.commits_by_clip.get(clip_id, [])
+        return commits[-1] if commits else None
+
+    def _build_export_clip_from_commit(self, clip: Clip, commit: ClipCommit) -> Clip:
+        export_clip = clip.model_copy(deep=True)
+        export_clip.review_status = commit.review_status_snapshot
+        export_clip.edit_state = EditState.COMMITTED
+        export_clip.transcript.text_current = commit.transcript_snapshot
+        export_clip.transcript.updated_at = commit.created_at
+        export_clip.clip_edl = [entry.model_copy(deep=True) for entry in commit.clip_edl_snapshot]
+        export_clip.duration_seconds = commit.duration_seconds
+        export_clip.speaker_name = commit.speaker_name
+        export_clip.language = commit.language
+        return export_clip
+
+    def _resolve_project_jsonl_output_path(
+        self,
+        project_id: str,
+        clips: list[Clip],
+    ) -> Path | None:
+        if not clips:
+            return None
+
+        directory_scores: dict[Path, int] = {}
+        preferred_stems: dict[Path, str] = {}
+        for clip in clips:
+            if not clip.audio_path:
+                continue
+            audio_path = Path(clip.audio_path).expanduser()
+            parent = audio_path.parent
+            if not parent:
+                continue
+
+            # Prefer the dataset root one level above raw/segments folders when available.
+            dataset_dir = parent.parent if parent.name.lower() in {"raw", "clips", "segments"} else parent
+            directory_scores[dataset_dir] = directory_scores.get(dataset_dir, 0) + 1
+
+            train_jsonl = dataset_dir / "train.jsonl"
+            if train_jsonl.exists():
+                preferred_stems[dataset_dir] = "train"
+            elif dataset_dir not in preferred_stems:
+                jsonl_candidates = sorted(dataset_dir.glob("*.jsonl"))
+                if jsonl_candidates:
+                    preferred_stems[dataset_dir] = jsonl_candidates[0].stem
+
+        if not directory_scores:
+            return self.exports_root / project_id / "committed-clips.jsonl"
+
+        output_dir = max(directory_scores, key=lambda path: directory_scores[path])
+        base_name = preferred_stems.get(output_dir, "train")
+        return output_dir / f"{base_name}.committed.jsonl"
 
     def _synthetic_peak_value(self, clip: Clip, ratio: float) -> float:
         seed = sum(ord(char) for char in clip.id)

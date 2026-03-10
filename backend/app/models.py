@@ -132,6 +132,9 @@ class ClipCommit(BaseModel):
     transcript_snapshot: str
     review_status_snapshot: ReviewStatus
     clip_edl_snapshot: list[ClipEdlOperation] = Field(default_factory=list)
+    duration_seconds: float = 0.0
+    speaker_name: str = ""
+    language: str = ""
     created_at: datetime = Field(default_factory=utc_now)
 
 
