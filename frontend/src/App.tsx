@@ -12,7 +12,6 @@ import {
   buildClipAudioUrl,
   commitClip,
   fetchClipCommits,
-  fetchExportPreview,
   fetchProjects,
   fetchProjectDetail,
   fetchProjectExports,
@@ -31,7 +30,6 @@ import type {
   Clip,
   ClipCommit,
   ClipHistoryResult,
-  ExportPreview,
   ExportRun,
   ProjectDetail,
   ReviewStatus,
@@ -53,13 +51,7 @@ const statusLabels: Record<ReviewStatus, string> = {
   rejected: "Rejected",
 };
 
-const defaultTagNames = [
-  "candidate",
-  "accepted",
-  "needs_attention",
-  "in_review",
-  "rejected",
-];
+const playbackRates = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
 
 type HistoryFlags = {
   can_undo: boolean;
@@ -68,6 +60,30 @@ type HistoryFlags = {
 
 function formatSeconds(value: number): string {
   return `${value.toFixed(2)}s`;
+}
+
+function formatClipTimestamp(value: number): string {
+  const totalCentiseconds = Math.max(0, Math.round(value * 100));
+  const seconds = Math.floor(totalCentiseconds / 100);
+  const centiseconds = totalCentiseconds % 100;
+  return `${seconds.toString().padStart(2, "0")}.${centiseconds
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+function formatDurationCompact(totalSeconds: number): string {
+  const rounded = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const seconds = rounded % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
 }
 
 function recalculateProjectDetail(detail: ProjectDetail): ProjectDetail {
@@ -166,9 +182,7 @@ function clipMatchesFilters(
   if (
     selectedFilterTags.length > 0 &&
     !selectedFilterTags.some(
-      (selectedTag) =>
-        clip.review_status.toLowerCase() === selectedTag ||
-        clip.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
+      (selectedTag) => clip.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
     )
   ) {
     return false;
@@ -202,16 +216,16 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilterTags, setSelectedFilterTags] = useState<string[]>([]);
   const [isTagFilterMenuOpen, setIsTagFilterMenuOpen] = useState(false);
-  const [newTagDraft, setNewTagDraft] = useState("");
+  const [tagInputDraft, setTagInputDraft] = useState("");
   const [hideResolved, setHideResolved] = useState(false);
   const [selectionStart, setSelectionStart] = useState(0);
   const [selectionEnd, setSelectionEnd] = useState(0);
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
+  const [hoverSeconds, setHoverSeconds] = useState<number | null>(null);
   const [playbackStartSeconds, setPlaybackStartSeconds] = useState(0);
+  const [playbackRate, setPlaybackRate] = useState<(typeof playbackRates)[number]>(1);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
-  const [isExportPreviewLoading, setIsExportPreviewLoading] = useState(false);
   const [isRunningExport, setIsRunningExport] = useState(false);
   const [clipCommits, setClipCommits] = useState<Record<string, ClipCommit[]>>({});
   const [historyByClip, setHistoryByClip] = useState<Record<string, HistoryFlags>>({});
@@ -220,6 +234,7 @@ export default function App() {
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const deferredSearch = useDeferredValue(searchQuery.trim().toLowerCase());
   const waveSurferRef = useRef<WaveSurfer | null>(null);
+  const transcriptEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const tagFilterRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoPlayAfterClipChangeRef = useRef(false);
 
@@ -305,20 +320,24 @@ export default function App() {
 
       if (event.code === "Space") {
         event.preventDefault();
+        if (event.shiftKey) {
+          void handlePlayFromBeginning();
+          return;
+        }
         void handleTogglePlayback();
         return;
       }
 
       if (event.code === "Enter") {
         event.preventDefault();
+        if (event.shiftKey) {
+          void handleRejectNextAndPlay();
+          return;
+        }
         void handleAcceptCommitNextAndPlay();
         return;
       }
 
-      if (event.code === "KeyC") {
-        event.preventDefault();
-        void handleCommitClip(true);
-      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -335,11 +354,21 @@ export default function App() {
   }, [projectDetail?.clips, deferredSearch, selectedFilterTags, hideResolved]);
 
   const availableFilterTags = useMemo(() => {
+    const statusTagNames = new Set(queuePriorityOrder.map((status) => status.toLowerCase()));
     const allClipTags = (projectDetail?.clips ?? []).flatMap((clip) =>
-      clip.tags.map((tag) => tag.name.toLowerCase()),
+      clip.tags
+        .map((tag) => tag.name.toLowerCase())
+        .filter((tagName) => !statusTagNames.has(tagName)),
     );
-    return Array.from(new Set([...defaultTagNames, ...allClipTags])).sort();
+    return Array.from(new Set(allClipTags)).sort();
   }, [projectDetail?.clips]);
+  const draftTagEntries = useMemo(() => parseTagDraft(draftTags), [draftTags]);
+  const suggestedTagNames = useMemo(() => {
+    const selected = new Set(draftTagEntries.map((tag) => tag.name.toLowerCase()));
+    return availableFilterTags
+      .filter((tagName) => !selected.has(tagName.toLowerCase()))
+      .slice(0, 12);
+  }, [availableFilterTags, draftTagEntries]);
 
   const activeClip = useMemo(() => {
     const allClips = projectDetail?.clips ?? [];
@@ -359,9 +388,11 @@ export default function App() {
 
     setDraftTranscript(activeClip.transcript.text_current);
     setDraftTags(activeClip.tags.map((tag) => tag.name).join(", "));
+    setTagInputDraft("");
     setSelectionStart(0);
     setSelectionEnd(0);
     setPlayheadSeconds(0);
+    setHoverSeconds(null);
     setPlaybackStartSeconds(0);
     setIsPlaying(false);
 
@@ -372,6 +403,15 @@ export default function App() {
       }, 180);
     }
   }, [activeClip?.id]);
+
+  useEffect(() => {
+    const editor = transcriptEditorRef.current;
+    if (!editor) {
+      return;
+    }
+    editor.style.height = "auto";
+    editor.style.height = `${editor.scrollHeight}px`;
+  }, [draftTranscript, activeClipId]);
 
   useEffect(() => {
     if (!activeClip) {
@@ -412,7 +452,6 @@ export default function App() {
 
       return replaceClipInProject(current, updatedClip);
     });
-    setExportPreview(null);
     setHistoryByClip((current) => ({
       ...current,
       [updatedClip.id]: { can_undo: true, can_redo: false },
@@ -436,7 +475,6 @@ export default function App() {
     setSelectionStart(0);
     setSelectionEnd(0);
     setPlayheadSeconds(0);
-    setExportPreview(null);
     setHistoryByClip((current) => ({
       ...current,
       [result.clip.id]: {
@@ -498,18 +536,34 @@ export default function App() {
     setDraftTags(nextTags.join(", "));
   }
 
-  function handleAddCustomTag() {
-    const value = newTagDraft.trim();
+  function handleAddTagFromInput() {
+    const value = tagInputDraft.trim();
     if (!value) {
       return;
     }
     addTagToDraft(value);
-    setNewTagDraft("");
+    setTagInputDraft("");
   }
 
   function pausePlayback() {
     waveSurferRef.current?.pause();
     setIsPlaying(false);
+  }
+
+  function applyPlaybackRate(instance: WaveSurfer | null, rate: number) {
+    if (!instance) {
+      return;
+    }
+    // Match browser-native player feel by preserving pitch across rate changes.
+    (instance as unknown as { setPlaybackRate: (value: number, preservePitch?: boolean) => void })
+      .setPlaybackRate(rate, true);
+  }
+
+  function handleCyclePlaybackRate() {
+    const currentIndex = playbackRates.indexOf(playbackRate);
+    const nextRate = playbackRates[(currentIndex + 1) % playbackRates.length];
+    setPlaybackRate(nextRate);
+    applyPlaybackRate(waveSurferRef.current, nextRate);
   }
 
   function setWaveSurferTime(nextTime: number) {
@@ -544,22 +598,6 @@ export default function App() {
     setEditorNotice(`Marked clip as ${statusLabels[reviewStatus].toLowerCase()}.`);
   }
 
-  async function handleTranscriptSave() {
-    if (!activeClip) {
-      return;
-    }
-
-    pausePlayback();
-    const updatedClip = await updateClipTranscript(activeClip.id, draftTranscript);
-    if (!updatedClip) {
-      setEditorNotice("Transcript save failed. Check the backend.");
-      return;
-    }
-
-    updateCurrentClip(updatedClip);
-    setEditorNotice("Saved transcript edits.");
-  }
-
   async function handleTagsSave() {
     if (!activeClip) {
       return;
@@ -575,17 +613,6 @@ export default function App() {
     updateCurrentClip(updatedClip);
     setDraftTags(updatedClip.tags.map((tag) => tag.name).join(", "));
     setEditorNotice("Saved clip tags.");
-  }
-
-  async function handleExportPreview() {
-    if (!projectDetail) {
-      return;
-    }
-
-    setIsExportPreviewLoading(true);
-    const preview = await fetchExportPreview(projectDetail.project.id, projectDetail.clips);
-    setExportPreview(preview);
-    setIsExportPreviewLoading(false);
   }
 
   async function handleRunExport() {
@@ -608,9 +635,7 @@ export default function App() {
       return;
     }
 
-    const preview = await fetchExportPreview(detail.project.id, detail.clips);
-    setExportPreview(preview);
-    setEditorNotice(`Export completed: ${result.accepted_clip_count} clip(s) rendered.`);
+    setEditorNotice(`Export completed: ${result.accepted_clip_count} accepted clip(s) rendered.`);
   }
 
   async function handleDeleteSelection() {
@@ -618,8 +643,13 @@ export default function App() {
       return;
     }
 
-    const start = Math.min(selectionStart, selectionEnd);
-    const end = Math.max(selectionStart, selectionEnd);
+    const duration = activeClip.duration_seconds;
+    const start = Math.max(0, Math.min(Math.min(selectionStart, selectionEnd), duration));
+    let end = Math.max(0, Math.min(Math.max(selectionStart, selectionEnd), duration));
+    const tailSnapThresholdSeconds = 0.03;
+    if (duration - end <= tailSnapThresholdSeconds) {
+      end = duration;
+    }
 
     if (end <= start) {
       setEditorNotice("Select a non-zero region before deleting.");
@@ -652,14 +682,17 @@ export default function App() {
       return;
     }
 
-    const start = Math.min(selectionStart, selectionEnd);
-    const end = Math.max(selectionStart, selectionEnd);
-    const silenceDuration = Number((Math.max(end - start, 0) || 0.25).toFixed(2));
+    const cursorTime = waveSurferRef.current
+      ? Number(waveSurferRef.current.getCurrentTime().toFixed(2))
+      : playheadSeconds;
+    const insertAt = Math.max(0, Math.min(cursorTime, activeClip.duration_seconds));
+    const silenceDuration = 0.2;
 
     setIsApplyingEdit(true);
     pausePlayback();
     const updatedClip = await appendClipEdlOperation(activeClip.id, {
       op: "insert_silence",
+      range: { start_seconds: insertAt, end_seconds: insertAt },
       duration_seconds: silenceDuration,
     });
     setIsApplyingEdit(false);
@@ -670,9 +703,9 @@ export default function App() {
     }
 
     updateCurrentClip(updatedClip);
-    setSelectionStart(Math.min(start, updatedClip.duration_seconds));
-    setSelectionEnd(Math.min(start, updatedClip.duration_seconds));
-    setPlayheadSeconds(Math.min(start, updatedClip.duration_seconds));
+    setSelectionStart(Math.min(insertAt, updatedClip.duration_seconds));
+    setSelectionEnd(Math.min(insertAt, updatedClip.duration_seconds));
+    setPlayheadSeconds(Math.min(insertAt, updatedClip.duration_seconds));
     setEditorNotice(`Inserted ${formatSeconds(silenceDuration)} of silence.`);
   }
 
@@ -771,7 +804,6 @@ export default function App() {
       ...current,
       [workingClip.id]: [...(current[workingClip.id] ?? []), createdCommit],
     }));
-    setExportPreview(null);
     setHistoryByClip((current) => ({
       ...current,
       [workingClip.id]: { can_undo: true, can_redo: false },
@@ -800,6 +832,30 @@ export default function App() {
     handleClipSelect(nextClipId);
   }
 
+  async function handleRejectNextAndPlay() {
+    if (!activeClip || isCommittingClip || isApplyingEdit) {
+      return;
+    }
+
+    const nextClipId = getNextClipId(activeClip.id);
+    pausePlayback();
+    const updatedClip = await updateClipStatus(activeClip.id, "rejected");
+    if (!updatedClip) {
+      setEditorNotice("Could not mark clip as rejected.");
+      return;
+    }
+
+    updateCurrentClip(updatedClip);
+    setEditorNotice("Marked clip as rejected.");
+
+    if (!nextClipId) {
+      return;
+    }
+
+    shouldAutoPlayAfterClipChangeRef.current = true;
+    handleClipSelect(nextClipId);
+  }
+
   async function handleTogglePlayback() {
     if (!activeClip || !waveSurferRef.current) {
       return;
@@ -819,11 +875,15 @@ export default function App() {
     let nextStart = cursorTime;
     let nextEnd: number | undefined;
 
+    const isAtOrPastEnd =
+      cursorTime >= activeClip.duration_seconds - 0.01 ||
+      playheadSeconds >= activeClip.duration_seconds - 0.01;
+
     if (hasSelection) {
       nextStart = normalizedSelectionStart;
       nextEnd = normalizedSelectionEnd;
-    } else if (cursorTime >= activeClip.duration_seconds) {
-      nextStart = normalizedSelectionStart > 0 ? normalizedSelectionStart : 0;
+    } else if (isAtOrPastEnd) {
+      nextStart = Math.max(0, Math.min(playbackStartSeconds, activeClip.duration_seconds));
     }
 
     setWaveSurferTime(nextStart);
@@ -831,6 +891,27 @@ export default function App() {
 
     try {
       await waveSurfer.play(nextStart, nextEnd);
+      setIsPlaying(true);
+      setEditorNotice(null);
+    } catch {
+      setEditorNotice("Audio preview could not start. Check the backend audio route.");
+    }
+  }
+
+  async function handlePlayFromBeginning() {
+    if (!activeClip || !waveSurferRef.current) {
+      return;
+    }
+
+    const waveSurfer = waveSurferRef.current;
+    pausePlayback();
+    setSelectionStart(0);
+    setSelectionEnd(0);
+    setWaveSurferTime(0);
+    setPlaybackStartSeconds(0);
+
+    try {
+      await waveSurfer.play(0);
       setIsPlaying(true);
       setEditorNotice(null);
     } catch {
@@ -865,7 +946,6 @@ export default function App() {
 
     setProjectDetail(result.project_detail);
     setActiveClipId(result.created_clip_ids[0] ?? null);
-    setExportPreview(null);
     setEditorNotice(`Split ${activeClip.id} into ${result.created_clip_ids.length} clips.`);
   }
 
@@ -886,7 +966,6 @@ export default function App() {
 
     setProjectDetail(result.project_detail);
     setActiveClipId(result.created_clip_ids[0] ?? null);
-    setExportPreview(null);
     setEditorNotice(`Merged into ${result.created_clip_ids[0] ?? "a new clip"}.`);
   }
 
@@ -913,10 +992,51 @@ export default function App() {
   const activeHistory = activeClip
     ? historyByClip[activeClip.id] ?? { can_undo: false, can_redo: false }
     : { can_undo: false, can_redo: false };
-  const visibleStartSeconds = 0;
-  const visibleEndSeconds = activeClip?.duration_seconds ?? 0;
+  const datasetStatusCounts = useMemo(() => {
+    const counts: Record<ReviewStatus, number> = {
+      candidate: 0,
+      needs_attention: 0,
+      in_review: 0,
+      accepted: 0,
+      rejected: 0,
+    };
+    const durations: Record<ReviewStatus, number> = {
+      candidate: 0,
+      needs_attention: 0,
+      in_review: 0,
+      accepted: 0,
+      rejected: 0,
+    };
+    for (const clip of projectDetail?.clips ?? []) {
+      counts[clip.review_status] += 1;
+      durations[clip.review_status] += clip.duration_seconds;
+    }
+    return { counts, durations };
+  }, [projectDetail?.clips]);
   const normalizedSelectionStart = Math.min(selectionStart, selectionEnd);
   const normalizedSelectionEnd = Math.max(selectionStart, selectionEnd);
+  const hasActiveSelection = normalizedSelectionEnd - normalizedSelectionStart > 0.01;
+  const acceptedRejectedRatio =
+    datasetStatusCounts.durations.rejected > 0
+      ? datasetStatusCounts.durations.accepted / datasetStatusCounts.durations.rejected
+      : null;
+  const totalDurationSeconds = projectDetail?.stats.total_duration_seconds ?? 0;
+  const resolvedDurationSeconds =
+    datasetStatusCounts.durations.accepted + datasetStatusCounts.durations.rejected;
+  const smoothingSeconds = 10;
+  const smoothedAcceptRate =
+    resolvedDurationSeconds >= 0
+      ? (datasetStatusCounts.durations.accepted + smoothingSeconds) /
+        (resolvedDurationSeconds + smoothingSeconds * 2)
+      : null;
+  const predictedOutputSeconds =
+    smoothedAcceptRate !== null
+      ? Math.min(totalDurationSeconds, Math.max(0, totalDurationSeconds * smoothedAcceptRate))
+      : null;
+  const progressPercent =
+    totalDurationSeconds > 0
+      ? Math.min(100, Math.max(0, (resolvedDurationSeconds / totalDurationSeconds) * 100))
+      : null;
 
   return (
     <div className="app-shell">
@@ -932,14 +1052,6 @@ export default function App() {
           <span className="status-pill">
             Export: {projectDetail?.project.export_status.replace(/_/g, " ") ?? "loading"}
           </span>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={handleExportPreview}
-            disabled={!projectDetail || isExportPreviewLoading}
-          >
-            {isExportPreviewLoading ? "Building Preview..." : "Preview Export"}
-          </button>
           <button
             className="primary-button"
             type="button"
@@ -1035,15 +1147,51 @@ export default function App() {
         <section className="editor-column">
           <section className="panel waveform-panel">
             <div className="panel-header">
-              <div>
+              <div className="clip-editor-header-main">
                 <p className="eyebrow">Clip Editor</p>
-                <h2>{activeClip ? "Selected Clip" : "No clip selected"}</h2>
+                {activeClip ? (
+                  <div className="tag-list header-tag-list">
+                    {activeClip.tags.length > 0 ? (
+                      activeClip.tags.map((tag) => (
+                        <span
+                          key={`${activeClip.id}-top-${tag.name}`}
+                          className="tag-pill"
+                          style={{ backgroundColor: tag.color }}
+                        >
+                          {tag.name}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="muted-copy">No tags</span>
+                    )}
+                  </div>
+                ) : null}
               </div>
               {activeClip ? (
-                <div className="metadata-strip">
-                  <span>{formatSeconds(activeClip.duration_seconds)}</span>
-                  <span>{activeClip.sample_rate / 1000} kHz</span>
-                  <span>{activeClip.channels} ch</span>
+                <div className="clip-editor-header-actions">
+                  <div className="metadata-strip">
+                    <span>{formatSeconds(activeClip.duration_seconds)}</span>
+                    <span>{activeClip.sample_rate / 1000} kHz</span>
+                    <span>{activeClip.channels} ch</span>
+                  </div>
+                  <div className="editor-actions">
+                    <button
+                      className="primary-button"
+                      type="button"
+                      onClick={() => void handleAcceptCommitNextAndPlay()}
+                      disabled={!activeClip || isCommittingClip}
+                    >
+                      Save Clip & Next
+                    </button>
+                    <button
+                      className="primary-button"
+                      type="button"
+                      onClick={() => void handleRejectNextAndPlay()}
+                      disabled={!activeClip || isCommittingClip || isApplyingEdit}
+                    >
+                      Reject Clip & Next
+                    </button>
+                  </div>
                 </div>
               ) : null}
             </div>
@@ -1056,6 +1204,7 @@ export default function App() {
                   audioUrl={buildClipAudioUrl(activeClip.id)}
                   durationSeconds={activeClip.duration_seconds}
                   peaks={null}
+                  desiredCursorSeconds={playheadSeconds}
                   selectionStart={selectionStart}
                   selectionEnd={selectionEnd}
                   onSelectionChange={(start, end) => {
@@ -1063,21 +1212,56 @@ export default function App() {
                     setSelectionEnd(end);
                   }}
                   onCursorChange={(time) => setPlayheadSeconds(time)}
+                  onHoverTimeChange={setHoverSeconds}
                   onReady={(instance) => {
                     waveSurferRef.current = instance;
+                    applyPlaybackRate(instance, playbackRate);
                   }}
                   onPlayingChange={setIsPlaying}
                 />
 
-                <div className="timeline-strip">
-                  <span>{formatSeconds(activeClip.original_start_time + visibleStartSeconds)}</span>
-                  <span>Full Clip</span>
-                  <span>{formatSeconds(activeClip.original_start_time + visibleEndSeconds)}</span>
+                <div className="waveform-second-scale" aria-hidden="true">
+                  {Array.from(
+                    { length: Math.floor(activeClip.duration_seconds) + 1 },
+                    (_, second) => (
+                      <span
+                        key={`sec-tick-${activeClip.id}-${second}`}
+                        className="waveform-second-tick"
+                        style={{
+                          left: `${(second / Math.max(activeClip.duration_seconds, 0.001)) * 100}%`,
+                        }}
+                      >
+                        {second}s
+                      </span>
+                    ),
+                  )}
+                </div>
+
+                <div className="timeline-strip transport-strip">
+                  <span className="transport-pill">
+                    {formatClipTimestamp(playheadSeconds)} /{" "}
+                    {formatClipTimestamp(activeClip.duration_seconds)}
+                  </span>
+                  <span className="transport-meta">
+                    {hoverSeconds !== null
+                      ? `Hover ${formatClipTimestamp(hoverSeconds)}`
+                      : "Hover --.--"}
+                  </span>
+                  <span className="transport-meta">
+                    {hasActiveSelection
+                      ? `Sel ${formatClipTimestamp(normalizedSelectionStart)}-${formatClipTimestamp(normalizedSelectionEnd)} (${formatClipTimestamp(
+                          normalizedSelectionEnd - normalizedSelectionStart,
+                        )})`
+                      : "Sel none"}
+                  </span>
                 </div>
 
                 <div className="editor-actions">
                   <button type="button" onClick={() => void handleTogglePlayback()}>
                     {isPlaying ? "Pause" : "Play"}
+                  </button>
+                  <button type="button" onClick={handleCyclePlaybackRate}>
+                    Speed {playbackRate}x
                   </button>
                   <button type="button" onClick={handleUndo} disabled={!activeHistory.can_undo}>
                     Undo
@@ -1091,9 +1275,15 @@ export default function App() {
                   <button type="button" onClick={handleMergeClip} disabled={isApplyingEdit}>
                     Merge Next Clip
                   </button>
-                  <button type="button" onClick={handleDeleteSelection} disabled={isApplyingEdit}>
-                    Delete Selection
-                  </button>
+                  {hasActiveSelection ? (
+                    <button
+                      type="button"
+                      onClick={handleDeleteSelection}
+                      disabled={isApplyingEdit}
+                    >
+                      Delete Selection
+                    </button>
+                  ) : null}
                   <button type="button" onClick={handleInsertSilence} disabled={isApplyingEdit}>
                     Insert Silence
                   </button>
@@ -1108,75 +1298,80 @@ export default function App() {
             <div className="panel-header">
               <div>
                 <p className="eyebrow">Transcript</p>
-                <h2>Manual Review</h2>
               </div>
-              <button className="primary-button" type="button" onClick={handleTranscriptSave}>
-                Save Transcript
-              </button>
             </div>
 
             <textarea
+              ref={transcriptEditorRef}
               className="transcript-editor"
+              rows={1}
               value={draftTranscript}
-              onChange={(event) => setDraftTranscript(event.target.value)}
+              onChange={(event) => {
+                const editor = event.target;
+                editor.style.height = "auto";
+                editor.style.height = `${editor.scrollHeight}px`;
+                setDraftTranscript(editor.value);
+              }}
               placeholder="Transcript text"
             />
 
             <div className="selection-panel">
               <div className="selection-header">
                 <strong>Tags</strong>
-                <button type="button" onClick={handleTagsSave}>
+                <button className="primary-button" type="button" onClick={handleTagsSave}>
                   Save Tags
                 </button>
               </div>
               <p className="muted-copy">
                 Export uses clip status (`accepted`) + commit state. Tags are for filtering/QA.
               </p>
-              <div className="tag-list">
-                {parseTagDraft(draftTags).map((tag) => (
-                  <button
-                    key={`draft-${tag.name}`}
-                    type="button"
-                    className="tag-pill"
-                    style={{ backgroundColor: tag.color }}
-                    onClick={() => removeTagFromDraft(tag.name)}
-                    title="Remove tag"
-                  >
-                    {tag.name} ×
-                  </button>
-                ))}
+              <div className="tag-token-list">
+                {draftTagEntries.length > 0 ? (
+                  draftTagEntries.map((tag) => (
+                    <button
+                      key={`draft-${tag.name}`}
+                      type="button"
+                      className="tag-pill"
+                      style={{ backgroundColor: tag.color }}
+                      onClick={() => removeTagFromDraft(tag.name)}
+                      title="Remove tag"
+                    >
+                      {tag.name} ×
+                    </button>
+                  ))
+                ) : (
+                  <span className="muted-copy">No tags on this clip yet.</span>
+                )}
               </div>
-              <div className="editor-actions">
-                {defaultTagNames.map((tagName) => (
+              <div className="tag-input-row">
+                <input
+                  className="search-input tag-entry-input"
+                  value={tagInputDraft}
+                  onChange={(event) => setTagInputDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === ",") {
+                      event.preventDefault();
+                      handleAddTagFromInput();
+                    }
+                  }}
+                  placeholder="Add tag (press Enter)"
+                />
+                <button type="button" onClick={handleAddTagFromInput}>
+                  Add
+                </button>
+              </div>
+              <div className="tag-suggestion-wrap">
+                {suggestedTagNames.map((tagName) => (
                   <button
-                    key={`default-tag-${tagName}`}
+                    key={`suggested-tag-${tagName}`}
                     type="button"
+                    className="tag-suggestion-pill"
                     onClick={() => addTagToDraft(tagName)}
                   >
                     + {tagName}
                   </button>
                 ))}
               </div>
-              <div className="editor-actions">
-                <input
-                  className="search-input"
-                  value={newTagDraft}
-                  onChange={(event) => setNewTagDraft(event.target.value)}
-                  placeholder="Create custom tag"
-                />
-                <button type="button" onClick={handleAddCustomTag}>
-                  Add Tag
-                </button>
-              </div>
-              <label>
-                Comma-separated tags
-                <input
-                  className="search-input"
-                  value={draftTags}
-                  onChange={(event) => setDraftTags(event.target.value)}
-                  placeholder="noisy, clipped_end, recheck"
-                />
-              </label>
             </div>
 
             <div className="transcript-footer">
@@ -1218,69 +1413,53 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="editor-actions">
-                <button
-                  type="button"
-                  onClick={() => void handleCommitClip(true)}
-                  disabled={isCommittingClip}
-                >
-                  {isCommittingClip ? "Committing..." : "Commit (C)"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleAcceptCommitNextAndPlay()}
-                  disabled={isCommittingClip}
-                >
-                  Commit + Next (Enter)
-                </button>
-              </div>
-
               <section className="inspector-block">
-                <h3>Provenance</h3>
-                <dl>
-                  <div>
-                    <dt>Source</dt>
-                    <dd>{activeClip.source_file_id}</dd>
+                <div className="stats-table">
+                  <div className="stats-row stats-head">
+                    <span>Status</span>
+                    <span>Clips</span>
+                    <span>Length</span>
                   </div>
-                  <div>
-                    <dt>Working Asset</dt>
-                    <dd>{activeClip.working_asset_id}</dd>
+                  <div className="stats-row">
+                    <span>Total</span>
+                    <span>{projectDetail?.stats.total_clips ?? 0}</span>
+                    <span>{formatDurationCompact(projectDetail?.stats.total_duration_seconds ?? 0)}</span>
                   </div>
-                  <div>
-                    <dt>Original Range</dt>
-                    <dd>
-                      {formatSeconds(activeClip.original_start_time)} to{" "}
-                      {formatSeconds(activeClip.original_end_time)}
-                    </dd>
+                  {queuePriorityOrder
+                    .filter((status) => datasetStatusCounts.counts[status] > 0)
+                    .map((status) => (
+                      <div key={`dataset-stat-${status}`} className="stats-row">
+                        <span>{statusLabels[status]}</span>
+                        <span>{datasetStatusCounts.counts[status]}</span>
+                        <span>{formatDurationCompact(datasetStatusCounts.durations[status])}</span>
+                      </div>
+                    ))}
+                  <div className="stats-divider" />
+                  <div className="stats-row">
+                    <span>A/R Ratio</span>
+                    <span>-</span>
+                    <span>{acceptedRejectedRatio !== null ? acceptedRejectedRatio.toFixed(2) : "n/a"}</span>
                   </div>
-                  <div>
-                    <dt>Edit State</dt>
-                    <dd>{activeClip.edit_state}</dd>
+                  <div className="stats-row">
+                    <span>Predicted Size</span>
+                    <span>-</span>
+                    <span>
+                      {predictedOutputSeconds !== null
+                        ? formatDurationCompact(predictedOutputSeconds)
+                        : "n/a"}
+                    </span>
                   </div>
-                </dl>
-              </section>
-
-              <section className="inspector-block">
-                <h3>Tags</h3>
-                <div className="tag-list">
-                  {activeClip.tags.length > 0 ? (
-                    activeClip.tags.map((tag) => (
-                      <span
-                        key={`${activeClip.id}-${tag.name}`}
-                        className="tag-pill"
-                        style={{ backgroundColor: tag.color }}
-                      >
-                        {tag.name}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="muted-copy">No tags saved yet.</span>
-                  )}
+                  <div className="stats-divider" />
+                  <div className="stats-row">
+                    <span>Progress</span>
+                    <span>-</span>
+                    <span>{progressPercent !== null ? `${Math.round(progressPercent)}%` : "n/a"}</span>
+                  </div>
                 </div>
               </section>
 
               <section className="inspector-block">
-                <h3>EDL Summary</h3>
+                <h3>Edit History</h3>
                 {activeClip.clip_edl.length > 0 ? (
                   <ul className="edl-list">
                     {activeClip.clip_edl.map((operation, index) => (
@@ -1327,28 +1506,6 @@ export default function App() {
               </section>
 
               <section className="inspector-block">
-                <h3>Export Preview</h3>
-                {exportPreview ? (
-                  <div className="export-preview">
-                    <p className="muted-copy">
-                      {exportPreview.accepted_clip_count} committed accepted clip
-                      {exportPreview.accepted_clip_count === 1 ? "" : "s"} ready
-                    </p>
-                    <p className="manifest-path">{exportPreview.manifest_path}</p>
-                    {exportPreview.lines.length > 0 ? (
-                      <pre className="manifest-preview">{exportPreview.lines.join("\n")}</pre>
-                    ) : (
-                      <p className="muted-copy">
-                        No export-eligible clips yet. Accepted clips must also be committed.
-                      </p>
-                    )}
-                  </div>
-                ) : (
-                  <p className="muted-copy">Generate a preview to inspect the next `.list` export.</p>
-                )}
-              </section>
-
-              <section className="inspector-block">
                 <h3>Export Runs</h3>
                 {exportRuns.length > 0 ? (
                   <div className="commit-list">
@@ -1369,6 +1526,31 @@ export default function App() {
                 ) : (
                   <p className="muted-copy">No export runs yet.</p>
                 )}
+              </section>
+
+              <section className="inspector-block">
+                <h3>Provenance</h3>
+                <dl>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{activeClip.source_file_id}</dd>
+                  </div>
+                  <div>
+                    <dt>Working Asset</dt>
+                    <dd>{activeClip.working_asset_id}</dd>
+                  </div>
+                  <div>
+                    <dt>Original Range</dt>
+                    <dd>
+                      {formatSeconds(activeClip.original_start_time)} to{" "}
+                      {formatSeconds(activeClip.original_end_time)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Edit State</dt>
+                    <dd>{activeClip.edit_state}</dd>
+                  </div>
+                </dl>
               </section>
             </>
           ) : (

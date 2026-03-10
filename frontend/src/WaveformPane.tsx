@@ -6,10 +6,12 @@ type WaveformPaneProps = {
   audioUrl: string;
   durationSeconds: number;
   peaks: number[] | null;
+  desiredCursorSeconds?: number;
   selectionStart: number;
   selectionEnd: number;
   onSelectionChange: (start: number, end: number) => void;
   onCursorChange: (time: number) => void;
+  onHoverTimeChange?: (time: number | null) => void;
   onReady?: (instance: WaveSurfer | null) => void;
   onPlayingChange?: (isPlaying: boolean) => void;
 };
@@ -18,13 +20,17 @@ export default function WaveformPane({
   audioUrl,
   durationSeconds,
   peaks,
+  desiredCursorSeconds = 0,
   selectionStart,
   selectionEnd,
   onSelectionChange,
   onCursorChange,
+  onHoverTimeChange,
   onReady,
   onPlayingChange,
 }: WaveformPaneProps) {
+  const precision = 10000;
+  const roundTime = (value: number): number => Math.round(value * precision) / precision;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const waveSurferRef = useRef<WaveSurfer | null>(null);
   const regionsRef = useRef<any>(null);
@@ -34,15 +40,23 @@ export default function WaveformPane({
   const draggedThisGestureRef = useRef(false);
   const selectionChangeRef = useRef(onSelectionChange);
   const cursorChangeRef = useRef(onCursorChange);
+  const hoverTimeChangeRef = useRef(onHoverTimeChange);
   const readyRef = useRef(onReady);
   const playingChangeRef = useRef(onPlayingChange);
+  const lastAudioUrlRef = useRef<string | null>(null);
+  const desiredCursorRef = useRef(desiredCursorSeconds);
 
   useEffect(() => {
     selectionChangeRef.current = onSelectionChange;
     cursorChangeRef.current = onCursorChange;
+    hoverTimeChangeRef.current = onHoverTimeChange;
     readyRef.current = onReady;
     playingChangeRef.current = onPlayingChange;
-  }, [onSelectionChange, onCursorChange, onReady, onPlayingChange]);
+  }, [onSelectionChange, onCursorChange, onHoverTimeChange, onReady, onPlayingChange]);
+
+  useEffect(() => {
+    desiredCursorRef.current = desiredCursorSeconds;
+  }, [desiredCursorSeconds]);
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -115,19 +129,19 @@ export default function WaveformPane({
       if (draggedThisGestureRef.current) {
         return;
       }
-      cursorChangeRef.current(Number(waveSurfer.getCurrentTime().toFixed(2)));
+      cursorChangeRef.current(roundTime(waveSurfer.getCurrentTime()));
     };
     const handleSeeking = (time: number) => {
       if (draggedThisGestureRef.current) {
         return;
       }
-      cursorChangeRef.current(Number(time.toFixed(2)));
+      cursorChangeRef.current(roundTime(time));
     };
     const handleClick = () => {
       if (draggedThisGestureRef.current) {
         return;
       }
-      const time = Number(waveSurfer.getCurrentTime().toFixed(2));
+      const time = roundTime(waveSurfer.getCurrentTime());
       cursorChangeRef.current(time);
       selectionChangeRef.current(time, time);
     };
@@ -147,15 +161,15 @@ export default function WaveformPane({
         }
       }
       selectionChangeRef.current(
-        Number(region.start.toFixed(2)),
-        Number(region.end.toFixed(2)),
+        roundTime(region.start),
+        roundTime(region.end),
       );
     });
 
     regions.on("region-updated", (region: any) => {
       selectionChangeRef.current(
-        Number(region.start.toFixed(2)),
-        Number(region.end.toFixed(2)),
+        roundTime(region.start),
+        roundTime(region.end),
       );
     });
 
@@ -166,6 +180,20 @@ export default function WaveformPane({
     };
 
     const handlePointerMove = (event: PointerEvent) => {
+      const wrapper = waveSurfer.getWrapper();
+      const scrollContainer = wrapper.parentElement;
+      const duration = waveSurfer.getDuration();
+      if (scrollContainer && duration > 0 && wrapper.scrollWidth > 0) {
+        const viewport = scrollContainer.getBoundingClientRect();
+        const localX = Math.max(0, Math.min(event.clientX - viewport.left, viewport.width));
+        const absoluteX = Math.max(
+          0,
+          Math.min(scrollContainer.scrollLeft + localX, wrapper.scrollWidth),
+        );
+        const hoverTime = roundTime((absoluteX / wrapper.scrollWidth) * duration);
+        hoverTimeChangeRef.current?.(hoverTime);
+      }
+
       if (!isPointerDownRef.current || pointerStartXRef.current === null) {
         return;
       }
@@ -202,12 +230,16 @@ export default function WaveformPane({
         scrollContainer.scrollLeft += event.deltaY;
       }
     };
+    const handlePointerLeave = () => {
+      hoverTimeChangeRef.current?.(null);
+    };
 
     containerRef.current.addEventListener("wheel", handleWheel, { passive: false });
     containerRef.current.addEventListener("pointerdown", handlePointerDown);
     containerRef.current.addEventListener("pointermove", handlePointerMove);
     containerRef.current.addEventListener("pointerup", handlePointerUp);
     containerRef.current.addEventListener("pointercancel", handlePointerUp);
+    containerRef.current.addEventListener("pointerleave", handlePointerLeave);
 
     return () => {
       containerRef.current?.removeEventListener("wheel", handleWheel);
@@ -215,6 +247,7 @@ export default function WaveformPane({
       containerRef.current?.removeEventListener("pointermove", handlePointerMove);
       containerRef.current?.removeEventListener("pointerup", handlePointerUp);
       containerRef.current?.removeEventListener("pointercancel", handlePointerUp);
+      containerRef.current?.removeEventListener("pointerleave", handlePointerLeave);
       readyRef.current?.(null);
       waveSurfer.destroy();
       waveSurferRef.current = null;
@@ -228,11 +261,19 @@ export default function WaveformPane({
       return;
     }
 
-    const resetOnReady = () => {
-      waveSurfer.seekTo(0);
-      cursorChangeRef.current(0);
+    const isClipChange = lastAudioUrlRef.current !== audioUrl;
+    lastAudioUrlRef.current = audioUrl;
+    const targetTime = isClipChange
+      ? 0
+      : Math.max(0, Math.min(desiredCursorRef.current, durationSeconds));
+    const seekOnReady = () => {
+      const duration = waveSurfer.getDuration();
+      if (duration > 0) {
+        waveSurfer.seekTo(Math.max(0, Math.min(targetTime / duration, 1)));
+      }
+      cursorChangeRef.current(roundTime(targetTime));
     };
-    waveSurfer.once("ready", resetOnReady);
+    waveSurfer.once("ready", seekOnReady);
 
     if (peaks && peaks.length > 0) {
       void waveSurfer.load(audioUrl, [peaks], durationSeconds);
