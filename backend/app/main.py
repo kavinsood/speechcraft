@@ -202,7 +202,7 @@ def get_clip_audio(clip_id: str) -> Response:
     try:
         return Response(
             content=repository.get_clip_audio_bytes(clip_id),
-            media_type="audio/wav",
+            media_type=repository.get_clip_audio_media_type(clip_id),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Clip not found") from exc

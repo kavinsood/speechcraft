@@ -289,6 +289,7 @@ class FileBackedRepository:
                     order_index=(imported_count + 1) * 10,
                     source_file_id=source_file_ids[audio_path],
                     working_asset_id=working_asset_ids[audio_path],
+                    audio_path=audio_path,
                     original_start_time=0.0,
                     original_end_time=round(duration_seconds, 2),
                     clip_edl=[],
@@ -709,7 +710,7 @@ class FileBackedRepository:
                 )
 
             manifest_path.write_text("\n".join(manifest_lines))
-            dataset_jsonl_path = self._resolve_project_jsonl_output_path(project_id, committed)
+            dataset_jsonl_path = self._resolve_project_jsonl_output_path(output_root, project_id)
             if dataset_jsonl_path is not None:
                 dataset_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
                 dataset_jsonl_path.write_text("\n".join(jsonl_lines))
@@ -747,6 +748,25 @@ class FileBackedRepository:
     def get_clip_audio_bytes(self, clip_id: str) -> bytes:
         clip = self._find_clip(clip_id)
         return self._get_clip_audio_bytes_for_clip(clip)
+
+    def get_clip_audio_media_type(self, clip_id: str) -> str:
+        clip = self._find_clip(clip_id)
+        audio_path = self._resolve_clip_audio_path(clip)
+        if audio_path is None:
+            return "audio/wav"
+
+        suffix = audio_path.suffix.lower()
+        if suffix == ".mp3":
+            return "audio/mpeg"
+        if suffix == ".flac":
+            return "audio/flac"
+        if suffix == ".ogg":
+            return "audio/ogg"
+        if suffix == ".m4a":
+            return "audio/mp4"
+        if suffix == ".aac":
+            return "audio/aac"
+        return "audio/wav"
 
     def _get_clip_audio_bytes_for_clip(self, clip: Clip) -> bytes:
         audio_path = self._resolve_clip_audio_path(clip)
@@ -866,40 +886,10 @@ class FileBackedRepository:
 
     def _resolve_project_jsonl_output_path(
         self,
+        output_root: Path,
         project_id: str,
-        clips: list[Clip],
     ) -> Path | None:
-        if not clips:
-            return None
-
-        directory_scores: dict[Path, int] = {}
-        preferred_stems: dict[Path, str] = {}
-        for clip in clips:
-            if not clip.audio_path:
-                continue
-            audio_path = Path(clip.audio_path).expanduser()
-            parent = audio_path.parent
-            if not parent:
-                continue
-
-            # Prefer the dataset root one level above raw/segments folders when available.
-            dataset_dir = parent.parent if parent.name.lower() in {"raw", "clips", "segments"} else parent
-            directory_scores[dataset_dir] = directory_scores.get(dataset_dir, 0) + 1
-
-            train_jsonl = dataset_dir / "train.jsonl"
-            if train_jsonl.exists():
-                preferred_stems[dataset_dir] = "train"
-            elif dataset_dir not in preferred_stems:
-                jsonl_candidates = sorted(dataset_dir.glob("*.jsonl"))
-                if jsonl_candidates:
-                    preferred_stems[dataset_dir] = jsonl_candidates[0].stem
-
-        if not directory_scores:
-            return self.exports_root / project_id / "committed-clips.jsonl"
-
-        output_dir = max(directory_scores, key=lambda path: directory_scores[path])
-        base_name = preferred_stems.get(output_dir, "train")
-        return output_dir / f"{base_name}.committed.jsonl"
+        return output_root / f"{project_id}.committed.jsonl"
 
     def _synthetic_peak_value(self, clip: Clip, ratio: float) -> float:
         seed = sum(ord(char) for char in clip.id)
