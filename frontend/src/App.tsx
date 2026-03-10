@@ -237,6 +237,10 @@ export default function App() {
   const transcriptEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const tagFilterRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoPlayAfterClipChangeRef = useRef(false);
+  const playFromBeginningRef = useRef<() => Promise<void>>(async () => {});
+  const togglePlaybackRef = useRef<() => Promise<void>>(async () => {});
+  const rejectNextRef = useRef<() => Promise<void>>(async () => {});
+  const acceptNextRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -321,20 +325,20 @@ export default function App() {
       if (event.code === "Space") {
         event.preventDefault();
         if (event.shiftKey) {
-          void handlePlayFromBeginning();
+          void playFromBeginningRef.current();
           return;
         }
-        void handleTogglePlayback();
+        void togglePlaybackRef.current();
         return;
       }
 
       if (event.code === "Enter") {
         event.preventDefault();
         if (event.shiftKey) {
-          void handleRejectNextAndPlay();
+          void rejectNextRef.current();
           return;
         }
-        void handleAcceptCommitNextAndPlay();
+        void acceptNextRef.current();
         return;
       }
 
@@ -344,7 +348,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  });
+  }, []);
 
   const queueClips = useMemo(() => {
     const clips = projectDetail?.clips ?? [];
@@ -583,7 +587,7 @@ export default function App() {
     }
 
     if (reviewStatus === "accepted") {
-      await handleCommitClip(true);
+      await handleCommitClip("accepted");
       return;
     }
 
@@ -741,7 +745,7 @@ export default function App() {
     setEditorNotice("Re-applied the next local state.");
   }
 
-  async function handleCommitClip(forceAccepted = false): Promise<boolean> {
+  async function handleCommitClip(targetStatus: ReviewStatus | null = null): Promise<boolean> {
     if (!activeClip || !projectDetail) {
       return false;
     }
@@ -753,28 +757,34 @@ export default function App() {
 
     if (draftTranscript !== activeClip.transcript.text_current) {
       const transcriptClip = await updateClipTranscript(activeClip.id, draftTranscript);
-      if (transcriptClip) {
-        workingClip = transcriptClip;
-        setProjectDetail((current) =>
-          current ? replaceClipInProject(current, transcriptClip) : current,
-        );
+      if (!transcriptClip) {
+        setIsCommittingClip(false);
+        setEditorNotice("Transcript save failed. Commit cancelled.");
+        return false;
       }
+      workingClip = transcriptClip;
+      setProjectDetail((current) =>
+        current ? replaceClipInProject(current, transcriptClip) : current,
+      );
     }
 
     const currentTagDraft = workingClip.tags.map((tag) => tag.name).join(", ");
     if (draftTags.trim() !== currentTagDraft.trim()) {
       const tagClip = await updateClipTags(workingClip.id, parseTagDraft(draftTags));
-      if (tagClip) {
-        workingClip = tagClip;
-        setProjectDetail((current) => (current ? replaceClipInProject(current, tagClip) : current));
+      if (!tagClip) {
+        setIsCommittingClip(false);
+        setEditorNotice("Tag update failed. Commit cancelled.");
+        return false;
       }
+      workingClip = tagClip;
+      setProjectDetail((current) => (current ? replaceClipInProject(current, tagClip) : current));
     }
 
-    if (forceAccepted && workingClip.review_status !== "accepted") {
-      const statusClip = await updateClipStatus(workingClip.id, "accepted");
+    if (targetStatus && workingClip.review_status !== targetStatus) {
+      const statusClip = await updateClipStatus(workingClip.id, targetStatus);
       if (!statusClip) {
         setIsCommittingClip(false);
-        setEditorNotice("Could not mark clip as accepted before commit.");
+        setEditorNotice(`Could not mark clip as ${statusLabels[targetStatus].toLowerCase()} before commit.`);
         return false;
       }
       workingClip = statusClip;
@@ -784,6 +794,8 @@ export default function App() {
     const message =
       workingClip.review_status === "accepted"
         ? "Accepted clip snapshot"
+        : workingClip.review_status === "rejected"
+          ? "Rejected clip snapshot"
         : "Manual review commit";
 
     const createdCommit = await commitClip(workingClip.id, message);
@@ -818,7 +830,7 @@ export default function App() {
     }
 
     const nextClipId = getNextClipId(activeClip.id);
-    const committed = await handleCommitClip(true);
+    const committed = await handleCommitClip("accepted");
     if (!committed) {
       return;
     }
@@ -838,17 +850,13 @@ export default function App() {
     }
 
     const nextClipId = getNextClipId(activeClip.id);
-    pausePlayback();
-    const updatedClip = await updateClipStatus(activeClip.id, "rejected");
-    if (!updatedClip) {
-      setEditorNotice("Could not mark clip as rejected.");
+    const committed = await handleCommitClip("rejected");
+    if (!committed) {
       return;
     }
 
-    updateCurrentClip(updatedClip);
-    setEditorNotice("Marked clip as rejected.");
-
     if (!nextClipId) {
+      setEditorNotice("Committed rejection. No next clip in the current queue.");
       return;
     }
 
@@ -918,6 +926,11 @@ export default function App() {
       setEditorNotice("Audio preview could not start. Check the backend audio route.");
     }
   }
+
+  playFromBeginningRef.current = handlePlayFromBeginning;
+  togglePlaybackRef.current = handleTogglePlayback;
+  rejectNextRef.current = handleRejectNextAndPlay;
+  acceptNextRef.current = handleAcceptCommitNextAndPlay;
 
   async function handleSplitClip() {
     if (!activeClip) {
