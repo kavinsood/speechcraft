@@ -435,13 +435,52 @@ button:disabled {
   touch-action: none;
 }
 
+.waveform-shell {
+  position: relative;
+}
+
 .wavesurfer-host {
+  position: relative;
   min-height: 15rem;
   border-radius: 1.25rem;
   padding: 0.35rem;
   background:
     linear-gradient(180deg, rgba(31, 53, 61, 0.96), rgba(20, 33, 37, 0.98)),
     linear-gradient(90deg, rgba(250, 222, 157, 0.08), transparent);
+  overflow: hidden;
+}
+
+.waveform-overlay {
+  position: absolute;
+  inset: 0.35rem;
+  display: grid;
+  place-content: center;
+  gap: 0.35rem;
+  padding: 1.5rem;
+  border-radius: 1rem;
+  text-align: center;
+  backdrop-filter: blur(3px);
+  pointer-events: none;
+}
+
+.waveform-overlay strong {
+  font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+  font-size: 1rem;
+}
+
+.waveform-overlay span {
+  max-width: 34rem;
+  color: rgba(239, 244, 246, 0.92);
+}
+
+.waveform-overlay-loading {
+  background: linear-gradient(180deg, rgba(24, 38, 43, 0.18), rgba(24, 38, 43, 0.36));
+  color: #f6efe4;
+}
+
+.waveform-overlay-error {
+  background: linear-gradient(180deg, rgba(87, 35, 35, 0.68), rgba(58, 18, 18, 0.82));
+  color: #fff2ee;
 }
 
 .waveform-stage::after {
@@ -944,6 +983,30 @@ button:disabled {
 .muted-copy,
 .empty-state {
   color: #66757c;
+}
+
+.workspace-pane {
+  padding: 1rem;
+}
+
+.workspace-state-panel {
+  display: grid;
+  align-content: center;
+  gap: 0.75rem;
+  min-height: 100%;
+  padding: 1.2rem;
+  border-radius: 1rem;
+  background: rgba(247, 243, 234, 0.9);
+  border: 1px solid rgba(97, 91, 74, 0.1);
+}
+
+.workspace-state-panel h2,
+.workspace-state-panel p {
+  margin: 0;
+}
+
+.workspace-state-panel .primary-button {
+  justify-self: start;
 }
 
 .empty-state {

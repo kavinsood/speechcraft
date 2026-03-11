@@ -622,10 +622,13 @@ class FileBackedRepository:
     def get_waveform_peaks(self, clip_id: str, bins: int = 120) -> WaveformPeaks:
         clip = self._find_clip(clip_id)
         safe_bins = max(16, min(bins, 512))
-        peaks = self._extract_waveform_peaks_from_bytes(
-            self.get_clip_audio_bytes(clip.id),
-            safe_bins,
-        )
+        audio_path = self._resolve_clip_audio_path(clip)
+        peaks: list[float] | None = None
+        if audio_path is not None:
+            peaks = self._extract_waveform_peaks_from_bytes(
+                self.get_clip_audio_bytes(clip.id),
+                safe_bins,
+            )
         if peaks is None:
             peaks = [
                 round(self._synthetic_peak_value(clip, index / safe_bins), 4)

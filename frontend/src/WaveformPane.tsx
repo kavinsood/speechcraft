@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 
@@ -45,6 +45,8 @@ export default function WaveformPane({
   const playingChangeRef = useRef(onPlayingChange);
   const lastAudioUrlRef = useRef<string | null>(null);
   const desiredCursorRef = useRef(desiredCursorSeconds);
+  const [audioState, setAudioState] = useState<"loading" | "ready" | "error">("loading");
+  const [audioError, setAudioError] = useState<string | null>(null);
 
   useEffect(() => {
     selectionChangeRef.current = onSelectionChange;
@@ -153,6 +155,21 @@ export default function WaveformPane({
     waveSurfer.on("play", () => playingChangeRef.current?.(true));
     waveSurfer.on("pause", () => playingChangeRef.current?.(false));
     waveSurfer.on("finish", () => playingChangeRef.current?.(false));
+    waveSurfer.on("ready", () => {
+      setAudioState("ready");
+      setAudioError(null);
+    });
+    waveSurfer.on("error", (error) => {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string" && error
+            ? error
+            : "Audio failed to load for this clip.";
+      setAudioState("error");
+      setAudioError(message);
+      playingChangeRef.current?.(false);
+    });
 
     regions.on("region-created", (region: any) => {
       for (const candidate of regions.getRegions()) {
@@ -274,6 +291,8 @@ export default function WaveformPane({
       cursorChangeRef.current(roundTime(targetTime));
     };
     waveSurfer.once("ready", seekOnReady);
+    setAudioState("loading");
+    setAudioError(null);
 
     if (peaks && peaks.length > 0) {
       void waveSurfer.load(audioUrl, [peaks], durationSeconds);
@@ -318,5 +337,22 @@ export default function WaveformPane({
     }
   }, [selectionStart, selectionEnd]);
 
-  return <div ref={containerRef} className="wavesurfer-host" aria-label="Waveform editor" />;
+  return (
+    <div className={`waveform-shell waveform-shell-${audioState}`}>
+      <div ref={containerRef} className="wavesurfer-host" aria-label="Waveform editor" />
+      {audioState !== "ready" ? (
+        <div
+          className={`waveform-overlay waveform-overlay-${audioState}`}
+          role={audioState === "error" ? "alert" : "status"}
+        >
+          <strong>{audioState === "loading" ? "Loading audio..." : "Audio unavailable"}</strong>
+          <span>
+            {audioState === "loading"
+              ? "Fetching clip audio and preparing the waveform."
+              : audioError ?? "The backend could not decode this clip."}
+          </span>
+        </div>
+      ) : null}
+    </div>
+  );
 }
