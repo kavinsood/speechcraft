@@ -92,6 +92,7 @@ export default function EditorPane({
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [waveformPeaks, setWaveformPeaks] = useState<WaveformPeaks | null>(null);
+  const [waveformError, setWaveformError] = useState<string | null>(null);
 
   const draftTagEntries = useMemo(() => parseTagDraft(draftTags), [draftTags]);
   const suggestedTagNames = useMemo(() => {
@@ -119,6 +120,7 @@ export default function EditorPane({
     setPlaybackStartSeconds(0);
     setIsPlaying(false);
     setEditorNotice(null);
+    setWaveformError(null);
 
     if (shouldAutoPlayAfterClipChangeRef.current) {
       shouldAutoPlayAfterClipChangeRef.current = false;
@@ -141,10 +143,11 @@ export default function EditorPane({
 
     let cancelled = false;
     setWaveformPeaks(null);
+    setWaveformError(null);
 
     void (async () => {
       try {
-        const nextPeaks = await fetchWaveformPeaks(activeClip.id, 240);
+        const nextPeaks = await fetchWaveformPeaks(activeClip.id, 960);
         if (cancelled) {
           return;
         }
@@ -153,9 +156,10 @@ export default function EditorPane({
         if (cancelled) {
           return;
         }
-        console.error(
-          error instanceof Error ? error.message : "Waveform peaks failed to load for this clip.",
-        );
+        const message =
+          error instanceof Error ? error.message : "Waveform peaks failed to load for this clip.";
+        console.error(message);
+        setWaveformError(message);
         setWaveformPeaks(null);
       }
     })();
@@ -656,93 +660,104 @@ export default function EditorPane({
             onAction={onRetryLoad}
           />
         ) : activeClip ? (
-          <>
-            <WaveformPane
-              audioUrl={activeClipAudioUrl ?? ""}
-              durationSeconds={activeClip.duration_seconds}
-              peaks={waveformPeaks?.peaks ?? null}
-              desiredCursorSeconds={playheadSeconds}
-              selectionStart={selectionStart}
-              selectionEnd={selectionEnd}
-              onSelectionChange={(start, end) => {
-                setSelectionStart(start);
-                setSelectionEnd(end);
-              }}
-              onCursorChange={setPlayheadSeconds}
-              onHoverTimeChange={setHoverSeconds}
-              onReady={(instance) => {
-                waveSurferRef.current = instance;
-                applyPlaybackRate(instance, playbackRate);
-              }}
-              onPlayingChange={setIsPlaying}
-            />
+          waveformError ? (
+            <div className="waveform-offline-panel" role="alert">
+              <strong>Media offline</strong>
+              <p>{waveformError}</p>
+              <span>
+                This clip can still be reviewed for transcript and metadata, but waveform-driven
+                editing is unavailable until the source audio is re-linked.
+              </span>
+            </div>
+          ) : (
+            <>
+              <WaveformPane
+                audioUrl={activeClipAudioUrl ?? ""}
+                durationSeconds={activeClip.duration_seconds}
+                peaks={waveformPeaks?.peaks ?? null}
+                desiredCursorSeconds={playheadSeconds}
+                selectionStart={selectionStart}
+                selectionEnd={selectionEnd}
+                onSelectionChange={(start, end) => {
+                  setSelectionStart(start);
+                  setSelectionEnd(end);
+                }}
+                onCursorChange={setPlayheadSeconds}
+                onHoverTimeChange={setHoverSeconds}
+                onReady={(instance) => {
+                  waveSurferRef.current = instance;
+                  applyPlaybackRate(instance, playbackRate);
+                }}
+                onPlayingChange={setIsPlaying}
+              />
 
-            <div className="waveform-second-scale" aria-hidden="true">
-              {Array.from({ length: Math.floor(activeClip.duration_seconds) + 1 }, (_, second) => (
-                <span
-                  key={`sec-tick-${activeClip.id}-${second}`}
-                  className="waveform-second-tick"
-                  style={{
-                    left: `${(second / Math.max(activeClip.duration_seconds, 0.001)) * 100}%`,
-                  }}
-                >
-                  {second}s
+              <div className="waveform-second-scale" aria-hidden="true">
+                {Array.from({ length: Math.floor(activeClip.duration_seconds) + 1 }, (_, second) => (
+                  <span
+                    key={`sec-tick-${activeClip.id}-${second}`}
+                    className="waveform-second-tick"
+                    style={{
+                      left: `${(second / Math.max(activeClip.duration_seconds, 0.001)) * 100}%`,
+                    }}
+                  >
+                    {second}s
+                  </span>
+                ))}
+              </div>
+
+              <div className="timeline-strip transport-strip">
+                <span className="transport-pill">
+                  {formatClipTimestamp(playheadSeconds)} /{" "}
+                  {formatClipTimestamp(activeClip.duration_seconds)}
                 </span>
-              ))}
-            </div>
+                <span className="transport-meta">
+                  {hoverSeconds !== null
+                    ? `Hover ${formatClipTimestamp(hoverSeconds)}`
+                    : "Hover --.--"}
+                </span>
+                <span className="transport-meta">
+                  {hasActiveSelection
+                    ? `Sel ${formatClipTimestamp(normalizedSelectionStart)}-${formatClipTimestamp(normalizedSelectionEnd)} (${formatClipTimestamp(
+                        normalizedSelectionEnd - normalizedSelectionStart,
+                      )})`
+                    : "Sel none"}
+                </span>
+              </div>
 
-            <div className="timeline-strip transport-strip">
-              <span className="transport-pill">
-                {formatClipTimestamp(playheadSeconds)} /{" "}
-                {formatClipTimestamp(activeClip.duration_seconds)}
-              </span>
-              <span className="transport-meta">
-                {hoverSeconds !== null
-                  ? `Hover ${formatClipTimestamp(hoverSeconds)}`
-                  : "Hover --.--"}
-              </span>
-              <span className="transport-meta">
-                {hasActiveSelection
-                  ? `Sel ${formatClipTimestamp(normalizedSelectionStart)}-${formatClipTimestamp(normalizedSelectionEnd)} (${formatClipTimestamp(
-                      normalizedSelectionEnd - normalizedSelectionStart,
-                    )})`
-                  : "Sel none"}
-              </span>
-            </div>
-
-            <div className="editor-actions">
-              <button type="button" onClick={() => void handleTogglePlayback()}>
-                {isPlaying ? "Pause" : "Play"}
-              </button>
-              <button type="button" onClick={handleCyclePlaybackRate}>
-                Speed {playbackRate}x
-              </button>
-              <button type="button" onClick={() => void handleUndo()} disabled={!activeHistory.can_undo}>
-                Undo
-              </button>
-              <button type="button" onClick={() => void handleRedo()} disabled={!activeHistory.can_redo}>
-                Redo
-              </button>
-              <button type="button" onClick={() => void handleSplitClip()} disabled={isApplyingEdit}>
-                {isApplyingEdit ? "Applying..." : "Split Clip"}
-              </button>
-              <button type="button" onClick={() => void handleMergeClip()} disabled={isApplyingEdit}>
-                Merge Next Clip
-              </button>
-              {hasActiveSelection ? (
-                <button
-                  type="button"
-                  onClick={() => void handleDeleteSelection()}
-                  disabled={isApplyingEdit}
-                >
-                  Delete Selection
+              <div className="editor-actions">
+                <button type="button" onClick={() => void handleTogglePlayback()}>
+                  {isPlaying ? "Pause" : "Play"}
                 </button>
-              ) : null}
-              <button type="button" onClick={() => void handleInsertSilence()} disabled={isApplyingEdit}>
-                Insert Silence
-              </button>
-            </div>
-          </>
+                <button type="button" onClick={handleCyclePlaybackRate}>
+                  Speed {playbackRate}x
+                </button>
+                <button type="button" onClick={() => void handleUndo()} disabled={!activeHistory.can_undo}>
+                  Undo
+                </button>
+                <button type="button" onClick={() => void handleRedo()} disabled={!activeHistory.can_redo}>
+                  Redo
+                </button>
+                <button type="button" onClick={() => void handleSplitClip()} disabled={isApplyingEdit}>
+                  {isApplyingEdit ? "Applying..." : "Split Clip"}
+                </button>
+                <button type="button" onClick={() => void handleMergeClip()} disabled={isApplyingEdit}>
+                  Merge Next Clip
+                </button>
+                {hasActiveSelection ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteSelection()}
+                    disabled={isApplyingEdit}
+                  >
+                    Delete Selection
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => void handleInsertSilence()} disabled={isApplyingEdit}>
+                  Insert Silence
+                </button>
+              </div>
+            </>
+          )
         ) : (
           <div className="empty-state">
             {workspacePhase === "empty"
