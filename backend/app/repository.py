@@ -621,7 +621,7 @@ class FileBackedRepository:
 
     def get_waveform_peaks(self, clip_id: str, bins: int = 120) -> WaveformPeaks:
         clip = self._find_clip(clip_id)
-        safe_bins = max(16, min(bins, 512))
+        safe_bins = max(32, min(bins, 2048))
         audio_path = self._resolve_clip_audio_path(clip)
         peaks: list[float] | None = None
         if audio_path is not None:
@@ -629,6 +629,8 @@ class FileBackedRepository:
                 self.get_clip_audio_bytes(clip.id),
                 safe_bins,
             )
+        elif not self._should_use_synthetic_media(clip):
+            raise FileNotFoundError("Source audio missing for this clip. Re-link media to continue.")
         if peaks is None:
             peaks = [
                 round(self._synthetic_peak_value(clip, index / safe_bins), 4)
@@ -647,6 +649,8 @@ class FileBackedRepository:
             if audio_path.suffix.lower() == ".wav":
                 return self._apply_clip_edl_to_wav_bytes(clip, audio_bytes)
             return audio_bytes
+        if not self._should_use_synthetic_media(clip):
+            raise FileNotFoundError("Source audio missing for this clip. Re-link media to continue.")
         return self._render_clip_wave_bytes(clip)
 
     def _ensure_runtime_state(self) -> None:
@@ -833,6 +837,9 @@ class FileBackedRepository:
                 wave_file.writeframesraw(frame)
 
         return buffer.getvalue()
+
+    def _should_use_synthetic_media(self, clip: Clip) -> bool:
+        return clip.project_id == "phase1-demo" and clip.transcript.source != "import"
 
     def _resolve_clip_audio_path(self, clip: Clip) -> Path | None:
         if not clip.audio_path:

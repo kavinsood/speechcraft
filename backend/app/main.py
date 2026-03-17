@@ -183,6 +183,8 @@ def get_waveform_peaks(clip_id: str, bins: int = 120) -> WaveformPeaks:
         return repository.get_waveform_peaks(clip_id, bins)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Clip not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/clips/{clip_id}/audio")
@@ -194,3 +196,5 @@ def get_clip_audio(clip_id: str) -> Response:
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Clip not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
