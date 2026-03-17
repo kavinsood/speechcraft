@@ -1,63 +1,42 @@
-import {
-  startTransition,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import {
-  appendClipEdlOperation,
-  ApiError,
-  buildClipAudioUrl,
-  commitClip,
-  fetchClipCommits,
-  fetchProjects,
-  fetchProjectDetail,
-  fetchProjectExports,
-  mergeWithNextClip,
-  redoClip,
-  runProjectExport,
-  splitClip,
-  undoClip,
-  updateClipStatus,
-  updateClipTags,
-  updateClipTranscript,
-} from "./api";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Settings2 } from "lucide-react";
+import { ApiError, fetchProjects } from "./api";
 import BackendTestPage from "./BackendTestPage";
-import ErrorBoundary from "./ErrorBoundary";
-import ClipQueuePane from "./workspace/ClipQueuePane";
-import EditorPane from "./workspace/EditorPane";
-import InspectorPane from "./workspace/InspectorPane";
-import WorkspaceStatePanel from "./workspace/WorkspaceStatePanel";
-import {
-  queuePriorityOrder,
-  recalculateProjectDetail,
-  sortClipsForQueue,
-  statusLabels,
-} from "./workspace/workspace-helpers";
-import type {
-  Clip,
-  ClipCommit,
-  ClipHistoryResult,
-  ClipMutationResult,
-  ExportRun,
-  ProjectDetail,
-  ReviewStatus,
-} from "./types";
+import IngestPage from "./pages/IngestPage";
+import LabelPage from "./pages/LabelPage";
+import StepPlaceholderPage from "./pages/StepPlaceholderPage";
+import type { Project } from "./types";
 
-type HistoryFlags = {
-  can_undo: boolean;
-  can_redo: boolean;
+type AppStep = "ingest" | "enhance" | "segment" | "label" | "train" | "deploy";
+type ProjectLoadStatus = "loading" | "ready" | "error";
+
+type AppRoute = {
+  step: AppStep;
+  projectId: string | null;
 };
 
-type WorkspaceStatus = "loading" | "error" | "ready";
+type StepDefinition = {
+  id: AppStep;
+  label: string;
+  shortLabel: string;
+  glyph: string;
+  tone: string;
+};
 
-function replaceClipInProject(detail: ProjectDetail, updatedClip: Clip): ProjectDetail {
-  return recalculateProjectDetail({
-    ...detail,
-    clips: detail.clips.map((clip) => (clip.id === updatedClip.id ? updatedClip : clip)),
-  });
-}
+type PageHeaderContent = {
+  eyebrow: string;
+  title: string;
+  description: string;
+};
+
+const stepDefinitions: StepDefinition[] = [
+  { id: "ingest", label: "Ingest", shortLabel: "In", glyph: "I", tone: "Sources first" },
+  { id: "enhance", label: "Enhance", shortLabel: "En", glyph: "E", tone: "Clean the raw signal" },
+  { id: "segment", label: "Segment", shortLabel: "Se", glyph: "S", tone: "Split into candidates" },
+  { id: "label", label: "Label", shortLabel: "La", glyph: "L", tone: "Human review and repair" },
+  { id: "train", label: "Train", shortLabel: "Tr", glyph: "T", tone: "Fine-tune the voice" },
+  { id: "deploy", label: "Deploy", shortLabel: "De", glyph: "D", tone: "Ship for inference" },
+];
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
@@ -71,542 +50,333 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function isAppStep(value: string | null): value is AppStep {
+  return stepDefinitions.some((step) => step.id === value);
+}
+
+function readRouteFromLocation(): AppRoute {
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+  const maybeStep = path.length > 0 ? path : "ingest";
+  const step = isAppStep(maybeStep) ? maybeStep : "ingest";
+  const projectId = new URLSearchParams(window.location.search).get("project")?.trim() ?? null;
+
+  return {
+    step,
+    projectId: projectId && projectId.length > 0 ? projectId : null,
+  };
+}
+
+function writeRouteToLocation(route: AppRoute, replace = false) {
+  const url = new URL(window.location.href);
+  url.pathname = route.step === "ingest" ? "/" : `/${route.step}`;
+  if (route.projectId) {
+    url.searchParams.set("project", route.projectId);
+  } else {
+    url.searchParams.delete("project");
+  }
+
+  if (replace) {
+    window.history.replaceState({}, "", url);
+    return;
+  }
+
+  window.history.pushState({}, "", url);
+}
+
+function getStepIndex(step: AppStep): number {
+  return stepDefinitions.findIndex((entry) => entry.id === step);
+}
+
+function getPageHeaderContent(step: AppStep, activeProject: Project | null): PageHeaderContent {
+  if (step === "ingest") {
+    return {
+      eyebrow: "Step 01",
+      title: activeProject?.name ?? "No project selected",
+      description:
+        "Ingest is the new home base: set up model access, point Speechcraft at source folders, and define where assets will sync next.",
+    };
+  }
+
+  if (step === "enhance") {
+    return {
+      eyebrow: "Step 02",
+      title: "Enhancement shell",
+      description:
+        "Prepare denoise, de-echo, de-reverb, and music removal as a focused workstation.",
+    };
+  }
+
+  if (step === "segment") {
+    return {
+      eyebrow: "Step 03",
+      title: "Segmentation shell",
+      description: "Own the split-and-propose stage before manual review begins.",
+    };
+  }
+
+  if (step === "label") {
+    return {
+      eyebrow: "Step 04",
+      title: activeProject?.name ?? "Label Workstation",
+      description:
+        "Manual transcript verification, clip correction, and export readiness all live here.",
+    };
+  }
+
+  if (step === "train") {
+    return {
+      eyebrow: "Step 05",
+      title: "Training shell",
+      description: "Stage the fine-tuning workspace without forcing a job model too early.",
+    };
+  }
+
+  return {
+    eyebrow: "Step 06",
+    title: "Deployment shell",
+    description: "Hold inference, serving, and release actions in a final workstation stage.",
+  };
+}
+
 export default function App() {
   if (window.location.pathname === "/backend-test") {
     return <BackendTestPage />;
   }
 
-  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus>("loading");
-  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
-  const [workspaceEmptyMessage, setWorkspaceEmptyMessage] = useState<string | null>(null);
-  const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
-  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
-  const [activeClipId, setActiveClipId] = useState<string | null>(null);
-  const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
-  const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
-  const [isRunningExport, setIsRunningExport] = useState(false);
-  const [clipCommits, setClipCommits] = useState<Record<string, ClipCommit[]>>({});
-  const [historyByClip, setHistoryByClip] = useState<Record<string, HistoryFlags>>({});
-  const latestWorkspaceRequestRef = useRef(0);
+  const [route, setRoute] = useState<AppRoute>(() => readRouteFromLocation());
+  const [projectLoadStatus, setProjectLoadStatus] = useState<ProjectLoadStatus>("loading");
+  const [projectLoadError, setProjectLoadError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [pageHeaderActions, setPageHeaderActions] = useState<ReactNode>(null);
 
-  async function loadWorkspace(preferredProjectId?: string) {
-    const requestId = latestWorkspaceRequestRef.current + 1;
-    latestWorkspaceRequestRef.current = requestId;
-    setWorkspaceStatus("loading");
-    setWorkspaceError(null);
-    setWorkspaceEmptyMessage(null);
-    setWorkspaceNotice(null);
+  useEffect(() => {
+    const handlePopState = () => {
+      setRoute(readRouteFromLocation());
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, []);
+
+  async function loadProjects(preferredProjectId?: string | null) {
+    setProjectLoadStatus("loading");
+    setProjectLoadError(null);
 
     try {
-      const projects = await fetchProjects();
-      const urlProjectId = new URLSearchParams(window.location.search)
-        .get("project")
-        ?.trim();
-      const sortedProjects = [...projects].sort(
+      const nextProjects = await fetchProjects();
+      const sortedProjects = [...nextProjects].sort(
         (left, right) =>
           new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
       );
       const fallbackProjectId = sortedProjects[0]?.id ?? null;
       const selectedProjectId =
-        preferredProjectId && projects.some((project) => project.id === preferredProjectId)
+        preferredProjectId && nextProjects.some((project) => project.id === preferredProjectId)
           ? preferredProjectId
-          : urlProjectId && projects.some((project) => project.id === urlProjectId)
-            ? urlProjectId
+          : route.projectId && nextProjects.some((project) => project.id === route.projectId)
+            ? route.projectId
             : fallbackProjectId;
 
-      if (latestWorkspaceRequestRef.current !== requestId) {
-        return;
+      setProjects(sortedProjects);
+      setProjectLoadStatus("ready");
+
+      if (selectedProjectId !== route.projectId) {
+        const nextRoute = { ...route, projectId: selectedProjectId };
+        setRoute(nextRoute);
+        writeRouteToLocation(nextRoute, true);
       }
-
-      if (!selectedProjectId) {
-        setProjectDetail(null);
-        setExportRuns([]);
-        setActiveClipId(null);
-        setVisibleQueueClipIds([]);
-        setWorkspaceStatus("ready");
-        setWorkspaceEmptyMessage("No projects are available yet. Import a project to begin review.");
-        return;
-      }
-
-      const [detail, exports] = await Promise.all([
-        fetchProjectDetail(selectedProjectId),
-        fetchProjectExports(selectedProjectId),
-      ]);
-
-      if (latestWorkspaceRequestRef.current !== requestId) {
-        return;
-      }
-
-      setProjectDetail(detail);
-      setExportRuns(exports);
-      setVisibleQueueClipIds(sortClipsForQueue(detail.clips).map((clip) => clip.id));
-      setActiveClipId((current) =>
-        detail.clips.some((clip) => clip.id === current) ? current : (detail.clips[0]?.id ?? null),
-      );
-      setWorkspaceStatus("ready");
-      setWorkspaceEmptyMessage(null);
-
-      const nextUrl = new URL(window.location.href);
-      nextUrl.searchParams.set("project", detail.project.id);
-      window.history.replaceState({}, "", nextUrl);
     } catch (error) {
-      if (latestWorkspaceRequestRef.current !== requestId) {
-        return;
-      }
-
-      setProjectDetail(null);
-      setExportRuns([]);
-      setActiveClipId(null);
-      setVisibleQueueClipIds([]);
-      setWorkspaceStatus("error");
-      setWorkspaceError(
-        getErrorMessage(error, "The workspace failed to load. Check the backend and try again."),
+      setProjects([]);
+      setProjectLoadStatus("error");
+      setProjectLoadError(
+        getErrorMessage(error, "The app could not load the project list from the backend."),
       );
     }
   }
 
   useEffect(() => {
-    void loadWorkspace();
+    void loadProjects(route.projectId);
   }, []);
 
-  const allClipTagNames = useMemo(() => {
-    return Array.from(
-      new Set(
-        (projectDetail?.clips ?? [])
-          .flatMap((clip) => clip.tags.map((tag) => tag.name.toLowerCase()))
-          .sort(),
-      ),
-    );
-  }, [projectDetail?.clips]);
-  const activeClip = useMemo(() => {
-    const allClips = projectDetail?.clips ?? [];
-    const visibleQueueClips = visibleQueueClipIds
-      .map((clipId) => allClips.find((clip) => clip.id === clipId) ?? null)
-      .filter((clip): clip is Clip => clip !== null);
-
-    return (
-      allClips.find((clip) => clip.id === activeClipId) ??
-      visibleQueueClips[0] ??
-      allClips[0] ??
-      null
-    );
-  }, [projectDetail?.clips, activeClipId, visibleQueueClipIds]);
-
-  useEffect(() => {
-    if (!activeClip) {
-      return;
-    }
-
-    if (clipCommits[activeClip.id]) {
-      return;
-    }
-
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const commits = await fetchClipCommits(activeClip.id);
-        if (cancelled) {
-          return;
-        }
-
-        setClipCommits((current) => ({
-          ...current,
-          [activeClip.id]: commits,
-        }));
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        const message = getErrorMessage(error, "Commit history failed to load for this clip.");
-        console.error(message);
-        setWorkspaceNotice(message);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeClip?.id, clipCommits]);
-
-  function updateCurrentClip(updatedClip: Clip) {
-    if (!projectDetail) {
-      return;
-    }
-
-    setProjectDetail((current) => {
-      if (!current) {
-        return current;
-      }
-
-      return replaceClipInProject(current, updatedClip);
-    });
-    setHistoryByClip((current) => ({
-      ...current,
-      [updatedClip.id]: { can_undo: true, can_redo: false },
-    }));
-  }
-
-  function applyHistoryResult(result: ClipHistoryResult) {
-    if (!projectDetail) {
-      return;
-    }
-
-    setProjectDetail((current) => {
-      if (!current) {
-        return current;
-      }
-
-      return replaceClipInProject(current, result.clip);
-    });
-    setHistoryByClip((current) => ({
-      ...current,
-      [result.clip.id]: {
-        can_undo: result.can_undo,
-        can_redo: result.can_redo,
-      },
-    }));
-  }
-
-  function handleClipSelect(nextClipId: string) {
-    startTransition(() => {
-      setActiveClipId(nextClipId);
-    });
-  }
-
-  function getNextClipId(currentClipId: string): string | null {
-    if (visibleQueueClipIds.length === 0) {
-      return null;
-    }
-
-    const currentIndex = visibleQueueClipIds.findIndex((clipId) => clipId === currentClipId);
-    if (currentIndex < 0) {
-      return visibleQueueClipIds[0] ?? null;
-    }
-
-    const nextClipId =
-      visibleQueueClipIds[currentIndex + 1] ?? visibleQueueClipIds[0] ?? null;
-    if (!nextClipId || nextClipId === currentClipId) {
-      return null;
-    }
-    return nextClipId;
-  }
-
-  async function handleRunExport() {
-    if (!projectDetail) {
-      return;
-    }
-
-    setIsRunningExport(true);
-    try {
-      const result = await runProjectExport(projectDetail.project.id);
-      const [detail, exports] = await Promise.all([
-        fetchProjectDetail(projectDetail.project.id),
-        fetchProjectExports(projectDetail.project.id),
-      ]);
-      setProjectDetail(detail);
-      setExportRuns(exports);
-      setWorkspaceNotice(
-        `Export completed: ${result.accepted_clip_count} accepted clip(s) rendered.`,
-      );
-    } catch (error) {
-      setWorkspaceNotice(getErrorMessage(error, "Export failed. See backend logs for details."));
-    } finally {
-      setIsRunningExport(false);
-    }
-  }
-
-  async function saveClipStatus(clipId: string, reviewStatus: ReviewStatus): Promise<Clip> {
-    const updatedClip = await updateClipStatus(clipId, reviewStatus);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
-  }
-
-  async function saveClipTranscript(clipId: string, textCurrent: string): Promise<Clip> {
-    const updatedClip = await updateClipTranscript(clipId, textCurrent);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
-  }
-
-  async function saveClipTags(
-    clipId: string,
-    tags: { name: string; color: string }[],
-  ): Promise<Clip> {
-    const updatedClip = await updateClipTags(clipId, tags);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
-  }
-
-  async function applyClipEdlOperation(
-    clipId: string,
-    payload: {
-      op: string;
-      range?: { start_seconds: number; end_seconds: number } | null;
-      duration_seconds?: number | null;
-    },
-  ): Promise<Clip> {
-    const updatedClip = await appendClipEdlOperation(clipId, payload);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
-  }
-
-  async function createCommitSnapshot(workingClip: Clip, message: string): Promise<ClipCommit> {
-    const createdCommit = await commitClip(workingClip.id, message);
-    const committedClip: Clip = {
-      ...workingClip,
-      edit_state: "committed",
-      updated_at: new Date().toISOString(),
-    };
-    setProjectDetail((current) =>
-      current ? replaceClipInProject(current, committedClip) : current,
-    );
-    setClipCommits((current) => ({
-      ...current,
-      [workingClip.id]: [...(current[workingClip.id] ?? []), createdCommit],
-    }));
-    setHistoryByClip((current) => ({
-      ...current,
-      [workingClip.id]: { can_undo: true, can_redo: false },
-    }));
-    return createdCommit;
-  }
-
-  async function undoClipMutation(clipId: string): Promise<ClipHistoryResult> {
-    const result = await undoClip(clipId);
-    applyHistoryResult(result);
-    return result;
-  }
-
-  async function redoClipMutation(clipId: string): Promise<ClipHistoryResult> {
-    const result = await redoClip(clipId);
-    applyHistoryResult(result);
-    return result;
-  }
-
-  async function splitClipMutation(
-    clipId: string,
-    splitAtSeconds: number,
-  ): Promise<ClipMutationResult> {
-    const result = await splitClip(clipId, splitAtSeconds);
-    setProjectDetail(result.project_detail);
-    setActiveClipId(result.created_clip_ids[0] ?? null);
-    return result;
-  }
-
-  async function mergeNextClipMutation(clipId: string): Promise<ClipMutationResult> {
-    const result = await mergeWithNextClip(clipId);
-    setProjectDetail(result.project_detail);
-    setActiveClipId(result.created_clip_ids[0] ?? null);
-    return result;
-  }
-
-  async function handleStatusChange(reviewStatus: ReviewStatus) {
-    if (!activeClip) {
-      return;
-    }
-    try {
-      if (reviewStatus === "accepted") {
-        const acceptedClip = await saveClipStatus(activeClip.id, "accepted");
-        await createCommitSnapshot(acceptedClip, "Accepted clip snapshot");
-        setWorkspaceNotice("Marked clip as accepted and committed the snapshot.");
-        return;
-      }
-
-      if (reviewStatus === "rejected") {
-        const rejectedClip = await saveClipStatus(activeClip.id, "rejected");
-        await createCommitSnapshot(rejectedClip, "Rejected clip snapshot");
-        setWorkspaceNotice("Marked clip as rejected and committed the snapshot.");
-        return;
-      }
-
-      await saveClipStatus(activeClip.id, reviewStatus);
-      setWorkspaceNotice(`Marked clip as ${statusLabels[reviewStatus].toLowerCase()}.`);
-    } catch (error) {
-      setWorkspaceNotice(getErrorMessage(error, "Status update failed. Check the backend."));
-    }
-  }
-
-  const activeCommits = activeClip ? clipCommits[activeClip.id] ?? [] : [];
-  const activeHistory = activeClip
-    ? historyByClip[activeClip.id] ?? { can_undo: false, can_redo: false }
-    : { can_undo: false, can_redo: false };
-  const datasetStatusCounts = useMemo(() => {
-    const counts: Record<ReviewStatus, number> = {
-      candidate: 0,
-      needs_attention: 0,
-      in_review: 0,
-      accepted: 0,
-      rejected: 0,
-    };
-    const durations: Record<ReviewStatus, number> = {
-      candidate: 0,
-      needs_attention: 0,
-      in_review: 0,
-      accepted: 0,
-      rejected: 0,
-    };
-    for (const clip of projectDetail?.clips ?? []) {
-      counts[clip.review_status] += 1;
-      durations[clip.review_status] += clip.duration_seconds;
-    }
-    return { counts, durations };
-  }, [projectDetail?.clips]);
-  const acceptedRejectedRatio =
-    datasetStatusCounts.durations.rejected > 0
-      ? datasetStatusCounts.durations.accepted / datasetStatusCounts.durations.rejected
-      : null;
-  const totalDurationSeconds = projectDetail?.stats.total_duration_seconds ?? 0;
-  const resolvedDurationSeconds =
-    datasetStatusCounts.durations.accepted + datasetStatusCounts.durations.rejected;
-  const smoothingSeconds = 10;
-  const smoothedAcceptRate =
-    resolvedDurationSeconds >= 0
-      ? (datasetStatusCounts.durations.accepted + smoothingSeconds) /
-        (resolvedDurationSeconds + smoothingSeconds * 2)
-      : null;
-  const predictedOutputSeconds =
-    smoothedAcceptRate !== null
-      ? Math.min(totalDurationSeconds, Math.max(0, totalDurationSeconds * smoothedAcceptRate))
-      : null;
-  const progressPercent =
-    totalDurationSeconds > 0
-      ? Math.min(100, Math.max(0, (resolvedDurationSeconds / totalDurationSeconds) * 100))
-      : null;
-  const workspacePhase =
-    workspaceStatus === "loading"
-      ? "loading"
-      : workspaceStatus === "error"
-        ? "error"
-        : projectDetail
-          ? "ready"
-          : "empty";
-  const workspaceTitle =
-    workspacePhase === "ready"
-      ? (projectDetail?.project.name ?? "Phase 1 Workspace")
-      : workspacePhase === "loading"
-        ? "Loading Phase 1 Workspace"
-        : "Phase 1 Workspace";
-  const workspaceStatusLabel =
-    workspacePhase === "ready"
-      ? `Export: ${(projectDetail?.project.export_status ?? "not_exported").replace(/_/g, " ")}`
-      : workspacePhase === "error"
-        ? "Workspace load failed"
-        : workspacePhase === "empty"
-          ? "No project loaded"
-          : "Loading workspace";
-  const workspaceFallback = (
-    <main className="workspace-grid">
-      <section className="panel workspace-pane">
-        <WorkspaceStatePanel
-          title="Workspace pane crashed"
-          message="A render error interrupted this view. Reload the workspace to recover."
-          actionLabel="Reload workspace"
-          onAction={() => void loadWorkspace(projectDetail?.project.id)}
-        />
-      </section>
-      <section className="panel workspace-pane">
-        <WorkspaceStatePanel
-          title="Editor unavailable"
-          message="The active view threw while rendering. The backend state is untouched."
-        />
-      </section>
-      <section className="panel workspace-pane">
-        <WorkspaceStatePanel
-          title="Inspector unavailable"
-          message="Reload after checking the console for the underlying UI exception."
-        />
-      </section>
-    </main>
+  const activeProject = useMemo(
+    () => projects.find((project) => project.id === route.projectId) ?? null,
+    [projects, route.projectId],
+  );
+  const activeStepIndex = getStepIndex(route.step);
+  const pageHeaderContent = useMemo(
+    () => getPageHeaderContent(route.step, activeProject),
+    [route.step, activeProject],
   );
 
+  useEffect(() => {
+    setPageHeaderActions(null);
+  }, [route.step]);
+
+  function navigate(nextStep: AppStep, nextProjectId = route.projectId) {
+    const nextRoute = { step: nextStep, projectId: nextProjectId ?? null };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute);
+  }
+
+  function handleProjectChange(nextProjectId: string) {
+    const nextRoute = {
+      step: route.step,
+      projectId: nextProjectId,
+    };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute);
+  }
+
+  const pageProps = {
+    activeProject,
+    projectLoadStatus,
+    projectLoadError,
+    onRetryProjects: () => void loadProjects(route.projectId),
+  };
+
+  let pageContent = null;
+
+  if (route.step === "ingest") {
+    pageContent = <IngestPage {...pageProps} />;
+  } else if (route.step === "label") {
+    pageContent = <LabelPage {...pageProps} onHeaderActionsChange={setPageHeaderActions} />;
+  } else {
+    const configByStep: Record<Exclude<AppStep, "ingest" | "label">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
+      enhance: {
+        leftTitle: "Planned modules",
+        rightTitle: "Notes",
+        leftItems: ["Denoise queue", "Dereverb presets", "Music removal routing"],
+        rightItems: ["Keep navigation open.", "Do not assume strict gating.", "This page should later reflect real project assets."],
+        centerTitle: "Signal cleanup canvas",
+        centerBody: "This shell is ready for the enhancement tools. The frame is in place so we can deepen this room without changing the global app structure again.",
+      },
+      segment: {
+        leftTitle: "Inputs",
+        rightTitle: "Outputs",
+        leftItems: ["Prepared sources", "Segmentation models", "Boundary configuration"],
+        rightItems: ["Candidate clips", "Initial transcript alignment", "Queue handoff to label"],
+        centerTitle: "Segmentation canvas",
+        centerBody: "This page will become the bridge between preprocessing and review. For now it keeps the shape of the workstation while we decide the exact model and job semantics.",
+      },
+      train: {
+        leftTitle: "Training inputs",
+        rightTitle: "Artifacts",
+        leftItems: ["Accepted dataset", "Model source", "Hyperparameter presets"],
+        rightItems: ["Checkpoints", "Metrics", "Evaluation notes"],
+        centerTitle: "Training canvas",
+        centerBody: "The app shell now has a dedicated room for training. We can wire the CLI-backed flow into this page incrementally instead of rethinking the navigation later.",
+      },
+      deploy: {
+        leftTitle: "Release setup",
+        rightTitle: "Destinations",
+        leftItems: ["Model selection", "Runtime profiles", "Access controls"],
+        rightItems: ["Local inference", "Hosted endpoints", "Publishing history"],
+        centerTitle: "Deployment canvas",
+        centerBody: "This final stage is intentionally skeletal for now. The shell makes the end-to-end product legible today without pretending the backend orchestration is already designed.",
+      },
+    };
+
+    const stepConfig = configByStep[route.step];
+    pageContent = <StepPlaceholderPage {...pageProps} {...stepConfig} />;
+  }
+
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">Speechcraft</p>
-          <h1>{workspaceTitle}</h1>
-        </div>
-        <div className="topbar-actions">
-          <a className="status-pill route-link" href="/backend-test">
-            Backend Test Route
-          </a>
-          <span className="status-pill">{workspaceStatusLabel}</span>
-          {workspacePhase === "error" ? (
-            <button
-              className="primary-button"
-              type="button"
-              onClick={() => void loadWorkspace(projectDetail?.project.id)}
-            >
-              Retry Load
-            </button>
-          ) : null}
-          <button
-            className="primary-button"
-            type="button"
-            onClick={handleRunExport}
-            disabled={workspacePhase !== "ready" || isRunningExport}
-          >
-            {isRunningExport ? "Rendering..." : "Run Export"}
-          </button>
+    <div className="workstation-shell">
+      <header className="shell-header">
+        <div className="shell-header-grid">
+          <div className="chrome-brand">
+            <p className="eyebrow">Speechcraft</p>
+            <h1>Dataset Workstation</h1>
+          </div>
+
+          <div className="step-page-summary">
+            <div className="step-page-title-row">
+              <p className="eyebrow">{pageHeaderContent.eyebrow}</p>
+              <h2>{pageHeaderContent.title}</h2>
+            </div>
+            <p className="step-page-copy">{pageHeaderContent.description}</p>
+          </div>
+
+          <div className="shell-header-tools">
+            <div className="chrome-controls">
+              {pageHeaderActions ? <div className="step-page-actions">{pageHeaderActions}</div> : null}
+
+              <label className="project-picker" htmlFor="project-picker">
+                <span>Project</span>
+                <select
+                  id="project-picker"
+                  value={route.projectId ?? ""}
+                  onChange={(event) => handleProjectChange(event.target.value)}
+                  disabled={projectLoadStatus !== "ready" || projects.length === 0}
+                >
+                  {projects.length === 0 ? <option value="">No projects loaded</option> : null}
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <button className="icon-button utility-link" type="button" aria-label="Settings">
+                <Settings2 aria-hidden="true" strokeWidth={2.1} />
+              </button>
+            </div>
+          </div>
         </div>
       </header>
 
-      {workspaceNotice ? <p className="editor-notice">{workspaceNotice}</p> : null}
+      <section className="workstation-stage">
+        {projectLoadError ? <p className="shell-notice shell-notice-error">{projectLoadError}</p> : null}
+        {pageContent}
+      </section>
 
-      <ErrorBoundary
-        resetKey={`${workspacePhase}:${projectDetail?.project.id ?? "none"}`}
-        fallback={workspaceFallback}
-      >
-        <main className="workspace-grid">
-          <ClipQueuePane
-            workspacePhase={workspacePhase}
-            workspaceError={workspaceError}
-            workspaceEmptyMessage={workspaceEmptyMessage}
-            clips={projectDetail?.clips ?? []}
-            activeClipId={activeClip?.id ?? null}
-            onSelectClip={handleClipSelect}
-            onRetryLoad={() => void loadWorkspace(projectDetail?.project.id)}
-            onVisibleClipIdsChange={setVisibleQueueClipIds}
+      <nav className="resolve-dock" aria-label="Workflow steps">
+        <div className="resolve-dock-track" aria-hidden="true">
+          <span
+            className="resolve-dock-track-progress"
+            style={{
+              width:
+                stepDefinitions.length > 1
+                  ? `${(activeStepIndex / (stepDefinitions.length - 1)) * 100}%`
+                  : "0%",
+            }}
           />
+        </div>
 
-          <EditorPane
-            workspacePhase={workspacePhase}
-            workspaceError={workspaceError}
-            workspaceEmptyMessage={workspaceEmptyMessage}
-            activeClip={activeClip}
-            activeClipAudioUrl={activeClip ? buildClipAudioUrl(activeClip.id) : null}
-            activeHistory={activeHistory}
-            allClipTagNames={allClipTagNames}
-            getNextClipId={getNextClipId}
-            onSelectClip={handleClipSelect}
-            onRetryLoad={() => void loadWorkspace(projectDetail?.project.id)}
-            onSaveTranscript={saveClipTranscript}
-            onSaveTags={saveClipTags}
-            onUpdateStatus={saveClipStatus}
-            onCommitSnapshot={createCommitSnapshot}
-            onAppendEdlOperation={applyClipEdlOperation}
-            onUndo={undoClipMutation}
-            onRedo={redoClipMutation}
-            onSplitClip={splitClipMutation}
-            onMergeClip={mergeNextClipMutation}
-          />
+        <div className="resolve-dock-items">
+          {stepDefinitions.map((step, index) => {
+            const state =
+              index < activeStepIndex ? "complete" : index === activeStepIndex ? "active" : "idle";
 
-          <InspectorPane
-            workspacePhase={workspacePhase}
-            workspaceError={workspaceError}
-            activeClip={activeClip}
-            projectDetail={projectDetail}
-            datasetStatusCounts={datasetStatusCounts}
-            acceptedRejectedRatio={acceptedRejectedRatio}
-            predictedOutputSeconds={predictedOutputSeconds}
-            progressPercent={progressPercent}
-            activeCommits={activeCommits}
-            exportRuns={exportRuns}
-            onRetryLoad={() => void loadWorkspace(projectDetail?.project.id)}
-            onStatusChange={(status) => void handleStatusChange(status)}
-          />
-        </main>
-      </ErrorBoundary>
+            return (
+              <button
+                key={step.id}
+                type="button"
+                className={`dock-item dock-item-${state}`}
+                onClick={() => navigate(step.id)}
+                aria-current={route.step === step.id ? "page" : undefined}
+                title={step.tone}
+              >
+                <span className="dock-item-glyph">{step.glyph}</span>
+                <span className="dock-item-label">{step.label}</span>
+                <span className="dock-item-tone" aria-hidden="true">
+                  {step.tone}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      {activeProject ? (
+        <footer className="workstation-footer">
+          <span>{activeProject.name}</span>
+          <span>{activeProject.export_status.replace(/_/g, " ")}</span>
+          <span>{stepDefinitions[activeStepIndex]?.shortLabel ?? "In"} active</span>
+        </footer>
+      ) : null}
     </div>
   );
 }
