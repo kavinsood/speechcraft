@@ -72,3 +72,26 @@ class RepositoryMediaTests(TestCase):
 
         with self.assertRaises(ValueError):
             self.repository.get_variant_media_path(variant_id)
+
+    def test_get_variant_media_path_materializes_legacy_external_variant(self) -> None:
+        with TemporaryDirectory() as external_dir:
+            external_path = Path(external_dir) / "legacy-variant.wav"
+            external_path.write_bytes(
+                self.repository._render_synthetic_wave_bytes(48000, 1, 157440 / 48000, "legacy-variant")
+            )
+
+            with Session(self.repository.engine, expire_on_commit=False) as session:
+                variant = session.exec(select(AudioVariant)).first()
+                self.assertIsNotNone(variant)
+                variant.file_path = str(external_path)
+                session.add(variant)
+                session.commit()
+                variant_id = variant.id
+
+            materialized_path = self.repository.get_variant_media_path(variant_id)
+            self.assertTrue(materialized_path.is_relative_to(self.repository.media_root.resolve()))
+            self.assertTrue(materialized_path.exists())
+
+            with Session(self.repository.engine, expire_on_commit=False) as session:
+                updated_variant = session.get(AudioVariant, variant_id)
+                self.assertEqual(updated_variant.file_path, str(materialized_path))

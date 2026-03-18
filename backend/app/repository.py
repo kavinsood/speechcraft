@@ -555,17 +555,36 @@ class SQLiteRepository:
             if active_variant is None:
                 return self._render_synthetic_wave_bytes(48000, 1, 2.0, slice_id)
             try:
-                audio_path = self._resolve_variant_media_path(Path(active_variant.file_path))
+                audio_path = self._materialize_variant_media(
+                    session,
+                    active_variant,
+                    slice_row.source_recording.num_channels if slice_row.source_recording is not None else None,
+                    persist=True,
+                )
             except FileNotFoundError as exc:
                 raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
             return self._apply_edl_to_wav_bytes(audio_path.read_bytes(), self._collect_edl_operations(session, slice_row))
 
     def get_variant_media_path(self, variant_id: str) -> Path:
         with self._session() as session:
-            variant = session.get(AudioVariant, variant_id)
+            variant = session.exec(
+                select(AudioVariant)
+                .where(AudioVariant.id == variant_id)
+                .options(selectinload(AudioVariant.parent_slice).selectinload(Slice.source_recording))
+            ).first()
             if variant is None:
                 raise KeyError(variant_id)
-            return self._resolve_variant_media_path(Path(variant.file_path))
+            expected_channels = (
+                variant.parent_slice.source_recording.num_channels
+                if variant.parent_slice is not None and variant.parent_slice.source_recording is not None
+                else None
+            )
+            return self._materialize_variant_media(
+                session,
+                variant,
+                expected_channels,
+                persist=True,
+            )
 
     def create_import_batch(self, payload: ImportBatchCreate) -> ImportBatch:
         with self._session() as session:
@@ -695,7 +714,12 @@ class SQLiteRepository:
             if active_variant is None:
                 raise ValueError("Slice has no active variant to process")
             try:
-                source_path = self._resolve_variant_media_path(Path(active_variant.file_path))
+                source_path = self._materialize_variant_media(
+                    session,
+                    active_variant,
+                    recording.num_channels,
+                    persist=False,
+                )
             except FileNotFoundError as exc:
                 raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
             variant_id = self._new_id("variant")
@@ -1350,6 +1374,38 @@ class SQLiteRepository:
         if source_path != target_path:
             shutil.copyfile(source_path, target_path)
         return target_path
+
+    def _materialize_variant_media(
+        self,
+        session: Session,
+        variant: AudioVariant,
+        expected_channels: int | None,
+        *,
+        persist: bool,
+    ) -> Path:
+        raw_path = Path(variant.file_path).expanduser().resolve(strict=False)
+        try:
+            return self._resolve_variant_media_path(raw_path)
+        except ValueError:
+            if not raw_path.exists():
+                raise FileNotFoundError(raw_path)
+            if expected_channels is None:
+                channels, _sample_width, sample_rate, frames = self._read_pcm_wav_header(raw_path)
+                if sample_rate != variant.sample_rate or frames != variant.num_samples:
+                    raise ValueError("Variant media metadata does not match the stored database record")
+                if channels <= 0:
+                    raise ValueError("Variant media has invalid channel metadata")
+            else:
+                self._validate_audio_asset(raw_path, variant.sample_rate, expected_channels, variant.num_samples)
+            managed_path = (self.media_root / "variants" / f"{variant.id}.wav").resolve()
+            managed_path.parent.mkdir(parents=True, exist_ok=True)
+            if not managed_path.exists():
+                shutil.copyfile(raw_path, managed_path)
+            if persist and variant.file_path != str(managed_path):
+                variant.file_path = str(managed_path)
+                session.add(variant)
+                session.commit()
+            return managed_path
 
     def _resolve_variant_media_path(self, path: Path) -> Path:
         resolved = path.expanduser().resolve(strict=False)
