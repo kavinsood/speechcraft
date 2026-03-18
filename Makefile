@@ -39,6 +39,7 @@ check: check-backend check-frontend
 
 check-backend:
 	cd $(ROOT_DIR) && python3 -m compileall backend/app
+	cd $(BACKEND_DIR) && ./.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 
 check-frontend:
 	cd $(FRONTEND_DIR) && npm run build
