@@ -1,15 +1,16 @@
 import { startTransition, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  appendClipEdlOperation,
   ApiError,
-  buildClipAudioUrl,
-  commitClip,
-  fetchClipCommits,
-  fetchProjectDetail,
+  appendClipEdlOperation,
+  buildVariantAudioUrl,
+  cleanupProjectMedia,
   fetchProjectExports,
+  fetchProjectSlices,
   mergeWithNextClip,
   redoClip,
+  runClipLabModel,
   runProjectExport,
+  setActiveVariant,
   splitClip,
   undoClip,
   updateClipStatus,
@@ -22,25 +23,11 @@ import EditorPane from "../workspace/EditorPane";
 import InspectorPane from "../workspace/InspectorPane";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
 import {
-  recalculateProjectDetail,
+  getRedoTarget,
+  getSliceDuration,
   sortClipsForQueue,
-  statusLabels,
 } from "../workspace/workspace-helpers";
-import type {
-  Clip,
-  ClipCommit,
-  ClipHistoryResult,
-  ClipMutationResult,
-  ExportRun,
-  Project,
-  ProjectDetail,
-  ReviewStatus,
-} from "../types";
-
-type HistoryFlags = {
-  can_undo: boolean;
-  can_redo: boolean;
-};
+import type { ExportRun, Project, ReviewStatus, Slice } from "../types";
 
 type WorkspaceStatus = "loading" | "error" | "ready";
 
@@ -51,13 +38,6 @@ type LabelPageProps = {
   onRetryProjects: () => void;
   onHeaderActionsChange: (actions: ReactNode) => void;
 };
-
-function replaceClipInProject(detail: ProjectDetail, updatedClip: Clip): ProjectDetail {
-  return recalculateProjectDetail({
-    ...detail,
-    clips: detail.clips.map((clip) => (clip.id === updatedClip.id ? updatedClip : clip)),
-  });
-}
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
@@ -82,13 +62,12 @@ export default function LabelPage({
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceEmptyMessage, setWorkspaceEmptyMessage] = useState<string | null>(null);
   const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
-  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
+  const [slices, setSlices] = useState<Slice[]>([]);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [isRunningExport, setIsRunningExport] = useState(false);
-  const [clipCommits, setClipCommits] = useState<Record<string, ClipCommit[]>>({});
-  const [historyByClip, setHistoryByClip] = useState<Record<string, HistoryFlags>>({});
+  const [isCleaningMedia, setIsCleaningMedia] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
 
   async function loadWorkspace(projectId: string | null | undefined) {
@@ -100,7 +79,7 @@ export default function LabelPage({
     setWorkspaceNotice(null);
 
     if (!projectId) {
-      setProjectDetail(null);
+      setSlices([]);
       setExportRuns([]);
       setActiveClipId(null);
       setVisibleQueueClipIds([]);
@@ -110,8 +89,8 @@ export default function LabelPage({
     }
 
     try {
-      const [detail, exports] = await Promise.all([
-        fetchProjectDetail(projectId),
+      const [nextSlices, nextExports] = await Promise.all([
+        fetchProjectSlices(projectId),
         fetchProjectExports(projectId),
       ]);
 
@@ -119,20 +98,21 @@ export default function LabelPage({
         return;
       }
 
-      setProjectDetail(detail);
-      setExportRuns(exports);
-      setVisibleQueueClipIds(sortClipsForQueue(detail.clips).map((clip) => clip.id));
+      const sortedSlices = sortClipsForQueue(nextSlices);
+      setSlices(nextSlices);
+      setExportRuns(nextExports);
+      setVisibleQueueClipIds(sortedSlices.map((slice) => slice.id));
       setActiveClipId((current) =>
-        detail.clips.some((clip) => clip.id === current) ? current : (detail.clips[0]?.id ?? null),
+        sortedSlices.some((slice) => slice.id === current) ? current : (sortedSlices[0]?.id ?? null),
       );
       setWorkspaceStatus("ready");
-      setWorkspaceEmptyMessage(null);
+      setWorkspaceEmptyMessage(sortedSlices.length === 0 ? "This project does not contain slices yet." : null);
     } catch (error) {
       if (latestWorkspaceRequestRef.current !== requestId) {
         return;
       }
 
-      setProjectDetail(null);
+      setSlices([]);
       setExportRuns([]);
       setActiveClipId(null);
       setVisibleQueueClipIds([]);
@@ -161,95 +141,27 @@ export default function LabelPage({
   const allClipTagNames = useMemo(() => {
     return Array.from(
       new Set(
-        (projectDetail?.clips ?? [])
-          .flatMap((clip) => clip.tags.map((tag) => tag.name.toLowerCase()))
+        slices
+          .flatMap((slice) => slice.tags.map((tag) => tag.name.toLowerCase()))
           .sort(),
       ),
     );
-  }, [projectDetail?.clips]);
+  }, [slices]);
 
   const activeClip = useMemo(() => {
-    const allClips = projectDetail?.clips ?? [];
     const visibleQueueClips = visibleQueueClipIds
-      .map((clipId) => allClips.find((clip) => clip.id === clipId) ?? null)
-      .filter((clip): clip is Clip => clip !== null);
+      .map((clipId) => slices.find((slice) => slice.id === clipId) ?? null)
+      .filter((slice): slice is Slice => slice !== null);
 
-    return (
-      allClips.find((clip) => clip.id === activeClipId) ??
-      visibleQueueClips[0] ??
-      allClips[0] ??
-      null
-    );
-  }, [projectDetail?.clips, activeClipId, visibleQueueClipIds]);
+    return slices.find((slice) => slice.id === activeClipId) ?? visibleQueueClips[0] ?? slices[0] ?? null;
+  }, [slices, activeClipId, visibleQueueClipIds]);
 
-  useEffect(() => {
-    if (!activeClip) {
-      return;
+  const activeClipAudioUrl = useMemo(() => {
+    if (!activeClip?.active_variant_id) {
+      return null;
     }
-
-    if (clipCommits[activeClip.id]) {
-      return;
-    }
-
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const commits = await fetchClipCommits(activeClip.id);
-        if (cancelled) {
-          return;
-        }
-
-        setClipCommits((current) => ({
-          ...current,
-          [activeClip.id]: commits,
-        }));
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-
-        const message = getErrorMessage(error, "Commit history failed to load for this clip.");
-        console.error(message);
-        setWorkspaceNotice(message);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeClip?.id, clipCommits]);
-
-  function updateCurrentClip(updatedClip: Clip) {
-    setProjectDetail((current) => {
-      if (!current) {
-        return current;
-      }
-
-      return replaceClipInProject(current, updatedClip);
-    });
-    setHistoryByClip((current) => ({
-      ...current,
-      [updatedClip.id]: { can_undo: true, can_redo: false },
-    }));
-  }
-
-  function applyHistoryResult(result: ClipHistoryResult) {
-    setProjectDetail((current) => {
-      if (!current) {
-        return current;
-      }
-
-      return replaceClipInProject(current, result.clip);
-    });
-    setHistoryByClip((current) => ({
-      ...current,
-      [result.clip.id]: {
-        can_undo: result.can_undo,
-        can_redo: result.can_redo,
-      },
-    }));
-  }
+    return buildVariantAudioUrl(activeClip.active_variant_id);
+  }, [activeClip?.active_variant_id]);
 
   function handleClipSelect(nextClipId: string) {
     startTransition(() => {
@@ -275,23 +187,25 @@ export default function LabelPage({
     return nextClipId;
   }
 
+  function replaceSlice(updatedSlice: Slice) {
+    setSlices((current) => current.map((slice) => (slice.id === updatedSlice.id ? updatedSlice : slice)));
+  }
+
   async function handleRunExport() {
-    if (!projectDetail) {
+    if (!activeProject) {
       return;
     }
 
     setIsRunningExport(true);
     try {
-      const result = await runProjectExport(projectDetail.project.id);
-      const [detail, exports] = await Promise.all([
-        fetchProjectDetail(projectDetail.project.id),
-        fetchProjectExports(projectDetail.project.id),
+      const result = await runProjectExport(activeProject.id);
+      const [nextSlices, nextExports] = await Promise.all([
+        fetchProjectSlices(activeProject.id),
+        fetchProjectExports(activeProject.id),
       ]);
-      setProjectDetail(detail);
-      setExportRuns(exports);
-      setWorkspaceNotice(
-        `Export completed: ${result.accepted_clip_count} accepted clip(s) rendered.`,
-      );
+      setSlices(nextSlices);
+      setExportRuns(nextExports);
+      setWorkspaceNotice(`Export completed: ${result.accepted_clip_count} accepted slice(s) rendered.`);
     } catch (error) {
       setWorkspaceNotice(getErrorMessage(error, "Export failed. See backend logs for details."));
     } finally {
@@ -299,250 +213,207 @@ export default function LabelPage({
     }
   }
 
-  async function saveClipStatus(clipId: string, reviewStatus: ReviewStatus): Promise<Clip> {
-    const updatedClip = await updateClipStatus(clipId, reviewStatus);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
+  async function handleCleanupMedia() {
+    if (!activeProject) {
+      return;
+    }
+
+    setIsCleaningMedia(true);
+    try {
+      const result = await cleanupProjectMedia(activeProject.id);
+      const nextSlices = await fetchProjectSlices(activeProject.id);
+      const sorted = sortClipsForQueue(nextSlices);
+      setSlices(nextSlices);
+      setVisibleQueueClipIds(sorted.map((slice) => slice.id));
+      setActiveClipId((current) =>
+        sorted.some((slice) => slice.id === current) ? current : (sorted[0]?.id ?? null),
+      );
+      setWorkspaceNotice(
+        `Cleanup removed ${result.deleted_slice_count} superseded slice(s), ${result.deleted_variant_count} variant row(s), and ${result.deleted_file_count} file(s).`,
+      );
+    } catch (error) {
+      setWorkspaceNotice(getErrorMessage(error, "Project media cleanup failed."));
+    } finally {
+      setIsCleaningMedia(false);
+    }
   }
 
-  async function saveClipTranscript(clipId: string, textCurrent: string): Promise<Clip> {
-    const updatedClip = await updateClipTranscript(clipId, textCurrent);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
+  async function saveClipStatus(clipId: string, status: ReviewStatus): Promise<Slice> {
+    const updatedSlice = await updateClipStatus(clipId, status);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
+  }
+
+  async function saveClipTranscript(clipId: string, modifiedText: string): Promise<Slice> {
+    const updatedSlice = await updateClipTranscript(clipId, modifiedText);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
   }
 
   async function saveClipTags(
     clipId: string,
     tags: { name: string; color: string }[],
-  ): Promise<Clip> {
-    const updatedClip = await updateClipTags(clipId, tags);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
+  ): Promise<Slice> {
+    const updatedSlice = await updateClipTags(clipId, tags);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
   }
 
-  async function applyClipEdlOperation(
+  async function saveClipEdl(
     clipId: string,
     payload: {
       op: string;
       range?: { start_seconds: number; end_seconds: number } | null;
       duration_seconds?: number | null;
     },
-  ): Promise<Clip> {
-    const updatedClip = await appendClipEdlOperation(clipId, payload);
-    updateCurrentClip(updatedClip);
-    return updatedClip;
+  ): Promise<Slice> {
+    const updatedSlice = await appendClipEdlOperation(clipId, payload);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
   }
 
-  async function createCommitSnapshot(workingClip: Clip, message: string): Promise<ClipCommit> {
-    const createdCommit = await commitClip(workingClip.id, message);
-    const committedClip: Clip = {
-      ...workingClip,
-      edit_state: "committed",
-      updated_at: new Date().toISOString(),
-    };
-    setProjectDetail((current) =>
-      current ? replaceClipInProject(current, committedClip) : current,
-    );
-    setClipCommits((current) => ({
-      ...current,
-      [workingClip.id]: [...(current[workingClip.id] ?? []), createdCommit],
-    }));
-    setHistoryByClip((current) => ({
-      ...current,
-      [workingClip.id]: { can_undo: true, can_redo: false },
-    }));
-    return createdCommit;
+  async function undoClipMutation(clipId: string): Promise<Slice> {
+    const updatedSlice = await undoClip(clipId);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
   }
 
-  async function undoClipMutation(clipId: string): Promise<ClipHistoryResult> {
-    const result = await undoClip(clipId);
-    applyHistoryResult(result);
-    return result;
+  async function redoClipMutation(clipId: string): Promise<Slice> {
+    const updatedSlice = await redoClip(clipId);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
   }
 
-  async function redoClipMutation(clipId: string): Promise<ClipHistoryResult> {
-    const result = await redoClip(clipId);
-    applyHistoryResult(result);
-    return result;
+  async function splitClipMutation(clipId: string, splitAtSeconds: number): Promise<Slice[]> {
+    const nextSlices = await splitClip(clipId, splitAtSeconds);
+    setSlices(nextSlices);
+    const sorted = sortClipsForQueue(nextSlices);
+    setVisibleQueueClipIds(sorted.map((slice) => slice.id));
+    setActiveClipId(sorted[0]?.id ?? null);
+    return nextSlices;
   }
 
-  async function splitClipMutation(
-    clipId: string,
-    splitAtSeconds: number,
-  ): Promise<ClipMutationResult> {
-    const result = await splitClip(clipId, splitAtSeconds);
-    setProjectDetail(result.project_detail);
-    setActiveClipId(result.created_clip_ids[0] ?? null);
-    return result;
+  async function mergeNextClipMutation(clipId: string): Promise<Slice[]> {
+    const nextSlices = await mergeWithNextClip(clipId);
+    setSlices(nextSlices);
+    const sorted = sortClipsForQueue(nextSlices);
+    setVisibleQueueClipIds(sorted.map((slice) => slice.id));
+    setActiveClipId(sorted[0]?.id ?? null);
+    return nextSlices;
   }
 
-  async function mergeNextClipMutation(clipId: string): Promise<ClipMutationResult> {
-    const result = await mergeWithNextClip(clipId);
-    setProjectDetail(result.project_detail);
-    setActiveClipId(result.created_clip_ids[0] ?? null);
-    return result;
+  async function runClipLabModelMutation(clipId: string, generatorModel: string): Promise<Slice> {
+    const updatedSlice = await runClipLabModel(clipId, generatorModel);
+    replaceSlice(updatedSlice);
+    return updatedSlice;
   }
 
-  async function handleStatusChange(reviewStatus: ReviewStatus) {
+  async function setActiveVariantMutation(variantId: string) {
     if (!activeClip) {
       return;
     }
-
     try {
-      if (reviewStatus === "accepted") {
-        const acceptedClip = await saveClipStatus(activeClip.id, "accepted");
-        await createCommitSnapshot(acceptedClip, "Accepted clip snapshot");
-        setWorkspaceNotice("Marked clip as accepted and committed the snapshot.");
-        return;
-      }
-
-      if (reviewStatus === "rejected") {
-        const rejectedClip = await saveClipStatus(activeClip.id, "rejected");
-        await createCommitSnapshot(rejectedClip, "Rejected clip snapshot");
-        setWorkspaceNotice("Marked clip as rejected and committed the snapshot.");
-        return;
-      }
-
-      await saveClipStatus(activeClip.id, reviewStatus);
-      setWorkspaceNotice(`Marked clip as ${statusLabels[reviewStatus].toLowerCase()}.`);
+      const updatedSlice = await setActiveVariant(activeClip.id, variantId);
+      replaceSlice(updatedSlice);
+      setWorkspaceNotice(`Activated variant ${variantId}.`);
     } catch (error) {
-      setWorkspaceNotice(getErrorMessage(error, "Status update failed. Check the backend."));
+      setWorkspaceNotice(getErrorMessage(error, "Variant switch failed."));
     }
   }
 
-  const activeCommits = activeClip ? clipCommits[activeClip.id] ?? [] : [];
-  const activeHistory = activeClip
-    ? historyByClip[activeClip.id] ?? { can_undo: false, can_redo: false }
-    : { can_undo: false, can_redo: false };
   const datasetStatusCounts = useMemo(() => {
     const counts: Record<ReviewStatus, number> = {
-      candidate: 0,
-      needs_attention: 0,
-      in_review: 0,
+      unresolved: 0,
+      quarantined: 0,
       accepted: 0,
       rejected: 0,
     };
     const durations: Record<ReviewStatus, number> = {
-      candidate: 0,
-      needs_attention: 0,
-      in_review: 0,
+      unresolved: 0,
+      quarantined: 0,
       accepted: 0,
       rejected: 0,
     };
-    for (const clip of projectDetail?.clips ?? []) {
-      counts[clip.review_status] += 1;
-      durations[clip.review_status] += clip.duration_seconds;
+
+    for (const slice of sortClipsForQueue(slices)) {
+      counts[slice.status] += 1;
+      durations[slice.status] += getSliceDuration(slice);
     }
-    return { counts, durations };
-  }, [projectDetail?.clips]);
-  const acceptedRejectedRatio =
-    datasetStatusCounts.durations.rejected > 0
-      ? datasetStatusCounts.durations.accepted / datasetStatusCounts.durations.rejected
-      : null;
-  const totalDurationSeconds = projectDetail?.stats.total_duration_seconds ?? 0;
-  const resolvedDurationSeconds =
-    datasetStatusCounts.durations.accepted + datasetStatusCounts.durations.rejected;
-  const smoothingSeconds = 10;
-  const smoothedAcceptRate =
-    resolvedDurationSeconds >= 0
-      ? (datasetStatusCounts.durations.accepted + smoothingSeconds) /
-        (resolvedDurationSeconds + smoothingSeconds * 2)
-      : null;
-  const predictedOutputSeconds =
-    smoothedAcceptRate !== null
-      ? Math.min(totalDurationSeconds, Math.max(0, totalDurationSeconds * smoothedAcceptRate))
-      : null;
-  const progressPercent =
-    totalDurationSeconds > 0
-      ? Math.min(100, Math.max(0, (resolvedDurationSeconds / totalDurationSeconds) * 100))
-      : null;
-  const workspacePhase =
-    workspaceStatus === "loading"
-      ? "loading"
-      : workspaceStatus === "error"
-        ? "error"
-        : projectDetail
-          ? "ready"
-          : "empty";
-  const workspaceStatusLabel =
-    workspacePhase === "ready"
-      ? `Export: ${(projectDetail?.project.export_status ?? "not_exported").replace(/_/g, " ")}`
-      : workspacePhase === "error"
-        ? "Workspace load failed"
-        : workspacePhase === "empty"
-          ? "No project loaded"
-          : "Loading workspace";
-  const workspaceFallback = (
-    <main className="workspace-grid">
-      <section className="panel workspace-pane">
-        <WorkspaceStatePanel
-          title="Workspace pane crashed"
-          message="A render error interrupted this view. Reload the workspace to recover."
-          actionLabel="Reload workspace"
-          onAction={() => void loadWorkspace(activeProject?.id)}
-        />
-      </section>
-      <section className="panel workspace-pane">
-        <WorkspaceStatePanel
-          title="Editor unavailable"
-          message="The active view threw while rendering. The backend state is untouched."
-        />
-      </section>
-      <section className="panel workspace-pane">
-        <WorkspaceStatePanel
-          title="Inspector unavailable"
-          message="Reload after checking the console for the underlying UI exception."
-        />
-      </section>
-    </main>
+
+    return {
+      counts,
+      durations,
+    };
+  }, [slices]);
+
+  const totalDurationSeconds = useMemo(
+    () => sortClipsForQueue(slices).reduce((sum, slice) => sum + getSliceDuration(slice), 0),
+    [slices],
   );
+  const acceptedRejectedRatio =
+    datasetStatusCounts.counts.rejected > 0
+      ? datasetStatusCounts.counts.accepted / datasetStatusCounts.counts.rejected
+      : datasetStatusCounts.counts.accepted > 0
+        ? datasetStatusCounts.counts.accepted
+        : null;
+  const predictedOutputSeconds =
+    datasetStatusCounts.counts.accepted > 0 ? datasetStatusCounts.durations.accepted : null;
+  const progressPercent =
+    slices.length > 0
+      ? ((datasetStatusCounts.counts.accepted + datasetStatusCounts.counts.rejected) / slices.length) * 100
+      : null;
+  const canUndo = Boolean(activeClip?.active_commit_id);
+  const canRedo = activeClip ? Boolean(getRedoTarget(activeClip)) : false;
 
   useEffect(() => {
     onHeaderActionsChange(
-      <>
-        <span className="status-pill">{workspaceStatusLabel}</span>
-        {workspacePhase === "error" ? (
-          <button className="ghost-button" type="button" onClick={onRetryProjects}>
-            Retry projects
+      activeProject ? (
+        <>
+          <button type="button" onClick={() => void handleCleanupMedia()} disabled={isCleaningMedia}>
+            {isCleaningMedia ? "Cleaning media..." : "Cleanup Media"}
           </button>
-        ) : null}
-        <button
-          className="primary-button"
-          type="button"
-          onClick={handleRunExport}
-          disabled={workspacePhase !== "ready" || isRunningExport}
-        >
-          {isRunningExport ? "Rendering..." : "Run Export"}
-        </button>
-      </>,
+          <button className="primary-button" type="button" onClick={() => void handleRunExport()} disabled={isRunningExport}>
+            {isRunningExport ? "Running export..." : "Run Export"}
+          </button>
+        </>
+      ) : null,
     );
 
     return () => {
       onHeaderActionsChange(null);
     };
-  }, [
-    onHeaderActionsChange,
-    workspaceStatusLabel,
-    workspacePhase,
-    isRunningExport,
-    onRetryProjects,
-    projectDetail?.project.id,
-  ]);
+  }, [activeProject, isCleaningMedia, isRunningExport, onHeaderActionsChange]);
 
   return (
-    <section className="step-page label-page">
-      {workspaceNotice ? <p className="editor-notice">{workspaceNotice}</p> : null}
+    <ErrorBoundary
+      resetKey={activeProject?.id ?? "no-project"}
+      fallback={
+        <WorkspaceStatePanel
+          title="Label workstation crashed"
+          message="The labeling UI hit a render error. Reload the workspace to recover."
+          actionLabel="Retry load"
+          onAction={() => void loadWorkspace(activeProject?.id)}
+        />
+      }
+    >
+      <div className="workspace-shell">
+        {workspaceNotice ? <p className="workspace-notice">{workspaceNotice}</p> : null}
 
-      <ErrorBoundary
-        resetKey={`${workspacePhase}:${projectDetail?.project.id ?? "none"}`}
-        fallback={workspaceFallback}
-      >
-        <main className="workspace-grid workspace-grid-nested">
+        {workspaceStatus === "error" && !activeProject ? (
+          <WorkspaceStatePanel
+            title="Project list unavailable"
+            message={workspaceError ?? projectLoadError ?? "The backend could not load projects."}
+            actionLabel="Retry projects"
+            onAction={onRetryProjects}
+          />
+        ) : null}
+
+        <div className="workspace-grid">
           <ClipQueuePane
-            workspacePhase={workspacePhase}
+            workspacePhase={workspaceStatus}
             workspaceError={workspaceError}
             workspaceEmptyMessage={workspaceEmptyMessage}
-            clips={projectDetail?.clips ?? []}
+            clips={slices}
             activeClipId={activeClip?.id ?? null}
             onSelectClip={handleClipSelect}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
@@ -550,12 +421,13 @@ export default function LabelPage({
           />
 
           <EditorPane
-            workspacePhase={workspacePhase}
+            workspacePhase={workspaceStatus}
             workspaceError={workspaceError}
             workspaceEmptyMessage={workspaceEmptyMessage}
             activeClip={activeClip}
-            activeClipAudioUrl={activeClip ? buildClipAudioUrl(activeClip.id) : null}
-            activeHistory={activeHistory}
+            activeClipAudioUrl={activeClipAudioUrl}
+            canUndo={canUndo}
+            canRedo={canRedo}
             allClipTagNames={allClipTagNames}
             getNextClipId={getNextClipId}
             onSelectClip={handleClipSelect}
@@ -563,30 +435,36 @@ export default function LabelPage({
             onSaveTranscript={saveClipTranscript}
             onSaveTags={saveClipTags}
             onUpdateStatus={saveClipStatus}
-            onCommitSnapshot={createCommitSnapshot}
-            onAppendEdlOperation={applyClipEdlOperation}
+            onAppendEdlOperation={saveClipEdl}
             onUndo={undoClipMutation}
             onRedo={redoClipMutation}
             onSplitClip={splitClipMutation}
             onMergeClip={mergeNextClipMutation}
+            onRunClipLabModel={runClipLabModelMutation}
           />
 
           <InspectorPane
-            workspacePhase={workspacePhase}
+            workspacePhase={workspaceStatus}
             workspaceError={workspaceError}
             activeClip={activeClip}
-            projectDetail={projectDetail}
+            totalClipCount={sortClipsForQueue(slices).length}
+            totalDurationSeconds={totalDurationSeconds}
             datasetStatusCounts={datasetStatusCounts}
             acceptedRejectedRatio={acceptedRejectedRatio}
             predictedOutputSeconds={predictedOutputSeconds}
             progressPercent={progressPercent}
-            activeCommits={activeCommits}
             exportRuns={exportRuns}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
-            onStatusChange={(status) => void handleStatusChange(status)}
+            onStatusChange={(status) => {
+              if (!activeClip) {
+                return;
+              }
+              void saveClipStatus(activeClip.id, status);
+            }}
+            onVariantSelect={(variantId) => void setActiveVariantMutation(variantId)}
           />
-        </main>
-      </ErrorBoundary>
-    </section>
+        </div>
+      </div>
+    </ErrorBoundary>
   );
 }

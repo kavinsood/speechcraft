@@ -167,8 +167,7 @@ export default function App() {
     try {
       const nextProjects = await fetchProjects();
       const sortedProjects = [...nextProjects].sort(
-        (left, right) =>
-          new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+        (left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
       );
       const fallbackProjectId = sortedProjects[0]?.id ?? null;
       const selectedProjectId =
@@ -373,7 +372,7 @@ export default function App() {
       {activeProject ? (
         <footer className="workstation-footer">
           <span>{activeProject.name}</span>
-          <span>{activeProject.export_status.replace(/_/g, " ")}</span>
+          <span>created {new Date(activeProject.created_at).toLocaleDateString()}</span>
           <span>{stepDefinitions[activeStepIndex]?.shortLabel ?? "In"} active</span>
         </footer>
       ) : null}

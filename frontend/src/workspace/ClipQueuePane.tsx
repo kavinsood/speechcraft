@@ -1,9 +1,11 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { Clip } from "../types";
+import type { Slice } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   clipMatchesFilters,
   formatSeconds,
+  getSliceDuration,
+  getSliceTranscriptText,
   queuePriorityOrder,
   sortClipsForQueue,
   statusLabels,
@@ -15,7 +17,7 @@ type ClipQueuePaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
-  clips: Clip[];
+  clips: Slice[];
   activeClipId: string | null;
   onSelectClip: (clipId: string) => void;
   onRetryLoad: () => void;
@@ -174,14 +176,14 @@ export default function ClipQueuePane({
                   <strong>
                     <span className="order-pill">{index + 1}.</span>
                   </strong>
-                  <span className={`review-chip status-${clip.review_status}`}>
-                    {statusLabels[clip.review_status]}
+                  <span className={`review-chip status-${clip.status}`}>
+                    {statusLabels[clip.status]}
                   </span>
                 </div>
-                <p>{clip.transcript.text_current}</p>
+                <p>{getSliceTranscriptText(clip)}</p>
                 <div className="clip-list-meta">
-                  <span>{formatSeconds(clip.duration_seconds)}</span>
-                  <span>{clip.edit_state}</span>
+                  <span>{formatSeconds(getSliceDuration(clip))}</span>
+                  <span>{clip.active_variant?.generator_model ?? "source"}</span>
                 </div>
               </button>
             ))

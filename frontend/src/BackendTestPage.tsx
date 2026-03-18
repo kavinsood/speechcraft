@@ -1,24 +1,23 @@
 import { useMemo, useState } from "react";
 import {
   API_BASE,
-  appendClipEdlOperationStrict,
-  commitClipStrict,
-  fetchClipCommitsStrict,
-  fetchExportPreviewStrict,
-  fetchProjectExportsStrict,
+  appendClipEdlOperation,
+  fetchExportPreview,
   fetchHealthStrict,
-  fetchProjectDetailStrict,
-  fetchWaveformPeaksStrict,
-  mergeWithNextClipStrict,
-  redoClipStrict,
-  runProjectExportStrict,
-  splitClipStrict,
-  undoClipStrict,
-  updateClipStatusStrict,
-  updateClipTagsStrict,
-  updateClipTranscriptStrict,
+  fetchProjectExports,
+  fetchProjectSlices,
+  mergeWithNextClip,
+  redoClip,
+  runClipLabModel,
+  runProjectExport,
+  setActiveVariant,
+  splitClip,
+  undoClip,
+  updateClipStatus,
+  updateClipTags,
+  updateClipTranscript,
 } from "./api";
-import type { ProjectDetail } from "./types";
+import type { Slice } from "./types";
 
 type LogEntry = {
   step: string;
@@ -35,11 +34,11 @@ function formatResult(value: unknown): string {
 export default function BackendTestPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isRunning, setIsRunning] = useState(false);
-  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
+  const [slices, setSlices] = useState<Slice[]>([]);
 
   const activeClipId = useMemo(() => {
-    return projectDetail?.clips[0]?.id ?? "clip-001";
-  }, [projectDetail]);
+    return slices[0]?.id ?? "clip-001";
+  }, [slices]);
 
   function pushLog(step: string, status: LogEntry["status"], detail: string) {
     setLogs((current) => [...current, { step, status, detail }]);
@@ -54,86 +53,83 @@ export default function BackendTestPage() {
       const health = await fetchHealthStrict();
       pushLog("Health Check", "ok", formatResult(health));
 
-      pushLog("Project Load", "running", `Requesting /api/projects/${demoProjectId}`);
-      const detail = await fetchProjectDetailStrict(demoProjectId);
-      setProjectDetail(detail);
-      pushLog("Project Load", "ok", formatResult(detail));
+      pushLog("Slice Load", "running", `Requesting /api/projects/${demoProjectId}/slices`);
+      const loadedSlices = await fetchProjectSlices(demoProjectId);
+      setSlices(loadedSlices);
+      pushLog("Slice Load", "ok", formatResult(loadedSlices));
 
-      const clipId = detail.clips[0]?.id ?? "clip-001";
+      const clipId = loadedSlices[0]?.id ?? "clip-001";
 
-      pushLog("Status Update", "running", `Setting ${clipId} to in_review`);
-      const statusResult = await updateClipStatusStrict(clipId, "in_review");
+      pushLog("Status Update", "running", `Setting ${clipId} to quarantined`);
+      const statusResult = await updateClipStatus(clipId, "quarantined");
       pushLog("Status Update", "ok", formatResult(statusResult));
 
       const transcriptSuffix = `[backend-test ${new Date().toLocaleTimeString()}]`;
       pushLog("Transcript Update", "running", `Appending test marker to ${clipId}`);
-      const transcriptResult = await updateClipTranscriptStrict(
+      const transcriptResult = await updateClipTranscript(
         clipId,
-        `${statusResult.transcript.text_current} ${transcriptSuffix}`.trim(),
+        `${statusResult.transcript?.modified_text ?? statusResult.transcript?.original_text ?? ""} ${transcriptSuffix}`.trim(),
       );
       pushLog("Transcript Update", "ok", formatResult(transcriptResult));
 
       pushLog("Tag Update", "running", `Saving backend-test tags on ${clipId}`);
-      const tagResult = await updateClipTagsStrict(clipId, [
+      const tagResult = await updateClipTags(clipId, [
         { name: "backend-test", color: "#2f6c8f" },
         { name: "qa", color: "#8a7a3d" },
       ]);
       pushLog("Tag Update", "ok", formatResult(tagResult));
 
       pushLog("EDL Append", "running", `Appending insert_silence to ${clipId}`);
-      const edlResult = await appendClipEdlOperationStrict(clipId, {
+      const edlResult = await appendClipEdlOperation(clipId, {
         op: "insert_silence",
         duration_seconds: 0.15,
       });
       pushLog("EDL Append", "ok", formatResult(edlResult));
 
-      pushLog("Waveform Peaks", "running", `Requesting waveform peaks for ${clipId}`);
-      const waveform = await fetchWaveformPeaksStrict(clipId, 48);
-      pushLog("Waveform Peaks", "ok", formatResult(waveform));
-
       pushLog("Undo", "running", `Undoing the last edit for ${clipId}`);
-      const undoResult = await undoClipStrict(clipId);
+      const undoResult = await undoClip(clipId);
       pushLog("Undo", "ok", formatResult(undoResult));
 
       pushLog("Redo", "running", `Redoing the last edit for ${clipId}`);
-      const redoResult = await redoClipStrict(clipId);
+      const redoResult = await redoClip(clipId);
       pushLog("Redo", "ok", formatResult(redoResult));
 
-      pushLog("Commit Clip", "running", `Creating commit for ${clipId}`);
-      const commitResult = await commitClipStrict(clipId, "Backend test route commit");
-      pushLog("Commit Clip", "ok", formatResult(commitResult));
+      pushLog("Run Variant", "running", `Running DeepFilterNet on ${clipId}`);
+      const variantResult = await runClipLabModel(clipId, "deepfilternet");
+      pushLog("Run Variant", "ok", formatResult(variantResult));
 
-      pushLog("Commit History", "running", `Fetching commits for ${clipId}`);
-      const commits = await fetchClipCommitsStrict(clipId);
-      pushLog("Commit History", "ok", formatResult(commits));
+      const originalVariantId = variantResult.variants.find((variant) => variant.is_original)?.id;
+      if (originalVariantId) {
+        pushLog("Variant Switch", "running", `Switching ${clipId} back to ${originalVariantId}`);
+        const switched = await setActiveVariant(clipId, originalVariantId);
+        pushLog("Variant Switch", "ok", formatResult(switched));
+      }
 
-      pushLog("Split Clip", "running", `Splitting ${clipId}`);
-      const splitPoint = Math.max(
-        Number((edlResult.duration_seconds / 2).toFixed(2)),
-        0.1,
-      );
-      const splitResult = await splitClipStrict(clipId, splitPoint);
-      pushLog("Split Clip", "ok", formatResult(splitResult));
+      pushLog("Split Slice", "running", `Splitting ${clipId}`);
+      const splitResult = await splitClip(clipId, 0.1);
+      pushLog("Split Slice", "ok", formatResult(splitResult));
 
-      const mergeCandidate = splitResult.created_clip_ids[0];
-      pushLog("Merge Next Clip", "running", `Merging ${mergeCandidate} with the next active clip`);
-      const mergeResult = await mergeWithNextClipStrict(mergeCandidate);
-      pushLog("Merge Next Clip", "ok", formatResult(mergeResult));
+      const mergeCandidate = splitResult[0]?.id;
+      if (mergeCandidate) {
+        pushLog("Merge Next Slice", "running", `Merging ${mergeCandidate} with the next active slice`);
+        const mergeResult = await mergeWithNextClip(mergeCandidate);
+        pushLog("Merge Next Slice", "ok", formatResult(mergeResult));
+      }
 
       pushLog("Export Preview", "running", `Requesting export preview for ${demoProjectId}`);
-      const exportPreview = await fetchExportPreviewStrict(demoProjectId);
+      const exportPreview = await fetchExportPreview(demoProjectId);
       pushLog("Export Preview", "ok", formatResult(exportPreview));
 
       pushLog("Run Export", "running", `Rendering export for ${demoProjectId}`);
-      const exportRun = await runProjectExportStrict(demoProjectId);
+      const exportRun = await runProjectExport(demoProjectId);
       pushLog("Run Export", "ok", formatResult(exportRun));
 
       pushLog("Export Runs", "running", `Fetching export runs for ${demoProjectId}`);
-      const exportRuns = await fetchProjectExportsStrict(demoProjectId);
+      const exportRuns = await fetchProjectExports(demoProjectId);
       pushLog("Export Runs", "ok", formatResult(exportRuns));
 
-      const refreshedDetail = await fetchProjectDetailStrict(demoProjectId);
-      setProjectDetail(refreshedDetail);
+      const refreshedSlices = await fetchProjectSlices(demoProjectId);
+      setSlices(refreshedSlices);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown backend test failure";
       pushLog("Backend Test", "error", message);
@@ -180,7 +176,7 @@ export default function BackendTestPage() {
               <dd>{demoProjectId}</dd>
             </div>
             <div>
-              <dt>Primary Clip</dt>
+              <dt>Primary Slice</dt>
               <dd>{activeClipId}</dd>
             </div>
           </dl>

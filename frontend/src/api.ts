@@ -1,13 +1,10 @@
 import type {
-  Clip,
-  ClipCommit,
-  ClipHistoryResult,
-  ClipMutationResult,
-  ExportRun,
   ExportPreview,
-  Project,
-  ProjectDetail,
+  ExportRun,
+  ImportBatch,
+  MediaCleanupResult,
   ReviewStatus,
+  Slice,
   WaveformPeaks,
 } from "./types";
 
@@ -49,8 +46,8 @@ async function parseJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function buildClipAudioUrl(clipId: string): string {
-  return `${API_BASE}/api/clips/${clipId}/audio`;
+export function buildVariantAudioUrl(variantId: string): string {
+  return `${API_BASE}/media/variants/${variantId}.wav`;
 }
 
 export async function fetchHealthStrict(): Promise<{ status: string }> {
@@ -58,90 +55,74 @@ export async function fetchHealthStrict(): Promise<{ status: string }> {
   return await parseJson<{ status: string }>(response);
 }
 
-export async function fetchProjects(): Promise<Project[]> {
-  return await fetchProjectsStrict();
-}
-
-export async function fetchProjectsStrict(): Promise<Project[]> {
+export async function fetchProjects(): Promise<ImportBatch[]> {
   const response = await fetch(`${API_BASE}/api/projects`);
-  return await parseJson<Project[]>(response);
+  return await parseJson<ImportBatch[]>(response);
 }
 
-export async function fetchProjectDetail(projectId = "phase1-demo"): Promise<ProjectDetail> {
-  return await fetchProjectDetailStrict(projectId);
-}
-
-export async function fetchProjectDetailStrict(
-  projectId = "phase1-demo",
-): Promise<ProjectDetail> {
+export async function fetchProject(projectId: string): Promise<ImportBatch> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}`);
-  return await parseJson<ProjectDetail>(response);
+  return await parseJson<ImportBatch>(response);
 }
 
-export async function fetchExportPreview(projectId = "phase1-demo"): Promise<ExportPreview> {
-  return await fetchExportPreviewStrict(projectId);
+export async function fetchProjectSlices(projectId: string): Promise<Slice[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slices`);
+  return await parseJson<Slice[]>(response);
 }
 
-export async function fetchExportPreviewStrict(
-  projectId = "phase1-demo",
-): Promise<ExportPreview> {
+export async function fetchProjectExports(projectId: string): Promise<ExportRun[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/exports`);
+  return await parseJson<ExportRun[]>(response);
+}
+
+export async function fetchExportPreview(projectId: string): Promise<ExportPreview> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/export-preview`);
   return await parseJson<ExportPreview>(response);
 }
 
-export async function updateClipStatus(
-  clipId: string,
-  reviewStatus: ReviewStatus,
-): Promise<Clip> {
-  return await updateClipStatusStrict(clipId, reviewStatus);
+export async function runProjectExport(projectId: string): Promise<ExportRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/export`, {
+    method: "POST",
+  });
+  return await parseJson<ExportRun>(response);
 }
 
-export async function updateClipStatusStrict(
-  clipId: string,
-  reviewStatus: ReviewStatus,
-): Promise<Clip> {
+export async function cleanupProjectMedia(projectId: string): Promise<MediaCleanupResult> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/media-cleanup`, {
+    method: "POST",
+  });
+  return await parseJson<MediaCleanupResult>(response);
+}
+
+export async function updateClipStatus(clipId: string, status: ReviewStatus): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/status`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ review_status: reviewStatus }),
+    body: JSON.stringify({ status }),
   });
-  return await parseJson<Clip>(response);
+  return await parseJson<Slice>(response);
 }
 
 export async function updateClipTranscript(
   clipId: string,
-  textCurrent: string,
-): Promise<Clip> {
-  return await updateClipTranscriptStrict(clipId, textCurrent);
-}
-
-export async function updateClipTranscriptStrict(
-  clipId: string,
-  textCurrent: string,
-): Promise<Clip> {
+  modifiedText: string,
+): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/transcript`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ text_current: textCurrent }),
+    body: JSON.stringify({ modified_text: modifiedText }),
   });
-  return await parseJson<Clip>(response);
+  return await parseJson<Slice>(response);
 }
 
 export async function updateClipTags(
   clipId: string,
   tags: { name: string; color: string }[],
-): Promise<Clip> {
-  return await updateClipTagsStrict(clipId, tags);
-}
-
-export async function updateClipTagsStrict(
-  clipId: string,
-  tags: { name: string; color: string }[],
-): Promise<Clip> {
+): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/tags`, {
     method: "PATCH",
     headers: {
@@ -149,7 +130,7 @@ export async function updateClipTagsStrict(
     },
     body: JSON.stringify({ tags }),
   });
-  return await parseJson<Clip>(response);
+  return await parseJson<Slice>(response);
 }
 
 export async function appendClipEdlOperation(
@@ -159,18 +140,7 @@ export async function appendClipEdlOperation(
     range?: { start_seconds: number; end_seconds: number } | null;
     duration_seconds?: number | null;
   },
-): Promise<Clip> {
-  return await appendClipEdlOperationStrict(clipId, payload);
-}
-
-export async function appendClipEdlOperationStrict(
-  clipId: string,
-  payload: {
-    op: string;
-    range?: { start_seconds: number; end_seconds: number } | null;
-    duration_seconds?: number | null;
-  },
-): Promise<Clip> {
+): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/edl`, {
     method: "POST",
     headers: {
@@ -178,113 +148,24 @@ export async function appendClipEdlOperationStrict(
     },
     body: JSON.stringify(payload),
   });
-  return await parseJson<Clip>(response);
+  return await parseJson<Slice>(response);
 }
 
-export async function fetchClipCommits(clipId: string): Promise<ClipCommit[]> {
-  return await fetchClipCommitsStrict(clipId);
-}
-
-export async function fetchClipCommitsStrict(clipId: string): Promise<ClipCommit[]> {
-  const response = await fetch(`${API_BASE}/api/clips/${clipId}/commits`);
-  return await parseJson<ClipCommit[]>(response);
-}
-
-export async function commitClip(
-  clipId: string,
-  message = "Manual review commit",
-): Promise<ClipCommit> {
-  return await commitClipStrict(clipId, message);
-}
-
-export async function commitClipStrict(
-  clipId: string,
-  message = "Manual review commit",
-): Promise<ClipCommit> {
-  const response = await fetch(`${API_BASE}/api/clips/${clipId}/commit`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ message }),
-  });
-  return await parseJson<ClipCommit>(response);
-}
-
-export async function undoClip(clipId: string): Promise<ClipHistoryResult> {
-  return await undoClipStrict(clipId);
-}
-
-export async function undoClipStrict(clipId: string): Promise<ClipHistoryResult> {
+export async function undoClip(clipId: string): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/undo`, {
     method: "POST",
   });
-  return await parseJson<ClipHistoryResult>(response);
+  return await parseJson<Slice>(response);
 }
 
-export async function redoClip(clipId: string): Promise<ClipHistoryResult> {
-  return await redoClipStrict(clipId);
-}
-
-export async function redoClipStrict(clipId: string): Promise<ClipHistoryResult> {
+export async function redoClip(clipId: string): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/redo`, {
     method: "POST",
   });
-  return await parseJson<ClipHistoryResult>(response);
+  return await parseJson<Slice>(response);
 }
 
-export async function fetchProjectExports(projectId = "phase1-demo"): Promise<ExportRun[]> {
-  return await fetchProjectExportsStrict(projectId);
-}
-
-export async function fetchProjectExportsStrict(
-  projectId = "phase1-demo",
-): Promise<ExportRun[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/exports`);
-  return await parseJson<ExportRun[]>(response);
-}
-
-export async function runProjectExport(projectId = "phase1-demo"): Promise<ExportRun> {
-  return await runProjectExportStrict(projectId);
-}
-
-export async function runProjectExportStrict(
-  projectId = "phase1-demo",
-): Promise<ExportRun> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/export`, {
-    method: "POST",
-  });
-  return await parseJson<ExportRun>(response);
-}
-
-export async function fetchWaveformPeaks(
-  clipId: string,
-  bins = 120,
-): Promise<WaveformPeaks> {
-  return await fetchWaveformPeaksStrict(clipId, bins);
-}
-
-export async function fetchWaveformPeaksStrict(
-  clipId: string,
-  bins = 120,
-): Promise<WaveformPeaks> {
-  const response = await fetch(
-    `${API_BASE}/api/clips/${clipId}/waveform-peaks?bins=${bins}`,
-  );
-  return await parseJson<WaveformPeaks>(response);
-}
-
-export async function splitClip(
-  clipId: string,
-  splitAtSeconds: number,
-): Promise<ClipMutationResult> {
-  return await splitClipStrict(clipId, splitAtSeconds);
-}
-
-export async function splitClipStrict(
-  clipId: string,
-  splitAtSeconds: number,
-): Promise<ClipMutationResult> {
+export async function splitClip(clipId: string, splitAtSeconds: number): Promise<Slice[]> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/split`, {
     method: "POST",
     headers: {
@@ -292,18 +173,48 @@ export async function splitClipStrict(
     },
     body: JSON.stringify({ split_at_seconds: splitAtSeconds }),
   });
-  return await parseJson<ClipMutationResult>(response);
+  return await parseJson<Slice[]>(response);
 }
 
-export async function mergeWithNextClip(clipId: string): Promise<ClipMutationResult> {
-  return await mergeWithNextClipStrict(clipId);
-}
-
-export async function mergeWithNextClipStrict(
-  clipId: string,
-): Promise<ClipMutationResult> {
+export async function mergeWithNextClip(clipId: string): Promise<Slice[]> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/merge-next`, {
     method: "POST",
   });
-  return await parseJson<ClipMutationResult>(response);
+  return await parseJson<Slice[]>(response);
+}
+
+export async function runClipLabModel(
+  clipId: string,
+  generatorModel: string,
+): Promise<Slice> {
+  const response = await fetch(`${API_BASE}/api/clips/${clipId}/variants/run`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ generator_model: generatorModel }),
+  });
+  return await parseJson<Slice>(response);
+}
+
+export async function setActiveVariant(
+  clipId: string,
+  activeVariantId: string,
+): Promise<Slice> {
+  const response = await fetch(`${API_BASE}/api/clips/${clipId}/active-variant`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ active_variant_id: activeVariantId }),
+  });
+  return await parseJson<Slice>(response);
+}
+
+export async function fetchWaveformPeaks(
+  clipId: string,
+  bins = 120,
+): Promise<WaveformPeaks> {
+  const response = await fetch(`${API_BASE}/api/clips/${clipId}/waveform-peaks?bins=${bins}`);
+  return await parseJson<WaveformPeaks>(response);
 }
