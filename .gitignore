@@ -9,6 +9,8 @@ node_modules/
 dist/
 build/
 backend/data/*.json
+backend/data/*.db
+backend/data/media/
 backend/exports/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
