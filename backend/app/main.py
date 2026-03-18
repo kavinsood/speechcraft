@@ -2,23 +2,29 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse
 
 from .models import (
-    Clip,
-    ClipCommit,
-    ClipCommitCreate,
-    ClipEdlUpdate,
-    ClipHistoryResult,
-    ClipMutationResult,
-    ClipSplitRequest,
-    ClipStatusUpdate,
-    ClipTagUpdate,
-    ClipTranscriptUpdate,
-    ExportRun,
+    ActiveVariantUpdate,
+    AudioVariantCreate,
+    AudioVariantRunRequest,
     ExportPreview,
-    Project,
-    ProjectDetail,
+    ExportRun,
+    ImportBatch,
+    ImportBatchCreate,
+    MediaCleanupResult,
+    RecordingDerivativeCreate,
+    ReferenceAsset,
+    ReferenceAssetCreate,
+    SliceDetail,
+    SliceEdlUpdate,
+    SliceSplitRequest,
+    SliceStatusUpdate,
+    SliceTagUpdate,
+    SliceTranscriptUpdate,
+    SourceRecording,
+    SourceRecordingCreate,
+    SlicerHandoffRequest,
     WaveformPeaks,
 )
 from .repository import repository
@@ -26,8 +32,8 @@ from .repository import repository
 
 app = FastAPI(
     title="Speechcraft API",
-    version="0.1.0",
-    description="Phase 1 Clip Prep Workstation API",
+    version="0.3.0",
+    description="SQLite-backed API for the Speechcraft labeling workstation",
 )
 
 app.add_middleware(
@@ -44,23 +50,23 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/projects", response_model=list[Project])
-def list_projects() -> list[Project]:
+@app.get("/api/projects", response_model=list[ImportBatch])
+def list_projects() -> list[ImportBatch]:
     return repository.list_projects()
 
 
-@app.get("/api/projects/{project_id}", response_model=ProjectDetail)
-def get_project_detail(project_id: str) -> ProjectDetail:
+@app.get("/api/projects/{project_id}", response_model=ImportBatch)
+def get_project(project_id: str) -> ImportBatch:
     try:
-        return repository.get_project_detail(project_id)
+        return repository.get_project(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
-@app.get("/api/projects/{project_id}/clips", response_model=list[Clip])
-def list_project_clips(project_id: str) -> list[Clip]:
+@app.get("/api/projects/{project_id}/slices", response_model=list[SliceDetail])
+def list_project_slices(project_id: str) -> list[SliceDetail]:
     try:
-        return repository.get_project_clips(project_id)
+        return repository.get_project_slices(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
@@ -87,92 +93,88 @@ def export_project(project_id: str) -> ExportRun:
         return repository.export_project(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/clips/{clip_id}/commits", response_model=list[ClipCommit])
-def list_clip_commits(clip_id: str) -> list[ClipCommit]:
+@app.post("/api/projects/{project_id}/media-cleanup", response_model=MediaCleanupResult)
+def cleanup_project_media(project_id: str) -> MediaCleanupResult:
     try:
-        return repository.get_clip_commits(clip_id)
+        return repository.cleanup_project_media(project_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.patch("/api/clips/{clip_id}/status", response_model=Clip)
-def update_clip_status(clip_id: str, payload: ClipStatusUpdate) -> Clip:
+@app.patch("/api/clips/{clip_id}/status", response_model=SliceDetail)
+def update_slice_status(clip_id: str, payload: SliceStatusUpdate) -> SliceDetail:
     try:
-        return repository.update_clip_status(clip_id, payload)
+        return repository.update_slice_status(clip_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
 
 
-@app.patch("/api/clips/{clip_id}/transcript", response_model=Clip)
-def update_clip_transcript(clip_id: str, payload: ClipTranscriptUpdate) -> Clip:
+@app.patch("/api/clips/{clip_id}/transcript", response_model=SliceDetail)
+def update_slice_transcript(clip_id: str, payload: SliceTranscriptUpdate) -> SliceDetail:
     try:
-        return repository.update_clip_transcript(clip_id, payload.text_current)
+        return repository.update_slice_transcript(clip_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
 
 
-@app.patch("/api/clips/{clip_id}/tags", response_model=Clip)
-def update_clip_tags(clip_id: str, payload: ClipTagUpdate) -> Clip:
+@app.patch("/api/clips/{clip_id}/tags", response_model=SliceDetail)
+def update_slice_tags(clip_id: str, payload: SliceTagUpdate) -> SliceDetail:
     try:
-        return repository.update_clip_tags(clip_id, payload)
+        return repository.update_slice_tags(clip_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
 
 
-@app.post("/api/clips/{clip_id}/edl", response_model=Clip)
-def append_clip_edl_operation(clip_id: str, payload: ClipEdlUpdate) -> Clip:
+@app.post("/api/clips/{clip_id}/edl", response_model=SliceDetail)
+def append_slice_edl_operation(clip_id: str, payload: SliceEdlUpdate) -> SliceDetail:
     try:
         return repository.append_edl_operation(clip_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
 
 
-@app.post("/api/clips/{clip_id}/commit", response_model=ClipCommit)
-def commit_clip(clip_id: str, payload: ClipCommitCreate) -> ClipCommit:
+@app.post("/api/clips/{clip_id}/undo", response_model=SliceDetail)
+def undo_slice(clip_id: str) -> SliceDetail:
     try:
-        return repository.commit_clip(clip_id, payload)
+        return repository.undo_slice(clip_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
-
-
-@app.post("/api/clips/{clip_id}/undo", response_model=ClipHistoryResult)
-def undo_clip(clip_id: str) -> ClipHistoryResult:
-    try:
-        return repository.undo_clip(clip_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/clips/{clip_id}/redo", response_model=ClipHistoryResult)
-def redo_clip(clip_id: str) -> ClipHistoryResult:
+@app.post("/api/clips/{clip_id}/redo", response_model=SliceDetail)
+def redo_slice(clip_id: str) -> SliceDetail:
     try:
-        return repository.redo_clip(clip_id)
+        return repository.redo_slice(clip_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/clips/{clip_id}/split", response_model=ClipMutationResult)
-def split_clip(clip_id: str, payload: ClipSplitRequest) -> ClipMutationResult:
+@app.post("/api/clips/{clip_id}/split", response_model=list[SliceDetail])
+def split_slice(clip_id: str, payload: SliceSplitRequest) -> list[SliceDetail]:
     try:
-        return repository.split_clip(clip_id, payload)
+        return repository.split_slice(clip_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/clips/{clip_id}/merge-next", response_model=ClipMutationResult)
-def merge_with_next_clip(clip_id: str) -> ClipMutationResult:
+@app.post("/api/clips/{clip_id}/merge-next", response_model=list[SliceDetail])
+def merge_with_next_slice(clip_id: str) -> list[SliceDetail]:
     try:
-        return repository.merge_with_next_clip(clip_id)
+        return repository.merge_with_next_slice(clip_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -182,19 +184,93 @@ def get_waveform_peaks(clip_id: str, bins: int = 120) -> WaveformPeaks:
     try:
         return repository.get_waveform_peaks(clip_id, bins)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/clips/{clip_id}/audio")
-def get_clip_audio(clip_id: str) -> Response:
+@app.patch("/api/clips/{clip_id}/active-variant", response_model=SliceDetail)
+def set_active_variant(clip_id: str, payload: ActiveVariantUpdate) -> SliceDetail:
     try:
-        return Response(
-            content=repository.get_clip_audio_bytes(clip_id),
-            media_type="audio/wav",
-        )
+        return repository.set_active_variant(clip_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Clip not found") from exc
+        raise HTTPException(status_code=404, detail="Audio variant not found") from exc
+
+
+@app.post("/api/clips/{clip_id}/variants", response_model=SliceDetail)
+def create_audio_variant(clip_id: str, payload: AudioVariantCreate) -> SliceDetail:
+    try:
+        return repository.create_audio_variant(clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/clips/{clip_id}/variants/run", response_model=SliceDetail)
+def run_audio_variant(clip_id: str, payload: AudioVariantRunRequest) -> SliceDetail:
+    try:
+        return repository.run_audio_variant(clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/media/variants/{variant_id}.wav")
+def get_variant_media(variant_id: str) -> FileResponse:
+    try:
+        path = repository.get_variant_media_path(variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Audio variant not found") from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
+@app.post("/api/import-batches", response_model=ImportBatch)
+def create_import_batch(payload: ImportBatchCreate) -> ImportBatch:
+    return repository.create_import_batch(payload)
+
+
+@app.post("/api/source-recordings", response_model=SourceRecording)
+def create_source_recording(payload: SourceRecordingCreate) -> SourceRecording:
+    try:
+        return repository.create_source_recording(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/source-recordings/{recording_id}/preprocess", response_model=SourceRecording)
+def create_preprocessed_recording(
+    recording_id: str,
+    payload: RecordingDerivativeCreate,
+) -> SourceRecording:
+    try:
+        return repository.create_preprocessed_recording(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/source-recordings/{recording_id}/slice-handoff", response_model=list[SliceDetail])
+def register_slicer_chunks(recording_id: str, payload: SlicerHandoffRequest) -> list[SliceDetail]:
+    try:
+        return repository.register_slicer_chunks(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/reference-assets", response_model=ReferenceAsset)
+def create_reference_asset(payload: ReferenceAssetCreate) -> ReferenceAsset:
+    try:
+        return repository.create_reference_asset(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Audio variant not found") from exc
