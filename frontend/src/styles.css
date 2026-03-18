@@ -796,19 +796,14 @@ button:disabled {
   font-weight: 700;
 }
 
-.status-candidate {
+.status-unresolved {
   background: #e3d7a7;
   color: #5c4f18;
 }
 
-.status-needs_attention {
+.status-quarantined {
   background: #f3c9be;
   color: #7e3322;
-}
-
-.status-in_review {
-  background: #d4e4ea;
-  color: #2a5d72;
 }
 
 .status-accepted {
@@ -1296,6 +1291,11 @@ button:disabled {
   border-radius: 0.9rem;
   background: rgba(244, 240, 231, 0.9);
   border: 1px solid rgba(97, 91, 74, 0.1);
+}
+
+.commit-card.selected {
+  border-color: rgba(47, 108, 143, 0.45);
+  box-shadow: 0 0 0 1px rgba(47, 108, 143, 0.18);
 }
 
 .commit-card p {

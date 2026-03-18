@@ -2,40 +2,36 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type WaveSurfer from "wavesurfer.js";
 import WaveformPane from "../WaveformPane";
 import { fetchWaveformPeaks } from "../api";
-import type {
-  Clip,
-  ClipCommit,
-  ClipEdlOperation,
-  ClipHistoryResult,
-  ClipMutationResult,
-  ReviewStatus,
-  WaveformPeaks,
-} from "../types";
+import type { ReviewStatus, Slice, WaveformPeaks } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
-import { formatClipTimestamp, formatSeconds, parseTagDraft } from "./workspace-helpers";
+import {
+  formatClipTimestamp,
+  formatSeconds,
+  getAlignmentConfidence,
+  getAlignmentSource,
+  getRedoTarget,
+  getSliceDuration,
+  getSliceTranscriptText,
+  parseTagDraft,
+} from "./workspace-helpers";
 
 type WorkspacePhase = "loading" | "error" | "empty" | "ready";
-
-type HistoryFlags = {
-  can_undo: boolean;
-  can_redo: boolean;
-};
 
 type EditorPaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
-  activeClip: Clip | null;
+  activeClip: Slice | null;
   activeClipAudioUrl: string | null;
-  activeHistory: HistoryFlags;
+  canUndo: boolean;
+  canRedo: boolean;
   allClipTagNames: string[];
   getNextClipId: (currentClipId: string) => string | null;
   onSelectClip: (clipId: string) => void;
   onRetryLoad: () => void;
-  onSaveTranscript: (clipId: string, text: string) => Promise<Clip>;
-  onSaveTags: (clipId: string, tags: { name: string; color: string }[]) => Promise<Clip>;
-  onUpdateStatus: (clipId: string, status: ReviewStatus) => Promise<Clip>;
-  onCommitSnapshot: (workingClip: Clip, message: string) => Promise<ClipCommit>;
+  onSaveTranscript: (clipId: string, text: string) => Promise<Slice>;
+  onSaveTags: (clipId: string, tags: { name: string; color: string }[]) => Promise<Slice>;
+  onUpdateStatus: (clipId: string, status: ReviewStatus) => Promise<Slice>;
   onAppendEdlOperation: (
     clipId: string,
     payload: {
@@ -43,11 +39,12 @@ type EditorPaneProps = {
       range?: { start_seconds: number; end_seconds: number } | null;
       duration_seconds?: number | null;
     },
-  ) => Promise<Clip>;
-  onUndo: (clipId: string) => Promise<ClipHistoryResult>;
-  onRedo: (clipId: string) => Promise<ClipHistoryResult>;
-  onSplitClip: (clipId: string, splitAtSeconds: number) => Promise<ClipMutationResult>;
-  onMergeClip: (clipId: string) => Promise<ClipMutationResult>;
+  ) => Promise<Slice>;
+  onUndo: (clipId: string) => Promise<Slice>;
+  onRedo: (clipId: string) => Promise<Slice>;
+  onSplitClip: (clipId: string, splitAtSeconds: number) => Promise<Slice[]>;
+  onMergeClip: (clipId: string) => Promise<Slice[]>;
+  onRunClipLabModel: (clipId: string, generatorModel: string) => Promise<Slice>;
 };
 
 export default function EditorPane({
@@ -56,7 +53,8 @@ export default function EditorPane({
   workspaceEmptyMessage,
   activeClip,
   activeClipAudioUrl,
-  activeHistory,
+  canUndo,
+  canRedo,
   allClipTagNames,
   getNextClipId,
   onSelectClip,
@@ -64,12 +62,12 @@ export default function EditorPane({
   onSaveTranscript,
   onSaveTags,
   onUpdateStatus,
-  onCommitSnapshot,
   onAppendEdlOperation,
   onUndo,
   onRedo,
   onSplitClip,
   onMergeClip,
+  onRunClipLabModel,
 }: EditorPaneProps) {
   const transcriptEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const waveSurferRef = useRef<WaveSurfer | null>(null);
@@ -88,12 +86,14 @@ export default function EditorPane({
   const [playbackStartSeconds, setPlaybackStartSeconds] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isCommittingClip, setIsCommittingClip] = useState(false);
+  const [isSavingSlice, setIsSavingSlice] = useState(false);
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
+  const [isRunningModel, setIsRunningModel] = useState(false);
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [waveformPeaks, setWaveformPeaks] = useState<WaveformPeaks | null>(null);
   const [waveformError, setWaveformError] = useState<string | null>(null);
 
+  const activeDuration = activeClip ? getSliceDuration(activeClip) : 0;
   const draftTagEntries = useMemo(() => parseTagDraft(draftTags), [draftTags]);
   const suggestedTagNames = useMemo(() => {
     const selected = new Set(draftTagEntries.map((tag) => tag.name.toLowerCase()));
@@ -110,7 +110,7 @@ export default function EditorPane({
       return;
     }
 
-    setDraftTranscript(activeClip.transcript.text_current);
+    setDraftTranscript(getSliceTranscriptText(activeClip));
     setDraftTags(activeClip.tags.map((tag) => tag.name).join(", "));
     setTagInputDraft("");
     setSelectionStart(0);
@@ -136,11 +136,6 @@ export default function EditorPane({
       return;
     }
 
-    if (activeClip.audio_path) {
-      setWaveformPeaks(null);
-      return;
-    }
-
     let cancelled = false;
     setWaveformPeaks(null);
     setWaveformError(null);
@@ -157,7 +152,7 @@ export default function EditorPane({
           return;
         }
         const message =
-          error instanceof Error ? error.message : "Waveform peaks failed to load for this clip.";
+          error instanceof Error ? error.message : "Waveform peaks failed to load for this slice.";
         console.error(message);
         setWaveformError(message);
         setWaveformPeaks(null);
@@ -167,7 +162,7 @@ export default function EditorPane({
     return () => {
       cancelled = true;
     };
-  }, [activeClip?.id]);
+  }, [activeClip?.id, activeClip?.active_commit_id, activeClip?.active_variant_id]);
 
   useEffect(() => {
     const editor = transcriptEditorRef.current;
@@ -187,18 +182,17 @@ export default function EditorPane({
     if (!instance) {
       return;
     }
-    (instance as unknown as { setPlaybackRate: (value: number, preservePitch?: boolean) => void })
-      .setPlaybackRate(rate, true);
+    (instance as unknown as { setPlaybackRate: (value: number, preservePitch?: boolean) => void }).setPlaybackRate(rate, true);
   }
 
   function setWaveSurferTime(nextTime: number) {
     const waveSurfer = waveSurferRef.current;
-    if (!waveSurfer || !activeClip || activeClip.duration_seconds <= 0) {
+    if (!waveSurfer || activeDuration <= 0) {
       return;
     }
 
-    const clamped = Math.max(0, Math.min(nextTime, activeClip.duration_seconds));
-    waveSurfer.seekTo(clamped / activeClip.duration_seconds);
+    const clamped = Math.max(0, Math.min(nextTime, activeDuration));
+    waveSurfer.seekTo(clamped / activeDuration);
     setPlayheadSeconds(Number(clamped.toFixed(2)));
   }
 
@@ -238,75 +232,64 @@ export default function EditorPane({
     applyPlaybackRate(waveSurferRef.current, nextRate);
   }
 
-  async function handleTagsSave() {
+  async function persistDrafts(): Promise<Slice | null> {
     if (!activeClip) {
-      return;
+      return null;
     }
 
-    pausePlayback();
-    try {
-      const updatedClip = await onSaveTags(activeClip.id, parseTagDraft(draftTags));
-      setDraftTags(updatedClip.tags.map((tag) => tag.name).join(", "));
-      setEditorNotice("Saved clip tags.");
-    } catch (error) {
-      setEditorNotice(error instanceof Error ? error.message : "Tag update failed.");
+    let workingSlice = activeClip;
+    if (draftTranscript !== getSliceTranscriptText(activeClip)) {
+      workingSlice = await onSaveTranscript(activeClip.id, draftTranscript);
     }
+
+    const currentTagDraft = workingSlice.tags.map((tag) => tag.name).join(", ");
+    if (draftTags.trim() !== currentTagDraft.trim()) {
+      workingSlice = await onSaveTags(workingSlice.id, parseTagDraft(draftTags));
+      setDraftTags(workingSlice.tags.map((tag) => tag.name).join(", "));
+    }
+
+    return workingSlice;
   }
 
-  async function handleCommitClip(forceAccepted = false): Promise<boolean> {
+  async function handleSaveSlice(forceStatus?: ReviewStatus): Promise<Slice | null> {
     if (!activeClip) {
-      return false;
+      return null;
     }
 
-    setIsCommittingClip(true);
+    setIsSavingSlice(true);
     pausePlayback();
 
     try {
-      let workingClip = activeClip;
-
-      if (draftTranscript !== activeClip.transcript.text_current) {
-        workingClip = await onSaveTranscript(activeClip.id, draftTranscript);
+      let workingSlice = await persistDrafts();
+      if (!workingSlice) {
+        return null;
       }
-
-      const currentTagDraft = workingClip.tags.map((tag) => tag.name).join(", ");
-      if (draftTags.trim() !== currentTagDraft.trim()) {
-        workingClip = await onSaveTags(workingClip.id, parseTagDraft(draftTags));
-        setDraftTags(workingClip.tags.map((tag) => tag.name).join(", "));
+      if (forceStatus && workingSlice.status !== forceStatus) {
+        workingSlice = await onUpdateStatus(workingSlice.id, forceStatus);
       }
-
-      if (forceAccepted && workingClip.review_status !== "accepted") {
-        workingClip = await onUpdateStatus(workingClip.id, "accepted");
-      }
-
-      const message =
-        workingClip.review_status === "accepted"
-          ? "Accepted clip snapshot"
-          : "Manual review commit";
-
-      const createdCommit = await onCommitSnapshot(workingClip, message);
-      setEditorNotice(`Committed clip snapshot: ${createdCommit.message}`);
-      return true;
+      setEditorNotice("Saved slice state.");
+      return workingSlice;
     } catch (error) {
-      setEditorNotice(error instanceof Error ? error.message : "Commit failed.");
-      return false;
+      setEditorNotice(error instanceof Error ? error.message : "Save failed.");
+      return null;
     } finally {
-      setIsCommittingClip(false);
+      setIsSavingSlice(false);
     }
   }
 
-  async function handleAcceptCommitNextAndPlay() {
-    if (!activeClip || isCommittingClip || isApplyingEdit) {
+  async function handleAcceptNextAndPlay() {
+    if (!activeClip || isSavingSlice || isApplyingEdit) {
       return;
     }
 
     const nextClipId = getNextClipId(activeClip.id);
-    const committed = await handleCommitClip(true);
-    if (!committed) {
+    const savedSlice = await handleSaveSlice("accepted");
+    if (!savedSlice) {
       return;
     }
 
     if (!nextClipId) {
-      setEditorNotice("Committed. No next clip in the current queue.");
+      setEditorNotice("Saved. No next slice in the current queue.");
       return;
     }
 
@@ -315,18 +298,13 @@ export default function EditorPane({
   }
 
   async function handleRejectNextAndPlay() {
-    if (!activeClip || isCommittingClip || isApplyingEdit) {
+    if (!activeClip || isSavingSlice || isApplyingEdit) {
       return;
     }
 
     const nextClipId = getNextClipId(activeClip.id);
-    pausePlayback();
-    try {
-      const rejectedClip = await onUpdateStatus(activeClip.id, "rejected");
-      const createdCommit = await onCommitSnapshot(rejectedClip, "Rejected clip snapshot");
-      setEditorNotice(`Committed clip snapshot: ${createdCommit.message}`);
-    } catch (error) {
-      setEditorNotice(error instanceof Error ? error.message : "Could not mark clip as rejected.");
+    const savedSlice = await handleSaveSlice("rejected");
+    if (!savedSlice) {
       return;
     }
 
@@ -356,15 +334,13 @@ export default function EditorPane({
     let nextStart = cursorTime;
     let nextEnd: number | undefined;
 
-    const isAtOrPastEnd =
-      cursorTime >= activeClip.duration_seconds - 0.01 ||
-      playheadSeconds >= activeClip.duration_seconds - 0.01;
+    const isAtOrPastEnd = cursorTime >= activeDuration - 0.01 || playheadSeconds >= activeDuration - 0.01;
 
     if (selectionDuration > 0.01) {
       nextStart = normalizedSelectionStart;
       nextEnd = normalizedSelectionEnd;
     } else if (isAtOrPastEnd) {
-      nextStart = Math.max(0, Math.min(playbackStartSeconds, activeClip.duration_seconds));
+      nextStart = Math.max(0, Math.min(playbackStartSeconds, activeDuration));
     }
 
     setWaveSurferTime(nextStart);
@@ -375,7 +351,7 @@ export default function EditorPane({
       setIsPlaying(true);
       setEditorNotice(null);
     } catch {
-      setEditorNotice("Audio preview could not start. Check the backend audio route.");
+      setEditorNotice("Audio preview could not start. Check the active variant media route.");
     }
   }
 
@@ -395,24 +371,19 @@ export default function EditorPane({
       setIsPlaying(true);
       setEditorNotice(null);
     } catch {
-      setEditorNotice("Audio preview could not start. Check the backend audio route.");
+      setEditorNotice("Audio preview could not start. Check the active variant media route.");
     }
   }
 
   playFromBeginningActionRef.current = handlePlayFromBeginning;
   togglePlaybackActionRef.current = handleTogglePlayback;
   rejectNextActionRef.current = handleRejectNextAndPlay;
-  acceptNextActionRef.current = handleAcceptCommitNextAndPlay;
+  acceptNextActionRef.current = handleAcceptNextAndPlay;
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable)
-      ) {
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
         return;
       }
 
@@ -451,11 +422,10 @@ export default function EditorPane({
       return;
     }
 
-    const duration = activeClip.duration_seconds;
-    const start = Math.max(0, Math.min(Math.min(selectionStart, selectionEnd), duration));
-    let end = Math.max(0, Math.min(Math.max(selectionStart, selectionEnd), duration));
-    if (duration - end <= 0.03) {
-      end = duration;
+    const start = Math.max(0, Math.min(Math.min(selectionStart, selectionEnd), activeDuration));
+    let end = Math.max(0, Math.min(Math.max(selectionStart, selectionEnd), activeDuration));
+    if (activeDuration - end <= 0.03) {
+      end = activeDuration;
     }
 
     if (end <= start) {
@@ -466,11 +436,11 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const updatedClip = await onAppendEdlOperation(activeClip.id, {
+      const updated = await onAppendEdlOperation(activeClip.id, {
         op: "delete_range",
         range: { start_seconds: start, end_seconds: end },
       });
-      const nextTime = Math.min(start, updatedClip.duration_seconds);
+      const nextTime = Math.min(start, getSliceDuration(updated));
       setSelectionStart(nextTime);
       setSelectionEnd(nextTime);
       setPlayheadSeconds(nextTime);
@@ -491,17 +461,17 @@ export default function EditorPane({
     const cursorTime = waveSurferRef.current
       ? Number(waveSurferRef.current.getCurrentTime().toFixed(2))
       : playheadSeconds;
-    const insertAt = Math.max(0, Math.min(cursorTime, activeClip.duration_seconds));
+    const insertAt = Math.max(0, Math.min(cursorTime, activeDuration));
 
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const updatedClip = await onAppendEdlOperation(activeClip.id, {
+      const updated = await onAppendEdlOperation(activeClip.id, {
         op: "insert_silence",
         range: { start_seconds: insertAt, end_seconds: insertAt },
         duration_seconds: 0.2,
       });
-      const nextTime = Math.min(insertAt, updatedClip.duration_seconds);
+      const nextTime = Math.min(insertAt, getSliceDuration(updated));
       setSelectionStart(nextTime);
       setSelectionEnd(nextTime);
       setPlayheadSeconds(nextTime);
@@ -520,13 +490,13 @@ export default function EditorPane({
 
     pausePlayback();
     try {
-      const result = await onUndo(activeClip.id);
-      setDraftTranscript(result.clip.transcript.text_current);
-      setDraftTags(result.clip.tags.map((tag) => tag.name).join(", "));
+      const updated = await onUndo(activeClip.id);
+      setDraftTranscript(getSliceTranscriptText(updated));
+      setDraftTags(updated.tags.map((tag) => tag.name).join(", "));
       setSelectionStart(0);
       setSelectionEnd(0);
       setPlayheadSeconds(0);
-      setEditorNotice("Reverted to the previous local state.");
+      setEditorNotice("Reverted to the previous backend edit state.");
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Nothing earlier to undo.");
     }
@@ -539,13 +509,13 @@ export default function EditorPane({
 
     pausePlayback();
     try {
-      const result = await onRedo(activeClip.id);
-      setDraftTranscript(result.clip.transcript.text_current);
-      setDraftTags(result.clip.tags.map((tag) => tag.name).join(", "));
+      const updated = await onRedo(activeClip.id);
+      setDraftTranscript(getSliceTranscriptText(updated));
+      setDraftTags(updated.tags.map((tag) => tag.name).join(", "));
       setSelectionStart(0);
       setSelectionEnd(0);
       setPlayheadSeconds(0);
-      setEditorNotice("Re-applied the next local state.");
+      setEditorNotice("Re-applied the next backend edit state.");
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Nothing newer to redo.");
     }
@@ -557,12 +527,12 @@ export default function EditorPane({
     }
 
     const splitAt =
-      normalizedSelectionEnd > 0 && normalizedSelectionEnd < activeClip.duration_seconds
+      normalizedSelectionEnd > 0 && normalizedSelectionEnd < activeDuration
         ? normalizedSelectionEnd
-        : Number((activeClip.duration_seconds / 2).toFixed(2));
+        : Number((activeDuration / 2).toFixed(2));
 
-    if (splitAt <= 0 || splitAt >= activeClip.duration_seconds) {
-      setEditorNotice("Choose a valid split point inside the clip.");
+    if (splitAt <= 0 || splitAt >= activeDuration) {
+      setEditorNotice("Choose a valid split point inside the slice.");
       return;
     }
 
@@ -570,7 +540,7 @@ export default function EditorPane({
     pausePlayback();
     try {
       const result = await onSplitClip(activeClip.id, splitAt);
-      setEditorNotice(`Split ${activeClip.id} into ${result.created_clip_ids.length} clips.`);
+      setEditorNotice(`Split ${activeClip.id} into ${result.length} visible slices.`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Split failed.");
     } finally {
@@ -587,11 +557,27 @@ export default function EditorPane({
     pausePlayback();
     try {
       const result = await onMergeClip(activeClip.id);
-      setEditorNotice(`Merged into ${result.created_clip_ids[0] ?? "a new clip"}.`);
+      setEditorNotice(`Merged. Workspace now has ${result.length} visible slices.`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Merge failed.");
     } finally {
       setIsApplyingEdit(false);
+    }
+  }
+
+  async function handleRunDeepFilterNet() {
+    if (!activeClip) {
+      return;
+    }
+    setIsRunningModel(true);
+    pausePlayback();
+    try {
+      const updated = await onRunClipLabModel(activeClip.id, "deepfilternet");
+      setEditorNotice(`Activated variant ${updated.active_variant_id ?? "unknown"}.`);
+    } catch (error) {
+      setEditorNotice(error instanceof Error ? error.message : "Clip Lab model failed.");
+    } finally {
+      setIsRunningModel(false);
     }
   }
 
@@ -600,16 +586,12 @@ export default function EditorPane({
       <section className="panel waveform-panel">
         <div className="panel-header">
           <div className="clip-editor-header-main">
-            <p className="eyebrow">Clip Editor</p>
+            <p className="eyebrow">Slice Editor</p>
             {activeClip ? (
               <div className="tag-list header-tag-list">
                 {activeClip.tags.length > 0 ? (
                   activeClip.tags.map((tag) => (
-                    <span
-                      key={`${activeClip.id}-top-${tag.name}`}
-                      className="tag-pill"
-                      style={{ backgroundColor: tag.color }}
-                    >
+                    <span key={`${activeClip.id}-top-${tag.id}`} className="tag-pill" style={{ backgroundColor: tag.color }}>
                       {tag.name}
                     </span>
                   ))
@@ -622,26 +604,41 @@ export default function EditorPane({
           {activeClip ? (
             <div className="clip-editor-header-actions">
               <div className="metadata-strip">
-                <span>{formatSeconds(activeClip.duration_seconds)}</span>
-                <span>{activeClip.sample_rate / 1000} kHz</span>
-                <span>{activeClip.channels} ch</span>
+                <span>{formatSeconds(activeDuration)}</span>
+                <span>{(activeClip.active_variant?.sample_rate ?? activeClip.source_recording.sample_rate) / 1000} kHz</span>
+                <span>{activeClip.source_recording.num_channels} ch</span>
               </div>
               <div className="editor-actions">
                 <button
                   className="primary-button"
                   type="button"
-                  onClick={() => void handleAcceptCommitNextAndPlay()}
-                  disabled={!activeClip || isCommittingClip}
+                  onClick={() => void handleSaveSlice()}
+                  disabled={!activeClip || isSavingSlice}
                 >
-                  Save Clip & Next
+                  Save Slice
+                </button>
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => void handleAcceptNextAndPlay()}
+                  disabled={!activeClip || isSavingSlice}
+                >
+                  Accept & Next
                 </button>
                 <button
                   className="primary-button"
                   type="button"
                   onClick={() => void handleRejectNextAndPlay()}
-                  disabled={!activeClip || isCommittingClip || isApplyingEdit}
+                  disabled={!activeClip || isSavingSlice || isApplyingEdit}
                 >
-                  Reject Clip & Next
+                  Reject & Next
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleRunDeepFilterNet()}
+                  disabled={!activeClip || isRunningModel}
+                >
+                  {isRunningModel ? "Running..." : "Run DeepFilterNet"}
                 </button>
               </div>
             </div>
@@ -665,7 +662,7 @@ export default function EditorPane({
               <strong>Media offline</strong>
               <p>{waveformError}</p>
               <span>
-                This clip can still be reviewed for transcript and metadata, but waveform-driven
+                This slice can still be reviewed for transcript and metadata, but waveform-driven
                 editing is unavailable until the source audio is re-linked.
               </span>
             </div>
@@ -673,7 +670,7 @@ export default function EditorPane({
             <>
               <WaveformPane
                 audioUrl={activeClipAudioUrl ?? ""}
-                durationSeconds={activeClip.duration_seconds}
+                durationSeconds={activeDuration}
                 peaks={waveformPeaks?.peaks ?? null}
                 desiredCursorSeconds={playheadSeconds}
                 selectionStart={selectionStart}
@@ -692,13 +689,11 @@ export default function EditorPane({
               />
 
               <div className="waveform-second-scale" aria-hidden="true">
-                {Array.from({ length: Math.floor(activeClip.duration_seconds) + 1 }, (_, second) => (
+                {Array.from({ length: Math.floor(activeDuration) + 1 }, (_, second) => (
                   <span
                     key={`sec-tick-${activeClip.id}-${second}`}
                     className="waveform-second-tick"
-                    style={{
-                      left: `${(second / Math.max(activeClip.duration_seconds, 0.001)) * 100}%`,
-                    }}
+                    style={{ left: `${(second / Math.max(activeDuration, 0.001)) * 100}%` }}
                   >
                     {second}s
                   </span>
@@ -707,13 +702,10 @@ export default function EditorPane({
 
               <div className="timeline-strip transport-strip">
                 <span className="transport-pill">
-                  {formatClipTimestamp(playheadSeconds)} /{" "}
-                  {formatClipTimestamp(activeClip.duration_seconds)}
+                  {formatClipTimestamp(playheadSeconds)} / {formatClipTimestamp(activeDuration)}
                 </span>
                 <span className="transport-meta">
-                  {hoverSeconds !== null
-                    ? `Hover ${formatClipTimestamp(hoverSeconds)}`
-                    : "Hover --.--"}
+                  {hoverSeconds !== null ? `Hover ${formatClipTimestamp(hoverSeconds)}` : "Hover --.--"}
                 </span>
                 <span className="transport-meta">
                   {hasActiveSelection
@@ -731,24 +723,20 @@ export default function EditorPane({
                 <button type="button" onClick={handleCyclePlaybackRate}>
                   Speed {playbackRate}x
                 </button>
-                <button type="button" onClick={() => void handleUndo()} disabled={!activeHistory.can_undo}>
+                <button type="button" onClick={() => void handleUndo()} disabled={!canUndo}>
                   Undo
                 </button>
-                <button type="button" onClick={() => void handleRedo()} disabled={!activeHistory.can_redo}>
+                <button type="button" onClick={() => void handleRedo()} disabled={!canRedo}>
                   Redo
                 </button>
                 <button type="button" onClick={() => void handleSplitClip()} disabled={isApplyingEdit}>
-                  {isApplyingEdit ? "Applying..." : "Split Clip"}
+                  {isApplyingEdit ? "Applying..." : "Split Slice"}
                 </button>
                 <button type="button" onClick={() => void handleMergeClip()} disabled={isApplyingEdit}>
-                  Merge Next Clip
+                  Merge Next Slice
                 </button>
                 {hasActiveSelection ? (
-                  <button
-                    type="button"
-                    onClick={() => void handleDeleteSelection()}
-                    disabled={isApplyingEdit}
-                  >
+                  <button type="button" onClick={() => void handleDeleteSelection()} disabled={isApplyingEdit}>
                     Delete Selection
                   </button>
                 ) : null}
@@ -762,7 +750,7 @@ export default function EditorPane({
           <div className="empty-state">
             {workspacePhase === "empty"
               ? workspaceEmptyMessage ?? "Import a project to begin review."
-              : "Select a clip to begin review."}
+              : "Select a slice to begin review."}
           </div>
         )}
       </section>
@@ -786,12 +774,12 @@ export default function EditorPane({
         <div className="selection-panel">
           <div className="selection-header">
             <strong>Tags</strong>
-            <button className="primary-button" type="button" onClick={() => void handleTagsSave()}>
-              Save Tags
+            <button className="primary-button" type="button" onClick={() => void handleSaveSlice()}>
+              Save Slice
             </button>
           </div>
           <p className="muted-copy">
-            Export uses clip status (`accepted`) + commit state. Tags are for filtering/QA.
+            Pipeline status is strict control flow. Tags are subjective QA metadata.
           </p>
           <div className="tag-token-list">
             {draftTagEntries.length > 0 ? (
@@ -808,7 +796,7 @@ export default function EditorPane({
                 </button>
               ))
             ) : (
-              <span className="muted-copy">No tags on this clip yet.</span>
+              <span className="muted-copy">No tags on this slice yet.</span>
             )}
           </div>
           <div className="tag-input-row">
@@ -844,15 +832,18 @@ export default function EditorPane({
 
         <div className="transcript-footer">
           <span>
-            Source: <strong>{activeClip?.transcript.source ?? "n/a"}</strong>
+            Source: <strong>{activeClip ? getAlignmentSource(activeClip) : "n/a"}</strong>
           </span>
           <span>
             Confidence:{" "}
             <strong>
-              {activeClip?.transcript.confidence
-                ? `${Math.round(activeClip.transcript.confidence * 100)}%`
+              {activeClip && getAlignmentConfidence(activeClip) !== null
+                ? `${Math.round((getAlignmentConfidence(activeClip) ?? 0) * 100)}%`
                 : "n/a"}
             </strong>
+          </span>
+          <span>
+            Redo: <strong>{activeClip && getRedoTarget(activeClip) ? "available" : "none"}</strong>
           </span>
         </div>
       </section>

@@ -1,9 +1,15 @@
-import type { Clip, ClipCommit, ExportRun, ProjectDetail, ReviewStatus } from "../types";
+import type { ExportRun, ReviewStatus, Slice } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatDurationCompact,
   formatSeconds,
+  getSliceLanguage,
+  getSliceOriginalEnd,
+  getSliceOriginalStart,
+  getSliceSpeakerName,
+  getSliceTranscriptText,
   queuePriorityOrder,
+  sortVariantsForHistory,
   statusLabels,
 } from "./workspace-helpers";
 
@@ -15,8 +21,9 @@ type StatusDurationMap = Record<ReviewStatus, number>;
 type InspectorPaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
-  activeClip: Clip | null;
-  projectDetail: ProjectDetail | null;
+  activeClip: Slice | null;
+  totalClipCount: number;
+  totalDurationSeconds: number;
   datasetStatusCounts: {
     counts: StatusCountMap;
     durations: StatusDurationMap;
@@ -24,32 +31,33 @@ type InspectorPaneProps = {
   acceptedRejectedRatio: number | null;
   predictedOutputSeconds: number | null;
   progressPercent: number | null;
-  activeCommits: ClipCommit[];
   exportRuns: ExportRun[];
   onRetryLoad: () => void;
   onStatusChange: (status: ReviewStatus) => void;
+  onVariantSelect: (variantId: string) => void;
 };
 
 export default function InspectorPane({
   workspacePhase,
   workspaceError,
   activeClip,
-  projectDetail,
+  totalClipCount,
+  totalDurationSeconds,
   datasetStatusCounts,
   acceptedRejectedRatio,
   predictedOutputSeconds,
   progressPercent,
-  activeCommits,
   exportRuns,
   onRetryLoad,
   onStatusChange,
+  onVariantSelect,
 }: InspectorPaneProps) {
   return (
     <aside className="inspector-column panel">
       <div className="panel-header">
         <div>
           <p className="eyebrow">Inspector</p>
-          <h2>Clip Review</h2>
+          <h2>Slice Review</h2>
         </div>
       </div>
 
@@ -64,30 +72,48 @@ export default function InspectorPane({
         />
       ) : activeClip ? (
         <>
-          <div className="status-group">
-            {queuePriorityOrder.map((status) => (
-              <button
-                key={status}
-                className={`status-button ${activeClip.review_status === status ? "selected" : ""}`}
-                type="button"
-                onClick={() => onStatusChange(status)}
-              >
-                {statusLabels[status]}
-              </button>
-            ))}
-          </div>
+          <section className="inspector-block">
+            <h3>Pipeline Status</h3>
+            <div className="status-group">
+              {queuePriorityOrder.map((status) => (
+                <button
+                  key={status}
+                  className={`status-button ${activeClip.status === status ? "selected" : ""}`}
+                  type="button"
+                  onClick={() => onStatusChange(status)}
+                >
+                  {statusLabels[status]}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="inspector-block">
+            <h3>User Tags</h3>
+            <div className="tag-list">
+              {activeClip.tags.length > 0 ? (
+                activeClip.tags.map((tag) => (
+                  <span key={tag.id} className="tag-pill" style={{ backgroundColor: tag.color }}>
+                    {tag.name}
+                  </span>
+                ))
+              ) : (
+                <p className="muted-copy">No tags on this slice yet.</p>
+              )}
+            </div>
+          </section>
 
           <section className="inspector-block">
             <div className="stats-table">
               <div className="stats-row stats-head">
                 <span>Status</span>
-                <span>Clips</span>
+                <span>Slices</span>
                 <span>Length</span>
               </div>
               <div className="stats-row">
                 <span>Total</span>
-                <span>{projectDetail?.stats.total_clips ?? 0}</span>
-                <span>{formatDurationCompact(projectDetail?.stats.total_duration_seconds ?? 0)}</span>
+                <span>{totalClipCount}</span>
+                <span>{formatDurationCompact(totalDurationSeconds)}</span>
               </div>
               {queuePriorityOrder
                 .filter((status) => datasetStatusCounts.counts[status] > 0)
@@ -123,10 +149,10 @@ export default function InspectorPane({
           </section>
 
           <section className="inspector-block">
-            <h3>Edit History</h3>
-            {activeClip.clip_edl.length > 0 ? (
+            <h3>Waveform EDL</h3>
+            {activeClip.active_commit?.edl_operations.length ? (
               <ul className="edl-list">
-                {activeClip.clip_edl.map((operation, index) => (
+                {activeClip.active_commit.edl_operations.map((operation, index) => (
                   <li key={`${activeClip.id}-edl-${index}`}>
                     <strong>{operation.op}</strong>
                     {operation.range ? (
@@ -143,29 +169,34 @@ export default function InspectorPane({
                 ))}
               </ul>
             ) : (
-              <p className="muted-copy">No per-clip edits yet.</p>
+              <p className="muted-copy">No waveform math stored yet.</p>
             )}
           </section>
 
           <section className="inspector-block">
-            <h3>Commit History</h3>
-            {activeCommits.length > 0 ? (
+            <h3>Clip Lab History</h3>
+            {activeClip.variants.length > 0 ? (
               <div className="commit-list">
-                {[...activeCommits].reverse().map((commitEntry) => (
-                  <div key={commitEntry.id} className="commit-card">
+                {sortVariantsForHistory(activeClip.variants).map((variant) => (
+                  <button
+                    key={variant.id}
+                    type="button"
+                    className={`commit-card ${variant.id === activeClip.active_variant_id ? "selected" : ""}`}
+                    onClick={() => onVariantSelect(variant.id)}
+                  >
                     <div className="commit-row">
-                      <strong>{commitEntry.message}</strong>
-                      <span>{statusLabels[commitEntry.review_status_snapshot]}</span>
+                      <strong>{variant.generator_model ?? "variant"}</strong>
+                      <span>{variant.id === activeClip.active_variant_id ? "active" : "available"}</span>
                     </div>
-                    <p>{commitEntry.transcript_snapshot}</p>
+                    <p>{variant.is_original ? "Original slicer output" : "Derived variant"}</p>
                     <span className="commit-time">
-                      {new Date(commitEntry.created_at).toLocaleString()}
+                      {variant.sample_rate / 1000} kHz • {Math.round(variant.num_samples / Math.max(variant.sample_rate, 1) * 100) / 100}s
                     </span>
-                  </div>
+                  </button>
                 ))}
               </div>
             ) : (
-              <p className="muted-copy">No commits yet. Use Commit Clip to save a milestone.</p>
+              <p className="muted-copy">No variants attached to this slice.</p>
             )}
           </section>
 
@@ -181,7 +212,7 @@ export default function InspectorPane({
                     </div>
                     <p>{run.manifest_path}</p>
                     <span className="commit-time">
-                      {run.accepted_clip_count} clip(s)
+                      {run.accepted_clip_count} slice(s)
                       {run.completed_at ? ` • ${new Date(run.completed_at).toLocaleString()}` : ""}
                     </span>
                   </div>
@@ -197,29 +228,33 @@ export default function InspectorPane({
             <dl>
               <div>
                 <dt>Source</dt>
-                <dd>{activeClip.source_file_id}</dd>
+                <dd>{activeClip.source_recording.id}</dd>
               </div>
               <div>
-                <dt>Working Asset</dt>
-                <dd>{activeClip.working_asset_id}</dd>
+                <dt>Speaker</dt>
+                <dd>{getSliceSpeakerName(activeClip)}</dd>
+              </div>
+              <div>
+                <dt>Language</dt>
+                <dd>{getSliceLanguage(activeClip)}</dd>
               </div>
               <div>
                 <dt>Original Range</dt>
                 <dd>
-                  {formatSeconds(activeClip.original_start_time)} to{" "}
-                  {formatSeconds(activeClip.original_end_time)}
+                  {formatSeconds(getSliceOriginalStart(activeClip))} to{" "}
+                  {formatSeconds(getSliceOriginalEnd(activeClip))}
                 </dd>
               </div>
               <div>
-                <dt>Edit State</dt>
-                <dd>{activeClip.edit_state}</dd>
+                <dt>Transcript</dt>
+                <dd>{getSliceTranscriptText(activeClip) || "n/a"}</dd>
               </div>
             </dl>
           </section>
         </>
       ) : (
         <div className="empty-state">
-          {workspacePhase === "empty" ? "No project selected." : "No clip selected."}
+          {workspacePhase === "empty" ? "No project selected." : "No slice selected."}
         </div>
       )}
     </aside>
