@@ -1,6 +1,8 @@
-.PHONY: help setup setup-backend setup-frontend bootstrap dev-backend dev-frontend check check-backend check-frontend backend-docs
+.PHONY: help setup setup-backend setup-frontend bootstrap dev-backend dev-frontend check check-backend check-frontend backend-docs smoke-backend
 
 UV_CACHE_DIR ?= /tmp/uv-cache
+SMOKE_BACKEND_BASE_URL ?= http://127.0.0.1:8000
+SMOKE_BACKEND_PROJECT_ID ?= phase1-demo
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BACKEND_DIR := $(ROOT_DIR)/backend
 FRONTEND_DIR := $(ROOT_DIR)/frontend
@@ -14,6 +16,7 @@ help:
 	@printf "  make check           Run backend and frontend verification\n"
 	@printf "  make check-backend   Compile-check backend Python code\n"
 	@printf "  make check-frontend  Build the frontend production bundle\n"
+	@printf "  make smoke-backend   Run non-destructive smoke checks against a running backend\n"
 	@printf "  make backend-docs    Run the backend and use /docs at http://127.0.0.1:8000/docs\n"
 	@printf "\n"
 
@@ -43,3 +46,6 @@ check-backend:
 
 check-frontend:
 	cd $(FRONTEND_DIR) && npm run build
+
+smoke-backend:
+	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) uv run python scripts/smoke_backend.py --base-url $(SMOKE_BACKEND_BASE_URL) --project-id $(SMOKE_BACKEND_PROJECT_ID)

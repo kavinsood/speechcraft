@@ -32,7 +32,7 @@ This repository currently contains a working Phase 1 scaffold for the Clip Prep 
 
 What is already implemented:
 
-- file-backed backend persistence
+- SQLite-backed backend persistence
 - clip review queue and project stats
 - transcript editing
 - tag editing and filtering
@@ -45,7 +45,8 @@ What is already implemented:
 - clip audio preview
 - export preview
 - export runs
-- backend integration test route
+- request-level backend integration tests
+- non-destructive backend smoke script
 
 What is still demo-grade:
 
@@ -97,13 +98,13 @@ npm run dev
 - frontend: `http://127.0.0.1:5173`
 - backend: `http://127.0.0.1:8000`
 - backend docs: `http://127.0.0.1:8000/docs`
-- backend integration test route: `http://127.0.0.1:5173/backend-test`
 
 ## Local State
 
 When the backend starts, it maintains local runtime state here:
 
-- `backend/data/phase1-demo.json`
+- `backend/data/project.db`
+- `backend/data/media/`
 - `backend/exports/`
 
 These files are expected and are part of the current demo workflow.
@@ -114,12 +115,22 @@ Use these quick checks after setup:
 
 ```bash
 make check
+make smoke-backend
+```
+
+You can also run the smoke script directly against a running backend:
+
+```bash
+cd backend
+uv run python scripts/smoke_backend.py --base-url http://127.0.0.1:8000
 ```
 
 ## Environment Notes
 
 - The frontend talks to `http://127.0.0.1:8000` by default.
 - Override the API target with `VITE_API_BASE_URL` if needed.
+- Override backend CORS allowlists with `SPEECHCRAFT_ALLOWED_ORIGINS` as a comma-separated origin list.
+- Tests can isolate backend runtime paths with `SPEECHCRAFT_DB_PATH`, `SPEECHCRAFT_LEGACY_SEED_PATH`, `SPEECHCRAFT_MEDIA_ROOT`, and `SPEECHCRAFT_EXPORTS_ROOT`.
 - `uv` is the preferred backend workflow.
 - `npm` is the preferred frontend workflow.
 - `bun` can work for the frontend, but `npm` is the default repo path.
