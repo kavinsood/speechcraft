@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { Slice } from "../types";
+import type { SliceSummary } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   clipMatchesFilters,
@@ -17,7 +17,7 @@ type ClipQueuePaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
-  clips: Slice[];
+  clips: SliceSummary[];
   activeClipId: string | null;
   onSelectClip: (clipId: string) => void;
   onRetryLoad: () => void;
@@ -183,7 +183,7 @@ export default function ClipQueuePane({
                 <p>{getSliceTranscriptText(clip)}</p>
                 <div className="clip-list-meta">
                   <span>{formatSeconds(getSliceDuration(clip))}</span>
-                  <span>{clip.active_variant?.generator_model ?? "source"}</span>
+                  <span>{clip.active_variant_generator_model ?? "source"}</span>
                 </div>
               </button>
             ))

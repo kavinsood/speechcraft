@@ -141,14 +141,19 @@ class AudioVariant(SQLModel, table=True):
 # LEVEL 4: EDIT DECISION LIST (WAVEFORM MATH)
 # ==========================================
 class EditCommit(SQLModel, table=True):
-    """Undo/Redo history for UI timeline edits. Pure Math."""
+    """Immutable slice revision snapshots for undo/redo and milestones."""
 
     id: str = Field(primary_key=True)
     slice_id: str = Field(foreign_key="slice.id")
     parent_commit_id: str | None = Field(default=None, foreign_key="editcommit.id")
 
-    # Example:[{"op": "crop", "start": 0.5, "end": 4.2}]
     edl_operations: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    transcript_text: str = ""
+    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED)
+    tags_payload: list[dict[str, str]] = Field(default_factory=list, sa_column=Column(JSON))
+    active_variant_id_snapshot: str | None = None
+    message: str | None = None
+    is_milestone: bool = False
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -197,7 +202,63 @@ class Slice(SQLModel, table=True):
     )
 
 
-class SliceDetail(SQLModel):
+class TagView(SQLModel):
+    id: str
+    name: str
+    color: str
+
+
+class TranscriptView(SQLModel):
+    id: str
+    slice_id: str
+    original_text: str
+    modified_text: str | None = None
+    is_modified: bool
+    alignment_data: dict[str, Any] | None = None
+
+
+class TranscriptSummaryView(SQLModel):
+    id: str
+    slice_id: str
+    original_text: str
+    modified_text: str | None = None
+    is_modified: bool
+
+
+class AudioVariantView(SQLModel):
+    id: str
+    slice_id: str
+    is_original: bool = False
+    generator_model: str | None = None
+    sample_rate: int
+    num_samples: int
+
+
+class SourceRecordingView(SQLModel):
+    id: str
+    batch_id: str
+    parent_recording_id: str | None = None
+    sample_rate: int
+    num_channels: int
+    num_samples: int
+    processing_recipe: str | None = None
+
+
+class SliceRevision(SQLModel):
+    id: str
+    slice_id: str
+    parent_commit_id: str | None = None
+    edl_operations: list[dict[str, Any]] = Field(default_factory=list)
+    transcript_text: str = ""
+    status: ReviewStatus
+    tags: list["TagPayload"] = Field(default_factory=list)
+    active_variant_id: str | None = None
+    message: str | None = None
+    is_milestone: bool = False
+    created_at: datetime
+
+
+class SliceSummary(SQLModel):
     id: str
     source_recording_id: str
     active_variant_id: str | None = None
@@ -206,13 +267,20 @@ class SliceDetail(SQLModel):
     duration_seconds: float = 0.0
     model_metadata: dict[str, Any] | None = None
     created_at: datetime
-    source_recording: SourceRecording
-    transcript: Transcript | None = None
-    tags: list[Tag] = Field(default_factory=list)
-    variants: list[AudioVariant] = Field(default_factory=list)
-    commits: list[EditCommit] = Field(default_factory=list)
-    active_variant: AudioVariant | None = None
-    active_commit: EditCommit | None = None
+    transcript: TranscriptSummaryView | None = None
+    tags: list[TagView] = Field(default_factory=list)
+    active_variant_generator_model: str | None = None
+    can_undo: bool = False
+    can_redo: bool = False
+
+
+class SliceDetail(SliceSummary):
+    transcript: TranscriptView | None = None
+    source_recording: SourceRecordingView
+    variants: list[AudioVariantView] = Field(default_factory=list)
+    commits: list[SliceRevision] = Field(default_factory=list)
+    active_variant: AudioVariantView | None = None
+    active_commit: SliceRevision | None = None
 
 
 class ReferenceAsset(SQLModel, table=True):
@@ -255,6 +323,14 @@ class SliceTranscriptUpdate(SQLModel):
 
 class SliceTagUpdate(SQLModel):
     tags: list[TagPayload]
+
+
+class SliceSaveRequest(SQLModel):
+    modified_text: str | None = None
+    tags: list[TagPayload] | None = None
+    status: ReviewStatus | None = None
+    message: str | None = None
+    is_milestone: bool = False
 
 
 class ClipRange(SQLModel):
@@ -300,6 +376,14 @@ class MediaCleanupResult(SQLModel):
 class ImportBatchCreate(SQLModel):
     id: str
     name: str
+
+
+class ProjectSummary(SQLModel):
+    id: str
+    name: str
+    created_at: datetime
+    updated_at: datetime
+    export_status: JobStatus | None = None
 
 
 class SourceRecordingCreate(SQLModel):

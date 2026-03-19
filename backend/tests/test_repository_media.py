@@ -172,15 +172,17 @@ class RepositoryMediaTests(TestCase):
 
     def test_create_audio_variant_ignores_client_supplied_id(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
-        self.assertIsNotNone(initial.active_variant)
+        detail = self.repository.get_slice_detail(initial.id)
+        self.assertIsNotNone(detail.active_variant)
+        self.assertIsNotNone(detail.active_variant_id)
 
         updated = self.repository.create_audio_variant(
             initial.id,
             AudioVariantCreate(
                 id="../../escape-test",
-                file_path=initial.active_variant.file_path,
-                sample_rate=initial.active_variant.sample_rate,
-                num_samples=initial.active_variant.num_samples,
+                file_path=str(self.repository.get_variant_media_path(detail.active_variant_id)),
+                sample_rate=detail.active_variant.sample_rate,
+                num_samples=detail.active_variant.num_samples,
                 generator_model="manual-copy",
             ),
         )

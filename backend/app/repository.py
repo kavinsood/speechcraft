@@ -20,6 +20,7 @@ from .models import (
     AudioVariant,
     AudioVariantCreate,
     AudioVariantRunRequest,
+    AudioVariantView,
     ActiveVariantUpdate,
     EditCommit,
     ExportRun,
@@ -28,10 +29,14 @@ from .models import (
     ImportBatchCreate,
     JobStatus,
     MediaCleanupResult,
+    ProjectSummary,
     ReferenceAsset,
     ReferenceAssetCreate,
     ReviewStatus,
+    SliceRevision,
+    SliceSaveRequest,
     SliceDetail,
+    SliceSummary,
     Slice,
     SliceEdlUpdate,
     SliceSplitRequest,
@@ -39,16 +44,28 @@ from .models import (
     SliceTagUpdate,
     SliceStatusUpdate,
     SliceTranscriptUpdate,
+    SourceRecordingView,
     TagPayload,
+    TagView,
     SourceRecording,
     SourceRecordingCreate,
     RecordingDerivativeCreate,
     SlicerHandoffRequest,
     Tag,
+    TranscriptSummaryView,
+    TranscriptView,
     Transcript,
     WaveformPeaks,
     utc_now,
 )
+
+DATA_VERSION_EXTERNAL_VARIANT_REHOME = 1
+DATA_VERSION_SLICE_REVISION_HISTORY = 2
+LATEST_DATA_VERSION = DATA_VERSION_SLICE_REVISION_HISTORY
+
+
+class SliceSaveValidationError(ValueError):
+    """Raised when a slice save request is syntactically valid but semantically invalid."""
 
 
 @dataclass
@@ -76,24 +93,28 @@ class SQLiteRepository:
             connect_args={"check_same_thread": False},
         )
         SQLModel.metadata.create_all(self.engine)
-        with self.engine.begin() as connection:
-            connection.exec_driver_sql("DROP TABLE IF EXISTS slicecommit")
+        self._migrate_editcommit_schema()
         self._seed_if_needed()
-        self._migrate_external_variant_media()
+        self._run_data_migrations()
 
-    def list_projects(self) -> list[ImportBatch]:
+    def list_projects(self) -> list[ProjectSummary]:
         with self._session() as session:
             batches = session.exec(select(ImportBatch)).all()
-            return [self._normalize_batch(batch) for batch in sorted(batches, key=lambda item: item.created_at, reverse=True)]
+            summaries = [self._project_summary(session, batch) for batch in batches]
+            return sorted(summaries, key=lambda item: item.updated_at, reverse=True)
 
-    def get_project(self, project_id: str) -> ImportBatch:
+    def get_project(self, project_id: str) -> ProjectSummary:
         with self._session() as session:
-            return self._normalize_batch(self._get_batch(session, project_id))
+            return self._project_summary(session, self._get_batch(session, project_id))
 
-    def get_project_slices(self, project_id: str) -> list[SliceDetail]:
+    def get_project_slices(self, project_id: str) -> list[SliceSummary]:
         with self._session() as session:
             self._get_batch(session, project_id)
-            return [self._to_slice_detail(slice_row) for slice_row in self._get_batch_slices(session, project_id)]
+            return [self._to_slice_summary(slice_row) for slice_row in self._get_batch_slice_summaries(session, project_id)]
+
+    def get_slice_detail(self, slice_id: str) -> SliceDetail:
+        with self._session() as session:
+            return self._get_slice_detail(session, slice_id)
 
     def list_export_runs(self, project_id: str) -> list[ExportRun]:
         with self._session() as session:
@@ -162,88 +183,127 @@ class SQLiteRepository:
             deleted_variant_ids=deleted_variant_ids,
         )
 
-    def update_slice_status(self, slice_id: str, payload: SliceStatusUpdate) -> SliceDetail:
+    def save_slice_state(self, slice_id: str, payload: SliceSaveRequest) -> SliceDetail:
         with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
-            slice_row.status = payload.status
+            slice_row = self._get_loaded_slice(session, slice_id)
+            transcript = self._get_transcript(session, slice_row.id)
+            current_transcript = self._transcript_text(transcript)
+            current_tags = self._normalized_tag_payloads(self._current_tag_payloads(session, slice_row))
+            next_transcript = payload.modified_text if payload.modified_text is not None else current_transcript
+            next_tags = (
+                self._normalized_tag_payloads(payload.tags)
+                if payload.tags is not None
+                else current_tags
+            )
+            next_status = payload.status if payload.status is not None else slice_row.status
+
+            state_changed = (
+                next_transcript != current_transcript
+                or next_tags != current_tags
+                or next_status != slice_row.status
+            )
+            if not state_changed and not payload.is_milestone:
+                return self._get_slice_detail(session, slice_id)
+
+            if payload.modified_text is not None:
+                transcript.modified_text = payload.modified_text
+                transcript.is_modified = payload.modified_text != transcript.original_text
+                session.add(transcript)
+
+            if payload.tags is not None:
+                self._replace_slice_tags(session, slice_row, payload.tags)
+
+            if payload.status is not None:
+                slice_row.status = payload.status
+
             self._touch_slice(slice_row)
             session.add(slice_row)
+            session.flush()
+            self._append_slice_revision(
+                session,
+                slice_row,
+                message=payload.message,
+                is_milestone=payload.is_milestone,
+            )
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
+
+    def update_slice_status(self, slice_id: str, payload: SliceStatusUpdate) -> SliceDetail:
+        return self.save_slice_state(
+            slice_id,
+            SliceSaveRequest(
+                status=payload.status,
+                message=f"Status: {payload.status.value.replace('_', ' ')}",
+            ),
+        )
 
     def update_slice_transcript(self, slice_id: str, payload: SliceTranscriptUpdate) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
-            transcript = self._get_transcript(session, slice_row.id)
-            transcript.modified_text = payload.modified_text
-            transcript.is_modified = payload.modified_text != transcript.original_text
-            self._touch_slice(slice_row)
-            session.add(transcript)
-            session.add(slice_row)
-            session.commit()
-            session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+        return self.save_slice_state(
+            slice_id,
+            SliceSaveRequest(modified_text=payload.modified_text, message="Transcript updated"),
+        )
 
     def update_slice_tags(self, slice_id: str, payload: SliceTagUpdate) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
-            self._replace_slice_tags(session, slice_row, payload.tags)
-            self._touch_slice(slice_row)
-            session.add(slice_row)
-            session.commit()
-            session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+        return self.save_slice_state(
+            slice_id,
+            SliceSaveRequest(tags=payload.tags, message="Tags updated"),
+        )
 
     def append_edl_operation(self, slice_id: str, payload: SliceEdlUpdate) -> SliceDetail:
         with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
+            slice_row = self._get_loaded_slice(session, slice_id)
             next_operations = [
-                *self._collect_edl_operations(session, slice_row),
+                *self._collect_edl_operations(slice_row),
                 payload.model_dump(mode="json"),
             ]
-            edit_commit = EditCommit(
-                id=self._new_id("edit"),
-                slice_id=slice_row.id,
-                parent_commit_id=slice_row.active_commit_id,
-                edl_operations=next_operations,
-            )
-            session.add(edit_commit)
-            session.flush()
-            slice_row.active_commit_id = edit_commit.id
-            self._touch_slice(slice_row, edit_commit.created_at)
+            self._touch_slice(slice_row)
             session.add(slice_row)
+            session.flush()
+            self._append_slice_revision(
+                session,
+                slice_row,
+                edl_operations=next_operations,
+                message=self._edl_message(payload),
+            )
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
 
     def undo_slice(self, slice_id: str) -> SliceDetail:
         with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
+            slice_row = self._get_loaded_slice(session, slice_id)
             if slice_row.active_commit_id is None:
                 raise ValueError("No earlier edit state is available")
             active_commit = self._get_edit_commit(session, slice_row.active_commit_id)
-            slice_row.active_commit_id = active_commit.parent_commit_id
-            self._touch_slice(slice_row)
-            session.add(slice_row)
+            if active_commit.parent_commit_id is None:
+                raise ValueError("No earlier edit state is available")
+            target_commit = self._get_edit_commit(session, active_commit.parent_commit_id)
+            self._restore_slice_from_revision(session, slice_row, target_commit)
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
 
     def redo_slice(self, slice_id: str) -> SliceDetail:
         with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
+            slice_row = self._get_loaded_slice(session, slice_id)
             redo_target = self._get_redo_target(session, slice_row)
             if redo_target is None:
                 raise ValueError("No newer edit state is available")
-            slice_row.active_commit_id = redo_target.id
-            self._touch_slice(slice_row)
-            session.add(slice_row)
+            self._restore_slice_from_revision(session, slice_row, redo_target)
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
 
-    def split_slice(self, slice_id: str, payload: SliceSplitRequest) -> list[SliceDetail]:
+    def split_slice(self, slice_id: str, payload: SliceSplitRequest) -> list[SliceSummary]:
         with self._session() as session:
             source_slice = self._get_loaded_slice(session, slice_id)
             recording = source_slice.source_recording
@@ -273,15 +333,13 @@ class SQLiteRepository:
             right_id = self._new_id("slice")
             left_variant_id = self._new_id("variant")
             right_variant_id = self._new_id("variant")
-            left_commit_id = self._new_id("edit")
-            right_commit_id = self._new_id("edit")
-            inherited_ops = self._collect_edl_operations(session, source_slice)
+            inherited_ops = self._collect_edl_operations(source_slice)
 
             left_slice = Slice(
                 id=left_id,
                 source_recording_id=source_slice.source_recording_id,
                 active_variant_id=left_variant_id,
-                active_commit_id=left_commit_id,
+                active_commit_id=None,
                 status=ReviewStatus.UNRESOLVED,
                 model_metadata={
                     **source_metadata,
@@ -300,7 +358,7 @@ class SQLiteRepository:
                 id=right_id,
                 source_recording_id=source_slice.source_recording_id,
                 active_variant_id=right_variant_id,
-                active_commit_id=right_commit_id,
+                active_commit_id=None,
                 status=ReviewStatus.UNRESOLVED,
                 model_metadata={
                     **source_metadata,
@@ -333,30 +391,6 @@ class SQLiteRepository:
                 sample_rate=max(base_variant.sample_rate, 1),
                 num_samples=max(base_variant.num_samples, 1),
             )
-            left_commit = EditCommit(
-                id=left_commit_id,
-                slice_id=left_id,
-                edl_operations=[
-                    *inherited_ops,
-                    {
-                        "op": "crop",
-                        "range": {"start_seconds": 0.0, "end_seconds": split_at},
-                        "duration_seconds": None,
-                    },
-                ],
-            )
-            right_commit = EditCommit(
-                id=right_commit_id,
-                slice_id=right_id,
-                edl_operations=[
-                    *inherited_ops,
-                    {
-                        "op": "crop",
-                        "range": {"start_seconds": split_at, "end_seconds": current_duration},
-                        "duration_seconds": None,
-                    },
-                ],
-            )
             left_transcript = Transcript(
                 id=self._new_id("transcript"),
                 slice_id=left_id,
@@ -382,8 +416,6 @@ class SQLiteRepository:
                 right_slice,
                 left_variant,
                 right_variant,
-                left_commit,
-                right_commit,
                 left_transcript,
                 right_transcript,
             ]:
@@ -391,12 +423,44 @@ class SQLiteRepository:
             session.flush()
             self._replace_slice_tags(session, left_slice, [TagPayload(name=tag.name, color=tag.color) for tag in source_slice.tags])
             self._replace_slice_tags(session, right_slice, [TagPayload(name=tag.name, color=tag.color) for tag in source_slice.tags])
+            session.flush()
+            self._append_slice_revision(
+                session,
+                left_slice,
+                edl_operations=[
+                    *inherited_ops,
+                    {
+                        "op": "crop",
+                        "range": {"start_seconds": 0.0, "end_seconds": split_at},
+                        "duration_seconds": None,
+                    },
+                ],
+                message="Split slice (left)",
+                created_at=now,
+            )
+            self._append_slice_revision(
+                session,
+                right_slice,
+                edl_operations=[
+                    *inherited_ops,
+                    {
+                        "op": "crop",
+                        "range": {"start_seconds": split_at, "end_seconds": current_duration},
+                        "duration_seconds": None,
+                    },
+                ],
+                message="Split slice (right)",
+                created_at=now,
+            )
             self._shift_order_indices(session, recording.batch_id, order_index, 2, exclude_ids={source_slice.id})
             session.commit()
             session.expire_all()
-            return [self._to_slice_detail(item) for item in self._get_batch_slices(session, recording.batch_id)]
+            summaries = [self._to_slice_summary(item) for item in self._get_batch_slices(session, recording.batch_id)]
+        for created_id in [left_id, right_id]:
+            self._warm_slice_artifacts_for_id(created_id)
+        return summaries
 
-    def merge_with_next_slice(self, slice_id: str) -> list[SliceDetail]:
+    def merge_with_next_slice(self, slice_id: str) -> list[SliceSummary]:
         with self._session() as session:
             first_slice = self._get_loaded_slice(session, slice_id)
             batch_id = first_slice.source_recording.batch_id
@@ -430,6 +494,7 @@ class SQLiteRepository:
                 id=merged_id,
                 source_recording_id=first_slice.source_recording_id,
                 active_variant_id=merged_variant_id,
+                active_commit_id=None,
                 status=ReviewStatus.UNRESOLVED,
                 model_metadata={
                     "order_index": min(int(first_metadata.get("order_index", 0)), int(second_metadata.get("order_index", 0))),
@@ -483,9 +548,19 @@ class SQLiteRepository:
             session.flush()
             merged_tags = {tag.name.lower(): TagPayload(name=tag.name, color=tag.color) for tag in [*first_slice.tags, *next_slice.tags]}
             self._replace_slice_tags(session, merged_slice, list(merged_tags.values()))
+            session.flush()
+            self._append_slice_revision(
+                session,
+                merged_slice,
+                edl_operations=[],
+                message="Merged slice baseline",
+                created_at=now,
+            )
             session.commit()
             session.expire_all()
-            return [self._to_slice_detail(item) for item in self._get_batch_slices(session, batch_id)]
+            summaries = [self._to_slice_summary(item) for item in self._get_batch_slices(session, batch_id)]
+        self._warm_slice_artifacts_for_id(merged_id)
+        return summaries
 
     def get_export_preview(self, project_id: str) -> ExportPreview:
         with self._session() as session:
@@ -546,10 +621,15 @@ class SQLiteRepository:
                 raise
 
     def get_waveform_peaks(self, slice_id: str, bins: int = 120) -> WaveformPeaks:
-        audio_bytes = self.get_clip_audio_bytes(slice_id)
         safe_bins = max(32, min(bins, 2048))
-        peaks = self._extract_waveform_peaks_from_bytes(audio_bytes, safe_bins)
-        return WaveformPeaks(clip_id=slice_id, bins=safe_bins, peaks=peaks)
+        with self._session() as session:
+            slice_row = self._get_loaded_slice(session, slice_id)
+            cache_path = self._waveform_peaks_cache_path(slice_row, safe_bins)
+            if cache_path.exists():
+                cached = json.loads(cache_path.read_text())
+                return WaveformPeaks.model_validate(cached)
+            media_path = self._materialize_slice_media_path(session, slice_row)
+            return self._ensure_waveform_peaks_cache(slice_row, media_path, safe_bins)
 
     def get_clip_audio_bytes(self, slice_id: str) -> bytes:
         with self._session() as session:
@@ -559,12 +639,7 @@ class SQLiteRepository:
     def get_slice_media_path(self, slice_id: str) -> Path:
         with self._session() as session:
             slice_row = self._get_loaded_slice(session, slice_id)
-            audio_bytes = self._render_slice_audio_bytes(session, slice_row)
-            target_path = self._slice_render_cache_path(slice_row)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            if not target_path.exists():
-                target_path.write_bytes(audio_bytes)
-            return target_path
+            return self._materialize_slice_media_path(session, slice_row)
 
     def get_variant_media_path(self, variant_id: str) -> Path:
         with self._session() as session:
@@ -577,13 +652,13 @@ class SQLiteRepository:
                 raise KeyError(variant_id)
             return self._resolve_variant_media_path(Path(variant.file_path))
 
-    def create_import_batch(self, payload: ImportBatchCreate) -> ImportBatch:
+    def create_import_batch(self, payload: ImportBatchCreate) -> ProjectSummary:
         with self._session() as session:
             batch = ImportBatch(id=payload.id, name=payload.name)
             session.add(batch)
             session.commit()
             session.refresh(batch)
-            return self._normalize_batch(batch)
+            return self._project_summary(session, batch)
 
     def create_source_recording(self, payload: SourceRecordingCreate) -> SourceRecording:
         with self._session() as session:
@@ -639,6 +714,7 @@ class SQLiteRepository:
                     id=chunk.id,
                     source_recording_id=recording.id,
                     active_variant_id=variant_id,
+                    active_commit_id=None,
                     status=ReviewStatus.UNRESOLVED,
                     model_metadata=metadata,
                 )
@@ -665,14 +741,24 @@ class SQLiteRepository:
                 session.add(transcript)
                 session.flush()
                 self._replace_slice_tags(session, slice_row, chunk.tags)
+                session.flush()
+                self._append_slice_revision(
+                    session,
+                    slice_row,
+                    edl_operations=[],
+                    message="Imported slice baseline",
+                )
                 created_ids.append(slice_row.id)
             session.commit()
             session.expire_all()
-            return [self._get_slice_detail(session, slice_id) for slice_id in created_ids]
+            details = [self._get_slice_detail(session, slice_id) for slice_id in created_ids]
+        for created_id in created_ids:
+            self._warm_slice_artifacts_for_id(created_id)
+        return details
 
     def create_audio_variant(self, slice_id: str, payload: AudioVariantCreate) -> SliceDetail:
         with self._session() as session:
-            slice_row = self._get_slice(session, slice_id)
+            slice_row = self._get_loaded_slice(session, slice_id)
             recording = self._get_source_recording(session, slice_row.source_recording_id)
             self._validate_audio_asset(Path(payload.file_path), payload.sample_rate, recording.num_channels, payload.num_samples)
             variant_id = self._new_id("variant")
@@ -694,9 +780,17 @@ class SQLiteRepository:
             metadata["updated_at"] = utc_now().isoformat()
             slice_row.model_metadata = metadata
             session.add(slice_row)
+            session.flush()
+            self._append_slice_revision(
+                session,
+                slice_row,
+                message=f"Created variant via {payload.generator_model}",
+            )
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
 
     def run_audio_variant(self, slice_id: str, payload: AudioVariantRunRequest) -> SliceDetail:
         with self._session() as session:
@@ -731,9 +825,17 @@ class SQLiteRepository:
             metadata["updated_at"] = utc_now().isoformat()
             slice_row.model_metadata = metadata
             session.add(slice_row)
+            session.flush()
+            self._append_slice_revision(
+                session,
+                slice_row,
+                message=f"Ran {payload.generator_model}",
+            )
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
 
     def set_active_variant(self, slice_id: str, payload: ActiveVariantUpdate) -> SliceDetail:
         with self._session() as session:
@@ -747,9 +849,17 @@ class SQLiteRepository:
             metadata["updated_at"] = utc_now().isoformat()
             slice_row.model_metadata = metadata
             session.add(slice_row)
+            session.flush()
+            self._append_slice_revision(
+                session,
+                slice_row,
+                message=f"Activated variant {matching_variant.generator_model or matching_variant.id}",
+            )
             session.commit()
             session.expire_all()
-            return self._get_slice_detail(session, slice_id)
+            detail = self._get_slice_detail(session, slice_id)
+        self._warm_slice_artifacts_for_id(slice_id)
+        return detail
 
     def create_reference_asset(self, payload: ReferenceAssetCreate) -> ReferenceAsset:
         with self._session() as session:
@@ -764,6 +874,108 @@ class SQLiteRepository:
 
     def _session(self) -> Session:
         return Session(self.engine, expire_on_commit=False)
+
+    def _run_data_migrations(self) -> None:
+        version = self._get_data_version()
+        if version < DATA_VERSION_EXTERNAL_VARIANT_REHOME:
+            self._migrate_external_variant_media()
+            self._set_data_version(DATA_VERSION_EXTERNAL_VARIANT_REHOME)
+            version = DATA_VERSION_EXTERNAL_VARIANT_REHOME
+        if version < DATA_VERSION_SLICE_REVISION_HISTORY:
+            self._migrate_legacy_slice_revision_history()
+            self._set_data_version(DATA_VERSION_SLICE_REVISION_HISTORY)
+
+    def _get_data_version(self) -> int:
+        with self.engine.begin() as connection:
+            raw = connection.exec_driver_sql("PRAGMA user_version").scalar()
+        return int(raw or 0)
+
+    def _set_data_version(self, version: int) -> None:
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(f"PRAGMA user_version = {version}")
+
+    def _migrate_editcommit_schema(self) -> None:
+        with self.engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql("PRAGMA table_info(editcommit)").fetchall()
+            }
+            if not columns:
+                return
+            if "transcript_text" not in columns:
+                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN transcript_text TEXT NOT NULL DEFAULT ''")
+            if "status" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE editcommit ADD COLUMN status TEXT NOT NULL DEFAULT 'unresolved'"
+                )
+            if "tags_payload" not in columns:
+                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN tags_payload JSON")
+            if "active_variant_id_snapshot" not in columns:
+                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN active_variant_id_snapshot TEXT")
+            if "message" not in columns:
+                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN message TEXT")
+            if "is_milestone" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE editcommit ADD COLUMN is_milestone INTEGER NOT NULL DEFAULT 0"
+                )
+
+    def _migrate_legacy_slice_revision_history(self) -> None:
+        with self._session() as session:
+            slices = session.exec(
+                select(Slice).options(
+                    selectinload(Slice.source_recording),
+                    selectinload(Slice.transcript),
+                    selectinload(Slice.tags),
+                    selectinload(Slice.variants),
+                    selectinload(Slice.commits),
+                    selectinload(Slice.active_variant),
+                    selectinload(Slice.active_commit),
+                )
+            ).all()
+            changed = False
+            for slice_row in slices:
+                current_tags = [tag.model_dump(mode="json") for tag in self._current_tag_payloads(session, slice_row)]
+                current_transcript = self._transcript_text(slice_row.transcript)
+                baseline_message = "Imported slice baseline"
+                for commit in slice_row.commits:
+                    commit_changed = False
+                    legacy_snapshot_commit = (
+                        commit.active_variant_id_snapshot is None and commit.message is None
+                    )
+                    if legacy_snapshot_commit and commit.transcript_text == "":
+                        commit.transcript_text = current_transcript
+                        commit_changed = True
+                    if legacy_snapshot_commit and not commit.tags_payload:
+                        commit.tags_payload = list(current_tags)
+                        commit_changed = True
+                    if commit.active_variant_id_snapshot is None:
+                        commit.active_variant_id_snapshot = slice_row.active_variant_id
+                        commit_changed = True
+                    if commit.message is None:
+                        commit.message = baseline_message
+                        commit_changed = True
+                    if commit_changed:
+                        if legacy_snapshot_commit and not commit.status:
+                            commit.status = slice_row.status
+                        session.add(commit)
+                        changed = True
+                if slice_row.active_commit_id is None:
+                    self._append_slice_revision(
+                        session,
+                        slice_row,
+                        edl_operations=[],
+                        message=baseline_message,
+                        created_at=self._clip_updated_at(slice_row),
+                        parent_commit_id=None,
+                    )
+                    changed = True
+                elif slice_row.active_commit is None and slice_row.commits:
+                    latest_commit = sorted(slice_row.commits, key=lambda commit: commit.created_at)[-1]
+                    slice_row.active_commit_id = latest_commit.id
+                    session.add(slice_row)
+                    changed = True
+            if changed:
+                session.commit()
 
     def _seed_if_needed(self) -> None:
         with self._session() as session:
@@ -828,7 +1040,6 @@ class SQLiteRepository:
             for clip_payload in active_clips:
                 variant_id = f"variant-{clip_payload['id']}"
                 transcript_id = f"transcript-{clip_payload['id']}"
-                active_commit_id = f"edit-{clip_payload['id']}" if clip_payload.get("clip_edl") else None
                 recording_id = f"source-{batch.id}-{clip_payload['source_file_id']}"
                 variant_path = self._managed_variant_path(variant_id)
                 variant_path.parent.mkdir(parents=True, exist_ok=True)
@@ -850,7 +1061,7 @@ class SQLiteRepository:
                     id=clip_payload["id"],
                     source_recording_id=recording_id,
                     active_variant_id=variant_id,
-                    active_commit_id=active_commit_id,
+                    active_commit_id=None,
                     status=self._legacy_status_to_storage(clip_payload["review_status"]),
                     model_metadata={
                         "order_index": clip_payload["order_index"],
@@ -888,16 +1099,16 @@ class SQLiteRepository:
                 session.add(slice_row)
                 session.add(variant)
                 session.add(transcript)
-                if active_commit_id is not None:
-                    session.add(
-                        EditCommit(
-                            id=active_commit_id,
-                            slice_id=slice_row.id,
-                            edl_operations=clip_payload["clip_edl"],
-                        )
-                    )
                 session.flush()
                 self._replace_slice_tags(session, slice_row, [TagPayload(**tag) for tag in clip_payload["tags"]])
+                session.flush()
+                self._append_slice_revision(
+                    session,
+                    slice_row,
+                    edl_operations=list(clip_payload["clip_edl"]),
+                    message="Imported legacy slice",
+                    created_at=datetime.fromisoformat(clip_payload["updated_at"].replace("Z", "+00:00")),
+                )
             for export_payload in exports_by_project.get(batch.id, []):
                 session.add(
                     ExportRun(
@@ -1006,6 +1217,35 @@ class SQLiteRepository:
             if not self._slice_metadata(item).get("is_superseded", False)
         ]
 
+    def _get_batch_slice_summaries(self, session: Session, batch_id: str) -> list[Slice]:
+        recording_ids = session.exec(
+            select(SourceRecording.id).where(SourceRecording.batch_id == batch_id)
+        ).all()
+        if not recording_ids:
+            return []
+        slices = session.exec(
+            select(Slice)
+            .where(Slice.source_recording_id.in_(recording_ids))
+            .options(
+                selectinload(Slice.source_recording),
+                selectinload(Slice.transcript),
+                selectinload(Slice.tags),
+                selectinload(Slice.active_variant),
+                selectinload(Slice.active_commit),
+            )
+        ).all()
+        return sorted(
+            [
+                item
+                for item in slices
+                if not self._slice_metadata(item).get("is_superseded", False)
+            ],
+            key=lambda slice_row: (
+                int(self._slice_metadata(slice_row).get("order_index", 0)),
+                self._as_utc(slice_row.created_at),
+            ),
+        )
+
     def _get_all_batch_slices(self, session: Session, batch_id: str) -> list[Slice]:
         recording_ids = session.exec(
             select(SourceRecording.id).where(SourceRecording.batch_id == batch_id)
@@ -1049,27 +1289,10 @@ class SQLiteRepository:
             .order_by(EditCommit.created_at.desc())
         ).first()
 
-    def _collect_edl_operations(self, session: Session, slice_row: Slice) -> list[dict[str, Any]]:
+    def _collect_edl_operations(self, slice_row: Slice) -> list[dict[str, Any]]:
         if slice_row.active_commit is None:
             return []
-        del session
-        commits_by_id = {commit.id: commit for commit in slice_row.commits}
-        active_commit = commits_by_id.get(slice_row.active_commit_id or "")
-        if active_commit is None:
-            return []
-        if active_commit.parent_commit_id:
-            parent_commit = commits_by_id.get(active_commit.parent_commit_id)
-            if parent_commit and self._commit_extends_parent(active_commit, parent_commit):
-                return list(active_commit.edl_operations or [])
-        chain: list[EditCommit] = []
-        current = active_commit
-        while current is not None:
-            chain.append(current)
-            current = commits_by_id.get(current.parent_commit_id or "")
-        operations: list[dict[str, Any]] = []
-        for commit in reversed(chain):
-            operations.extend(commit.edl_operations or [])
-        return operations
+        return list(slice_row.active_commit.edl_operations or [])
 
     def _get_slice_tags(self, session: Session, slice_id: str) -> list[Tag]:
         statement = (
@@ -1097,14 +1320,111 @@ class SQLiteRepository:
                 session.add(tag)
             session.add(SliceTagLink(slice_id=slice_row.id, tag_id=tag.id))
 
+    def _current_tag_payloads(self, session: Session, slice_row: Slice) -> list[TagPayload]:
+        return [
+            TagPayload(name=tag.name, color=tag.color)
+            for tag in self._get_slice_tags(session, slice_row.id)
+        ]
+
+    def _normalized_tag_payloads(self, tags: list[TagPayload] | None) -> list[dict[str, str]]:
+        return [
+            {"name": tag.name, "color": tag.color}
+            for tag in sorted(tags or [], key=lambda item: (item.name.lower(), item.color))
+        ]
+
+    def _append_slice_revision(
+        self,
+        session: Session,
+        slice_row: Slice,
+        *,
+        edl_operations: list[dict[str, Any]] | None = None,
+        message: str | None = None,
+        is_milestone: bool = False,
+        created_at: datetime | None = None,
+        parent_commit_id: str | None | object = ...,
+    ) -> EditCommit:
+        transcript = slice_row.transcript or self._get_transcript(session, slice_row.id)
+        revision = EditCommit(
+            id=self._new_id("edit"),
+            slice_id=slice_row.id,
+            parent_commit_id=slice_row.active_commit_id if parent_commit_id is ... else parent_commit_id,
+            edl_operations=list(edl_operations if edl_operations is not None else self._collect_edl_operations(slice_row)),
+            transcript_text=self._transcript_text(transcript),
+            status=slice_row.status,
+            tags_payload=[tag.model_dump(mode="json") for tag in self._current_tag_payloads(session, slice_row)],
+            active_variant_id_snapshot=slice_row.active_variant_id,
+            message=message,
+            is_milestone=is_milestone,
+            created_at=created_at or utc_now(),
+        )
+        session.add(revision)
+        session.flush()
+        slice_row.active_commit_id = revision.id
+        session.add(slice_row)
+        return revision
+
+    def _restore_slice_from_revision(self, session: Session, slice_row: Slice, revision: EditCommit) -> None:
+        transcript = slice_row.transcript or self._get_transcript(session, slice_row.id)
+        slice_row.active_variant_id = revision.active_variant_id_snapshot
+        slice_row.active_commit_id = revision.id
+        slice_row.status = revision.status
+        transcript.modified_text = (
+            None if revision.transcript_text == transcript.original_text else revision.transcript_text
+        )
+        transcript.is_modified = transcript.modified_text != transcript.original_text
+        self._replace_slice_tags(
+            session,
+            slice_row,
+            [TagPayload.model_validate(tag) for tag in revision.tags_payload or []],
+        )
+        self._touch_slice(slice_row)
+        session.add(transcript)
+        session.add(slice_row)
+
+    def _edl_message(self, payload: SliceEdlUpdate) -> str:
+        if payload.op == "delete_range" and payload.range is not None:
+            return f"Deleted {payload.range.end_seconds - payload.range.start_seconds:.2f}s"
+        if payload.op == "insert_silence":
+            return f"Inserted {float(payload.duration_seconds or 0.0):.2f}s silence"
+        if payload.op == "crop" and payload.range is not None:
+            return (
+                f"Cropped to {payload.range.start_seconds:.2f}s-{payload.range.end_seconds:.2f}s"
+            )
+        return f"Applied {payload.op}"
+
     def _as_utc(self, value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
-    def _normalize_batch(self, batch: ImportBatch) -> ImportBatch:
-        batch.created_at = self._as_utc(batch.created_at)
-        return batch
+    def _project_summary(self, session: Session, batch: ImportBatch) -> ProjectSummary:
+        created_at = self._as_utc(batch.created_at)
+        updated_at = created_at
+        recording_ids = session.exec(
+            select(SourceRecording.id).where(SourceRecording.batch_id == batch.id)
+        ).all()
+        if recording_ids:
+            for slice_row in session.exec(
+                select(Slice).where(Slice.source_recording_id.in_(recording_ids))
+            ).all():
+                updated_at = max(updated_at, self._clip_updated_at(slice_row))
+        latest_export = session.exec(
+            select(ExportRun).where(ExportRun.batch_id == batch.id).order_by(ExportRun.created_at.desc())
+        ).first()
+        export_status = None
+        if latest_export is not None:
+            export_status = latest_export.status
+            updated_at = max(
+                updated_at,
+                self._as_utc(latest_export.completed_at or latest_export.created_at),
+            )
+        return ProjectSummary(
+            id=batch.id,
+            name=batch.name,
+            created_at=created_at,
+            updated_at=updated_at,
+            export_status=export_status,
+        )
 
     def _normalize_export_run(self, run: ExportRun) -> ExportRun:
         run.created_at = self._as_utc(run.created_at)
@@ -1115,43 +1435,116 @@ class SQLiteRepository:
     def _get_slice_detail(self, session: Session, slice_id: str) -> SliceDetail:
         return self._to_slice_detail(self._get_slice(session, slice_id))
 
-    def _to_slice_detail(self, slice_row: Slice) -> SliceDetail:
-        transcript = slice_row.transcript
-        active_variant = slice_row.active_variant
-        active_commit = slice_row.active_commit
-        source_recording = slice_row.source_recording
-        if source_recording is None:
-            raise ValueError(f"Slice {slice_row.id} is missing its source recording")
-        payload = {
-            "id": slice_row.id,
-            "source_recording_id": slice_row.source_recording_id,
-            "active_variant_id": slice_row.active_variant_id,
-            "active_commit_id": slice_row.active_commit_id,
-            "status": slice_row.status,
-            "duration_seconds": self._slice_duration(slice_row),
-            "model_metadata": self._slice_metadata(slice_row),
-            "created_at": self._as_utc(slice_row.created_at),
-            "source_recording": source_recording,
-            "transcript": transcript,
-            "tags": list(sorted(slice_row.tags, key=lambda tag: tag.name.lower())),
-            "variants": list(sorted(slice_row.variants, key=lambda variant: (not variant.is_original, variant.id))),
-            "commits": [
-                commit.model_copy(update={"created_at": self._as_utc(commit.created_at)})
-                for commit in sorted(slice_row.commits, key=lambda commit: commit.created_at)
+    def _tag_view(self, tag: Tag) -> TagView:
+        return TagView(id=tag.id, name=tag.name, color=tag.color)
+
+    def _transcript_view(self, transcript: Transcript | None) -> TranscriptView | None:
+        if transcript is None:
+            return None
+        return TranscriptView(
+            id=transcript.id,
+            slice_id=transcript.slice_id,
+            original_text=transcript.original_text,
+            modified_text=transcript.modified_text,
+            is_modified=transcript.is_modified,
+            alignment_data=transcript.alignment_data,
+        )
+
+    def _transcript_summary_view(self, transcript: Transcript | None) -> TranscriptSummaryView | None:
+        if transcript is None:
+            return None
+        return TranscriptSummaryView(
+            id=transcript.id,
+            slice_id=transcript.slice_id,
+            original_text=transcript.original_text,
+            modified_text=transcript.modified_text,
+            is_modified=transcript.is_modified,
+        )
+
+    def _audio_variant_view(self, variant: AudioVariant | None) -> AudioVariantView | None:
+        if variant is None:
+            return None
+        return AudioVariantView(
+            id=variant.id,
+            slice_id=variant.slice_id,
+            is_original=variant.is_original,
+            generator_model=variant.generator_model,
+            sample_rate=variant.sample_rate,
+            num_samples=variant.num_samples,
+        )
+
+    def _source_recording_view(self, recording: SourceRecording | None) -> SourceRecordingView:
+        if recording is None:
+            raise ValueError("Slice is missing its source recording")
+        return SourceRecordingView(
+            id=recording.id,
+            batch_id=recording.batch_id,
+            parent_recording_id=recording.parent_recording_id,
+            sample_rate=recording.sample_rate,
+            num_channels=recording.num_channels,
+            num_samples=recording.num_samples,
+            processing_recipe=recording.processing_recipe,
+        )
+
+    def _revision_view(self, commit: EditCommit) -> SliceRevision:
+        return SliceRevision(
+            id=commit.id,
+            slice_id=commit.slice_id,
+            parent_commit_id=commit.parent_commit_id,
+            edl_operations=list(commit.edl_operations or []),
+            transcript_text=commit.transcript_text,
+            status=commit.status,
+            tags=[
+                TagPayload.model_validate(tag)
+                for tag in sorted(commit.tags_payload or [], key=lambda item: str(item.get("name", "")).lower())
             ],
-            "active_variant": active_variant,
-            "active_commit": (
-                active_commit.model_copy(
-                    update={
-                        "created_at": self._as_utc(active_commit.created_at),
-                        "edl_operations": self._collect_edl_operations(None, slice_row),
-                    }
-                )
-                if active_commit is not None
-                else None
-            ),
-        }
-        return SliceDetail.model_validate(payload)
+            active_variant_id=commit.active_variant_id_snapshot,
+            message=commit.message,
+            is_milestone=commit.is_milestone,
+            created_at=self._as_utc(commit.created_at),
+        )
+
+    def _to_slice_summary(self, slice_row: Slice) -> SliceSummary:
+        active_commit = slice_row.active_commit
+        return SliceSummary.model_validate(
+            {
+                "id": slice_row.id,
+                "source_recording_id": slice_row.source_recording_id,
+                "active_variant_id": slice_row.active_variant_id,
+                "active_commit_id": slice_row.active_commit_id,
+                "status": slice_row.status,
+                "duration_seconds": self._slice_duration(slice_row),
+                "model_metadata": self._slice_metadata(slice_row),
+                "created_at": self._as_utc(slice_row.created_at),
+                "transcript": self._transcript_summary_view(slice_row.transcript),
+                "tags": [self._tag_view(tag) for tag in sorted(slice_row.tags, key=lambda tag: tag.name.lower())],
+                "active_variant_generator_model": (
+                    slice_row.active_variant.generator_model if slice_row.active_variant is not None else None
+                ),
+                "can_undo": active_commit.parent_commit_id is not None if active_commit is not None else False,
+                "can_redo": False,
+            }
+        )
+
+    def _to_slice_detail(self, slice_row: Slice) -> SliceDetail:
+        active_commit = slice_row.active_commit
+        commits = list(sorted(slice_row.commits, key=lambda commit: commit.created_at))
+        return SliceDetail.model_validate(
+            {
+                **self._to_slice_summary(slice_row).model_dump(mode="json"),
+                "transcript": self._transcript_view(slice_row.transcript),
+                "source_recording": self._source_recording_view(slice_row.source_recording),
+                "variants": [
+                    self._audio_variant_view(variant)
+                    for variant in sorted(slice_row.variants, key=lambda variant: (not variant.is_original, variant.id))
+                ],
+                "commits": [self._revision_view(commit) for commit in commits],
+                "active_variant": self._audio_variant_view(slice_row.active_variant),
+                "active_commit": self._revision_view(active_commit) if active_commit is not None else None,
+                "can_undo": active_commit.parent_commit_id is not None if active_commit is not None else False,
+                "can_redo": any(commit.parent_commit_id == slice_row.active_commit_id for commit in commits),
+            }
+        )
 
     def _touch_slice(self, slice_row: Slice, when: datetime | None = None) -> None:
         metadata = self._slice_metadata(slice_row)
@@ -1174,7 +1567,7 @@ class SQLiteRepository:
             base_duration = slice_row.active_variant.duration_s
         else:
             base_duration = slice_row.source_recording.duration_s if slice_row.source_recording is not None else 0.0
-        return round(self._apply_edl_to_duration(base_duration, self._collect_edl_operations(None, slice_row)), 2)
+        return round(self._apply_edl_to_duration(base_duration, self._collect_edl_operations(slice_row)), 2)
 
     def _legacy_status_to_storage(self, status: str) -> ReviewStatus:
         mapping = {
@@ -1364,6 +1757,10 @@ class SQLiteRepository:
     def _render_slice_audio_bytes(self, session: Session, slice_row: Slice) -> bytes:
         active_variant = slice_row.active_variant
         if active_variant is None:
+            if slice_row.active_variant_id is not None:
+                raise ValueError(
+                    f"Active variant {slice_row.active_variant_id} is missing for slice {slice_row.id}"
+                )
             return self._render_synthetic_wave_bytes(48000, 1, 2.0, slice_row.id)
         try:
             audio_path = self._get_variant_audio_path(
@@ -1372,19 +1769,57 @@ class SQLiteRepository:
             )
         except FileNotFoundError as exc:
             raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
-        return self._apply_edl_to_wav_bytes(audio_path.read_bytes(), self._collect_edl_operations(session, slice_row))
+        return self._apply_edl_to_wav_bytes(audio_path.read_bytes(), self._collect_edl_operations(slice_row))
 
-    def _slice_render_cache_path(self, slice_row: Slice) -> Path:
+    def _materialize_slice_media_path(self, session: Session, slice_row: Slice) -> Path:
+        target_path = self._slice_render_cache_path(slice_row)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not target_path.exists():
+            target_path.write_bytes(self._render_slice_audio_bytes(session, slice_row))
+        return target_path
+
+    def _slice_audio_cache_identifier(self, slice_row: Slice) -> str:
         state_key = json.dumps(
             {
                 "slice_id": slice_row.id,
                 "active_variant_id": slice_row.active_variant_id,
-                "active_commit_id": slice_row.active_commit_id,
+                "edl_operations": self._collect_edl_operations(slice_row),
             },
             sort_keys=True,
         )
         fingerprint = hashlib.sha1(state_key.encode("utf-8")).hexdigest()[:12]
-        return self._managed_media_path("slices", f"slice-{fingerprint}")
+        return f"{slice_row.id}-{fingerprint}"
+
+    def _slice_render_cache_path(self, slice_row: Slice) -> Path:
+        return self._managed_media_path("slices", self._slice_audio_cache_identifier(slice_row))
+
+    def _waveform_peaks_cache_path(self, slice_row: Slice, bins: int) -> Path:
+        identifier = self._validate_managed_media_id(
+            f"{self._slice_audio_cache_identifier(slice_row)}-bins-{bins}"
+        )
+        return (self.media_root / "peaks" / f"{identifier}.json").resolve()
+
+    def _ensure_waveform_peaks_cache(self, slice_row: Slice, media_path: Path, bins: int) -> WaveformPeaks:
+        cache_path = self._waveform_peaks_cache_path(slice_row, bins)
+        if cache_path.exists():
+            return WaveformPeaks.model_validate(json.loads(cache_path.read_text()))
+        peaks = self._extract_waveform_peaks_from_bytes(media_path.read_bytes(), bins)
+        payload = WaveformPeaks(clip_id=slice_row.id, bins=bins, peaks=peaks)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(payload.model_dump_json())
+        return payload
+
+    def _warm_slice_artifacts_for_id(self, slice_id: str, bins_values: tuple[int, ...] = (960,)) -> None:
+        try:
+            with self._session() as session:
+                slice_row = self._get_loaded_slice(session, slice_id)
+                media_path = self._materialize_slice_media_path(session, slice_row)
+                for bins in bins_values:
+                    self._ensure_waveform_peaks_cache(slice_row, media_path, bins)
+        except (FileNotFoundError, ValueError):
+            # Imported projects can temporarily point at offline media; cache warming should
+            # never block transcript/status/tag persistence in that state.
+            return
 
     def _validate_managed_media_id(self, identifier: str) -> str:
         normalized = identifier.strip()
@@ -1400,6 +1835,27 @@ class SQLiteRepository:
 
     def _managed_variant_path(self, variant_id: str) -> Path:
         return self._managed_media_path("variants", variant_id)
+
+    def _prune_derived_media_cache(self) -> int:
+        with self._session() as session:
+            slices = session.exec(select(Slice)).all()
+            keep_cache_ids = {self._slice_audio_cache_identifier(slice_row) for slice_row in slices}
+        deleted_count = 0
+        slices_root = self.media_root / "slices"
+        peaks_root = self.media_root / "peaks"
+        for path in slices_root.glob("*.wav"):
+            cache_id = path.stem
+            if cache_id in keep_cache_ids:
+                continue
+            path.unlink()
+            deleted_count += 1
+        for path in peaks_root.glob("*.json"):
+            cache_id, _separator, _bins = path.stem.rpartition("-bins-")
+            if cache_id in keep_cache_ids:
+                continue
+            path.unlink()
+            deleted_count += 1
+        return deleted_count
 
     def _ingest_variant_asset(self, path: Path, variant_id: str) -> Path:
         source_path = path.expanduser().resolve()
@@ -1491,6 +1947,20 @@ class SQLiteRepository:
             path.unlink()
             deleted_count += 1
         return deleted_count
+
+    def _get_revision_referenced_variant_ids(self, session: Session, slice_ids: list[str]) -> set[str]:
+        if not slice_ids:
+            return set()
+        return {
+            variant_id
+            for variant_id in session.exec(
+                select(EditCommit.active_variant_id_snapshot).where(
+                    EditCommit.slice_id.in_(slice_ids),
+                    EditCommit.active_variant_id_snapshot.is_not(None),
+                )
+            ).all()
+            if variant_id is not None
+        }
 
     def _read_pcm_wav_header(self, path: Path) -> tuple[int, int, int, int]:
         try:

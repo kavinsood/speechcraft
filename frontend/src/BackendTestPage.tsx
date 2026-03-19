@@ -17,7 +17,7 @@ import {
   updateClipTags,
   updateClipTranscript,
 } from "./api";
-import type { Slice } from "./types";
+import type { SliceSummary } from "./types";
 
 type LogEntry = {
   step: string;
@@ -34,7 +34,7 @@ function formatResult(value: unknown): string {
 export default function BackendTestPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isRunning, setIsRunning] = useState(false);
-  const [slices, setSlices] = useState<Slice[]>([]);
+  const [slices, setSlices] = useState<SliceSummary[]>([]);
 
   const activeClipId = useMemo(() => {
     return slices[0]?.id ?? "clip-001";

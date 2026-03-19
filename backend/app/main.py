@@ -10,13 +10,15 @@ from .models import (
     AudioVariantRunRequest,
     ExportPreview,
     ExportRun,
-    ImportBatch,
     ImportBatchCreate,
     MediaCleanupResult,
+    ProjectSummary,
     RecordingDerivativeCreate,
     ReferenceAsset,
     ReferenceAssetCreate,
+    SliceSaveRequest,
     SliceDetail,
+    SliceSummary,
     SliceEdlUpdate,
     SliceSplitRequest,
     SliceStatusUpdate,
@@ -27,7 +29,7 @@ from .models import (
     SlicerHandoffRequest,
     WaveformPeaks,
 )
-from .repository import repository
+from .repository import SliceSaveValidationError, repository
 
 
 app = FastAPI(
@@ -50,25 +52,33 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/projects", response_model=list[ImportBatch])
-def list_projects() -> list[ImportBatch]:
+@app.get("/api/projects", response_model=list[ProjectSummary])
+def list_projects() -> list[ProjectSummary]:
     return repository.list_projects()
 
 
-@app.get("/api/projects/{project_id}", response_model=ImportBatch)
-def get_project(project_id: str) -> ImportBatch:
+@app.get("/api/projects/{project_id}", response_model=ProjectSummary)
+def get_project(project_id: str) -> ProjectSummary:
     try:
         return repository.get_project(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
-@app.get("/api/projects/{project_id}/slices", response_model=list[SliceDetail])
-def list_project_slices(project_id: str) -> list[SliceDetail]:
+@app.get("/api/projects/{project_id}/slices", response_model=list[SliceSummary])
+def list_project_slices(project_id: str) -> list[SliceSummary]:
     try:
         return repository.get_project_slices(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.get("/api/slices/{slice_id}", response_model=SliceDetail)
+def get_slice_detail(slice_id: str) -> SliceDetail:
+    try:
+        return repository.get_slice_detail(slice_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
 
 
 @app.get("/api/projects/{project_id}/export-preview", response_model=ExportPreview)
@@ -131,6 +141,16 @@ def update_slice_tags(clip_id: str, payload: SliceTagUpdate) -> SliceDetail:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
 
 
+@app.post("/api/clips/{clip_id}/save", response_model=SliceDetail)
+def save_slice_state(clip_id: str, payload: SliceSaveRequest) -> SliceDetail:
+    try:
+        return repository.save_slice_state(clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except SliceSaveValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/clips/{clip_id}/edl", response_model=SliceDetail)
 def append_slice_edl_operation(clip_id: str, payload: SliceEdlUpdate) -> SliceDetail:
     try:
@@ -159,8 +179,8 @@ def redo_slice(clip_id: str) -> SliceDetail:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/clips/{clip_id}/split", response_model=list[SliceDetail])
-def split_slice(clip_id: str, payload: SliceSplitRequest) -> list[SliceDetail]:
+@app.post("/api/clips/{clip_id}/split", response_model=list[SliceSummary])
+def split_slice(clip_id: str, payload: SliceSplitRequest) -> list[SliceSummary]:
     try:
         return repository.split_slice(clip_id, payload)
     except KeyError as exc:
@@ -169,8 +189,8 @@ def split_slice(clip_id: str, payload: SliceSplitRequest) -> list[SliceDetail]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/clips/{clip_id}/merge-next", response_model=list[SliceDetail])
-def merge_with_next_slice(clip_id: str) -> list[SliceDetail]:
+@app.post("/api/clips/{clip_id}/merge-next", response_model=list[SliceSummary])
+def merge_with_next_slice(clip_id: str) -> list[SliceSummary]:
     try:
         return repository.merge_with_next_slice(clip_id)
     except KeyError as exc:
@@ -243,8 +263,8 @@ def get_slice_media(slice_id: str) -> FileResponse:
     return FileResponse(path=path, media_type="audio/wav")
 
 
-@app.post("/api/import-batches", response_model=ImportBatch)
-def create_import_batch(payload: ImportBatchCreate) -> ImportBatch:
+@app.post("/api/import-batches", response_model=ProjectSummary)
+def create_import_batch(payload: ImportBatchCreate) -> ProjectSummary:
     return repository.create_import_batch(payload)
 
 

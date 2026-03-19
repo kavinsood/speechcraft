@@ -5,17 +5,16 @@ import {
   buildSliceAudioUrl,
   cleanupProjectMedia,
   fetchProjectExports,
+  fetchSliceDetail,
   fetchProjectSlices,
   mergeWithNextClip,
   redoClip,
   runClipLabModel,
   runProjectExport,
+  saveClipState,
   setActiveVariant,
   splitClip,
   undoClip,
-  updateClipStatus,
-  updateClipTags,
-  updateClipTranscript,
 } from "../api";
 import ErrorBoundary from "../ErrorBoundary";
 import ClipQueuePane from "../workspace/ClipQueuePane";
@@ -23,11 +22,11 @@ import EditorPane from "../workspace/EditorPane";
 import InspectorPane from "../workspace/InspectorPane";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
 import {
-  getRedoTarget,
+  getSliceAudioRevisionKey,
   getSliceDuration,
   sortClipsForQueue,
 } from "../workspace/workspace-helpers";
-import type { ExportRun, Project, ReviewStatus, Slice } from "../types";
+import type { ExportRun, Project, ReviewStatus, Slice, SliceSummary } from "../types";
 
 type WorkspaceStatus = "loading" | "error" | "ready";
 
@@ -51,6 +50,24 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function summarizeSlice(slice: Slice): SliceSummary {
+  return {
+    id: slice.id,
+    source_recording_id: slice.source_recording_id,
+    active_variant_id: slice.active_variant_id,
+    active_commit_id: slice.active_commit_id,
+    status: slice.status,
+    duration_seconds: slice.duration_seconds,
+    model_metadata: slice.model_metadata,
+    created_at: slice.created_at,
+    transcript: slice.transcript,
+    tags: slice.tags,
+    active_variant_generator_model: slice.active_variant?.generator_model ?? null,
+    can_undo: slice.can_undo,
+    can_redo: slice.can_redo,
+  };
+}
+
 export default function LabelPage({
   activeProject,
   projectLoadStatus,
@@ -62,13 +79,15 @@ export default function LabelPage({
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceEmptyMessage, setWorkspaceEmptyMessage] = useState<string | null>(null);
   const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
-  const [slices, setSlices] = useState<Slice[]>([]);
+  const [slices, setSlices] = useState<SliceSummary[]>([]);
+  const [activeClip, setActiveClip] = useState<Slice | null>(null);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [isRunningExport, setIsRunningExport] = useState(false);
   const [isCleaningMedia, setIsCleaningMedia] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
+  const latestDetailRequestRef = useRef(0);
   const showDangerousDevActions = import.meta.env.DEV;
 
   async function loadWorkspace(projectId: string | null | undefined) {
@@ -101,6 +120,7 @@ export default function LabelPage({
 
       const sortedSlices = sortClipsForQueue(nextSlices);
       setSlices(nextSlices);
+      setActiveClip(null);
       setExportRuns(nextExports);
       setVisibleQueueClipIds(sortedSlices.map((slice) => slice.id));
       setActiveClipId((current) =>
@@ -114,6 +134,7 @@ export default function LabelPage({
       }
 
       setSlices([]);
+      setActiveClip(null);
       setExportRuns([]);
       setActiveClipId(null);
       setVisibleQueueClipIds([]);
@@ -149,23 +170,56 @@ export default function LabelPage({
     );
   }, [slices]);
 
-  const activeClip = useMemo(() => {
-    const visibleQueueClips = visibleQueueClipIds
-      .map((clipId) => slices.find((slice) => slice.id === clipId) ?? null)
-      .filter((slice): slice is Slice => slice !== null);
+  const sliceMap = useMemo(() => new Map(slices.map((slice) => [slice.id, slice])), [slices]);
 
-    return slices.find((slice) => slice.id === activeClipId) ?? visibleQueueClips[0] ?? slices[0] ?? null;
-  }, [slices, activeClipId, visibleQueueClipIds]);
+  const activeClipSummary = useMemo(() => {
+    const visibleQueueClips = visibleQueueClipIds
+      .map((clipId) => sliceMap.get(clipId) ?? null)
+      .filter((slice): slice is SliceSummary => slice !== null);
+
+    return sliceMap.get(activeClipId ?? "") ?? visibleQueueClips[0] ?? slices[0] ?? null;
+  }, [sliceMap, slices, activeClipId, visibleQueueClipIds]);
+
+  const activeClipRevisionKey = activeClipSummary
+    ? `${activeClipSummary.active_variant_id ?? "no-variant"}:${activeClipSummary.active_commit_id ?? "base"}`
+    : null;
+
+  useEffect(() => {
+    const requestId = latestDetailRequestRef.current + 1;
+    latestDetailRequestRef.current = requestId;
+
+    if (!activeClipSummary) {
+      setActiveClip(null);
+      return;
+    }
+
+    void (async () => {
+      try {
+        const detail = await fetchSliceDetail(activeClipSummary.id);
+        if (latestDetailRequestRef.current !== requestId) {
+          return;
+        }
+        setActiveClip(detail);
+      } catch (error) {
+        if (latestDetailRequestRef.current !== requestId) {
+          return;
+        }
+        setActiveClip(null);
+        setWorkspaceNotice(getErrorMessage(error, "The active slice failed to load."));
+      }
+    })();
+  }, [activeClipSummary?.id, activeClipRevisionKey]);
 
   const activeClipAudioUrl = useMemo(() => {
     if (!activeClip) {
       return null;
     }
-    const revision = `${activeClip.active_variant_id ?? "no-variant"}:${activeClip.active_commit_id ?? "base"}`;
+    const revision = getSliceAudioRevisionKey(activeClip);
     return buildSliceAudioUrl(activeClip.id, revision);
   }, [activeClip]);
 
   function handleClipSelect(nextClipId: string) {
+    setActiveClip(null);
     startTransition(() => {
       setActiveClipId(nextClipId);
     });
@@ -190,7 +244,10 @@ export default function LabelPage({
   }
 
   function replaceSlice(updatedSlice: Slice) {
-    setSlices((current) => current.map((slice) => (slice.id === updatedSlice.id ? updatedSlice : slice)));
+    setSlices((current) =>
+      current.map((slice) => (slice.id === updatedSlice.id ? summarizeSlice(updatedSlice) : slice)),
+    );
+    setActiveClip((current) => (current?.id === updatedSlice.id ? updatedSlice : current));
   }
 
   async function handleRunExport() {
@@ -233,6 +290,7 @@ export default function LabelPage({
       const nextSlices = await fetchProjectSlices(activeProject.id);
       const sorted = sortClipsForQueue(nextSlices);
       setSlices(nextSlices);
+      setActiveClip(null);
       setVisibleQueueClipIds(sorted.map((slice) => slice.id));
       setActiveClipId((current) =>
         sorted.some((slice) => slice.id === current) ? current : (sorted[0]?.id ?? null),
@@ -247,23 +305,17 @@ export default function LabelPage({
     }
   }
 
-  async function saveClipStatus(clipId: string, status: ReviewStatus): Promise<Slice> {
-    const updatedSlice = await updateClipStatus(clipId, status);
-    replaceSlice(updatedSlice);
-    return updatedSlice;
-  }
-
-  async function saveClipTranscript(clipId: string, modifiedText: string): Promise<Slice> {
-    const updatedSlice = await updateClipTranscript(clipId, modifiedText);
-    replaceSlice(updatedSlice);
-    return updatedSlice;
-  }
-
-  async function saveClipTags(
+  async function saveFullSlice(
     clipId: string,
-    tags: { name: string; color: string }[],
+    payload: {
+      modified_text?: string | null;
+      tags?: { name: string; color: string }[] | null;
+      status?: ReviewStatus | null;
+      message?: string | null;
+      is_milestone?: boolean;
+    },
   ): Promise<Slice> {
-    const updatedSlice = await updateClipTags(clipId, tags);
+    const updatedSlice = await saveClipState(clipId, payload);
     replaceSlice(updatedSlice);
     return updatedSlice;
   }
@@ -293,10 +345,11 @@ export default function LabelPage({
     return updatedSlice;
   }
 
-  async function splitClipMutation(clipId: string, splitAtSeconds: number): Promise<Slice[]> {
+  async function splitClipMutation(clipId: string, splitAtSeconds: number): Promise<SliceSummary[]> {
     const existingIds = new Set(slices.map((slice) => slice.id));
     const nextSlices = await splitClip(clipId, splitAtSeconds);
     setSlices(nextSlices);
+    setActiveClip(null);
     const sorted = sortClipsForQueue(nextSlices);
     setVisibleQueueClipIds(sorted.map((slice) => slice.id));
     const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
@@ -304,10 +357,11 @@ export default function LabelPage({
     return nextSlices;
   }
 
-  async function mergeNextClipMutation(clipId: string): Promise<Slice[]> {
+  async function mergeNextClipMutation(clipId: string): Promise<SliceSummary[]> {
     const existingIds = new Set(slices.map((slice) => slice.id));
     const nextSlices = await mergeWithNextClip(clipId);
     setSlices(nextSlices);
+    setActiveClip(null);
     const sorted = sortClipsForQueue(nextSlices);
     setVisibleQueueClipIds(sorted.map((slice) => slice.id));
     const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
@@ -364,10 +418,10 @@ export default function LabelPage({
     [slices],
   );
   const acceptedRejectedRatio =
-    datasetStatusCounts.counts.rejected > 0
-      ? datasetStatusCounts.counts.accepted / datasetStatusCounts.counts.rejected
-      : datasetStatusCounts.counts.accepted > 0
-        ? datasetStatusCounts.counts.accepted
+    datasetStatusCounts.durations.rejected > 0
+      ? datasetStatusCounts.durations.accepted / datasetStatusCounts.durations.rejected
+      : datasetStatusCounts.durations.accepted > 0
+        ? datasetStatusCounts.durations.accepted
         : null;
   const predictedOutputSeconds =
     datasetStatusCounts.counts.accepted > 0 ? datasetStatusCounts.durations.accepted : null;
@@ -375,8 +429,8 @@ export default function LabelPage({
     slices.length > 0
       ? ((datasetStatusCounts.counts.accepted + datasetStatusCounts.counts.rejected) / slices.length) * 100
       : null;
-  const canUndo = Boolean(activeClip?.active_commit_id);
-  const canRedo = activeClip ? Boolean(getRedoTarget(activeClip)) : false;
+  const canUndo = Boolean(activeClip?.can_undo);
+  const canRedo = Boolean(activeClip?.can_redo);
 
   useEffect(() => {
     onHeaderActionsChange(
@@ -447,9 +501,7 @@ export default function LabelPage({
             getNextClipId={getNextClipId}
             onSelectClip={handleClipSelect}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
-            onSaveTranscript={saveClipTranscript}
-            onSaveTags={saveClipTags}
-            onUpdateStatus={saveClipStatus}
+            onSaveSlice={saveFullSlice}
             onAppendEdlOperation={saveClipEdl}
             onUndo={undoClipMutation}
             onRedo={redoClipMutation}
@@ -474,7 +526,10 @@ export default function LabelPage({
               if (!activeClip) {
                 return;
               }
-              void saveClipStatus(activeClip.id, status);
+              void saveFullSlice(activeClip.id, {
+                status,
+                message: `Status: ${status}`,
+              });
             }}
             onVariantSelect={(variantId) => void setActiveVariantMutation(variantId)}
           />

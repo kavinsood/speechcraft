@@ -15,6 +15,14 @@ export type Transcript = {
   alignment_data?: Record<string, unknown> | null;
 };
 
+export type TranscriptSummary = {
+  id: string;
+  slice_id: string;
+  original_text: string;
+  modified_text?: string | null;
+  is_modified: boolean;
+};
+
 export type ClipRange = {
   start_seconds: number;
   end_seconds: number;
@@ -29,13 +37,18 @@ export type EditCommit = {
     range?: ClipRange | null;
     duration_seconds?: number | null;
   }[];
+  transcript_text: string;
+  status: ReviewStatus;
+  tags: Tag[];
+  active_variant_id?: string | null;
+  message?: string | null;
+  is_milestone: boolean;
   created_at: string;
 };
 
 export type AudioVariant = {
   id: string;
   slice_id: string;
-  file_path: string;
   is_original: boolean;
   generator_model?: string | null;
   sample_rate: number;
@@ -46,14 +59,13 @@ export type SourceRecording = {
   id: string;
   batch_id: string;
   parent_recording_id?: string | null;
-  file_path: string;
   sample_rate: number;
   num_channels: number;
   num_samples: number;
   processing_recipe?: string | null;
 };
 
-export type Slice = {
+export type SliceSummary = {
   id: string;
   source_recording_id: string;
   active_variant_id?: string | null;
@@ -62,9 +74,16 @@ export type Slice = {
   duration_seconds: number;
   model_metadata?: Record<string, unknown> | null;
   created_at: string;
-  source_recording: SourceRecording;
-  transcript?: Transcript | null;
+  transcript?: TranscriptSummary | null;
   tags: Tag[];
+  active_variant_generator_model?: string | null;
+  can_undo: boolean;
+  can_redo: boolean;
+};
+
+export type Slice = SliceSummary & {
+  transcript?: Transcript | null;
+  source_recording: SourceRecording;
   variants: AudioVariant[];
   commits: EditCommit[];
   active_variant?: AudioVariant | null;
@@ -75,6 +94,8 @@ export type ImportBatch = {
   id: string;
   name: string;
   created_at: string;
+  updated_at: string;
+  export_status?: "pending" | "running" | "completed" | "failed" | null;
 };
 
 export type Project = ImportBatch;

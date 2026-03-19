@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type WaveSurfer from "wavesurfer.js";
 import WaveformPane from "../WaveformPane";
 import { fetchWaveformPeaks } from "../api";
-import type { ReviewStatus, Slice, WaveformPeaks } from "../types";
+import type { ReviewStatus, Slice, SliceSummary, WaveformPeaks } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatClipTimestamp,
   formatSeconds,
   getAlignmentConfidence,
   getAlignmentSource,
-  getRedoTarget,
+  getSliceAudioRevisionKey,
   getSliceDuration,
   getSliceTranscriptText,
   parseTagDraft,
@@ -29,9 +29,16 @@ type EditorPaneProps = {
   getNextClipId: (currentClipId: string) => string | null;
   onSelectClip: (clipId: string) => void;
   onRetryLoad: () => void;
-  onSaveTranscript: (clipId: string, text: string) => Promise<Slice>;
-  onSaveTags: (clipId: string, tags: { name: string; color: string }[]) => Promise<Slice>;
-  onUpdateStatus: (clipId: string, status: ReviewStatus) => Promise<Slice>;
+  onSaveSlice: (
+    clipId: string,
+    payload: {
+      modified_text?: string | null;
+      tags?: { name: string; color: string }[] | null;
+      status?: ReviewStatus | null;
+      message?: string | null;
+      is_milestone?: boolean;
+    },
+  ) => Promise<Slice>;
   onAppendEdlOperation: (
     clipId: string,
     payload: {
@@ -42,8 +49,8 @@ type EditorPaneProps = {
   ) => Promise<Slice>;
   onUndo: (clipId: string) => Promise<Slice>;
   onRedo: (clipId: string) => Promise<Slice>;
-  onSplitClip: (clipId: string, splitAtSeconds: number) => Promise<Slice[]>;
-  onMergeClip: (clipId: string) => Promise<Slice[]>;
+  onSplitClip: (clipId: string, splitAtSeconds: number) => Promise<SliceSummary[]>;
+  onMergeClip: (clipId: string) => Promise<SliceSummary[]>;
   onRunClipLabModel: (clipId: string, generatorModel: string) => Promise<Slice>;
 };
 
@@ -59,9 +66,7 @@ export default function EditorPane({
   getNextClipId,
   onSelectClip,
   onRetryLoad,
-  onSaveTranscript,
-  onSaveTags,
-  onUpdateStatus,
+  onSaveSlice,
   onAppendEdlOperation,
   onUndo,
   onRedo,
@@ -94,6 +99,7 @@ export default function EditorPane({
   const [waveformError, setWaveformError] = useState<string | null>(null);
 
   const activeDuration = activeClip ? getSliceDuration(activeClip) : 0;
+  const activeAudioRevisionKey = activeClip ? getSliceAudioRevisionKey(activeClip) : null;
   const draftTagEntries = useMemo(() => parseTagDraft(draftTags), [draftTags]);
   const suggestedTagNames = useMemo(() => {
     const selected = new Set(draftTagEntries.map((tag) => tag.name.toLowerCase()));
@@ -162,7 +168,7 @@ export default function EditorPane({
     return () => {
       cancelled = true;
     };
-  }, [activeClip?.id, activeClip?.active_commit_id, activeClip?.active_variant_id]);
+  }, [activeClip?.id, activeAudioRevisionKey]);
 
   useEffect(() => {
     const editor = transcriptEditorRef.current;
@@ -232,25 +238,6 @@ export default function EditorPane({
     applyPlaybackRate(waveSurferRef.current, nextRate);
   }
 
-  async function persistDrafts(): Promise<Slice | null> {
-    if (!activeClip) {
-      return null;
-    }
-
-    let workingSlice = activeClip;
-    if (draftTranscript !== getSliceTranscriptText(activeClip)) {
-      workingSlice = await onSaveTranscript(activeClip.id, draftTranscript);
-    }
-
-    const currentTagDraft = workingSlice.tags.map((tag) => tag.name).join(", ");
-    if (draftTags.trim() !== currentTagDraft.trim()) {
-      workingSlice = await onSaveTags(workingSlice.id, parseTagDraft(draftTags));
-      setDraftTags(workingSlice.tags.map((tag) => tag.name).join(", "));
-    }
-
-    return workingSlice;
-  }
-
   async function handleSaveSlice(forceStatus?: ReviewStatus): Promise<Slice | null> {
     if (!activeClip) {
       return null;
@@ -260,14 +247,24 @@ export default function EditorPane({
     pausePlayback();
 
     try {
-      let workingSlice = await persistDrafts();
-      if (!workingSlice) {
-        return null;
-      }
-      if (forceStatus && workingSlice.status !== forceStatus) {
-        workingSlice = await onUpdateStatus(workingSlice.id, forceStatus);
-      }
+      const nextTags = parseTagDraft(draftTags);
+      const currentTagDraft = activeClip.tags.map((tag) => tag.name).join(", ");
+      const workingSlice = await onSaveSlice(activeClip.id, {
+        modified_text:
+          draftTranscript !== getSliceTranscriptText(activeClip) ? draftTranscript : undefined,
+        tags: draftTags.trim() !== currentTagDraft.trim() ? nextTags : undefined,
+        status: forceStatus && activeClip.status !== forceStatus ? forceStatus : undefined,
+        message:
+          forceStatus === "accepted"
+            ? "Accepted slice milestone"
+            : forceStatus === "rejected"
+              ? "Rejected slice milestone"
+              : "Saved slice milestone",
+        is_milestone: true,
+      });
       setEditorNotice("Saved slice state.");
+      setDraftTranscript(getSliceTranscriptText(workingSlice));
+      setDraftTags(workingSlice.tags.map((tag) => tag.name).join(", "));
       return workingSlice;
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Save failed.");
@@ -843,7 +840,7 @@ export default function EditorPane({
             </strong>
           </span>
           <span>
-            Redo: <strong>{activeClip && getRedoTarget(activeClip) ? "available" : "none"}</strong>
+            Redo: <strong>{activeClip && canRedo ? "available" : "none"}</strong>
           </span>
         </div>
       </section>

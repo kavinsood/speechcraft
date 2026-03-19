@@ -126,7 +126,7 @@ export default function InspectorPane({
                 ))}
               <div className="stats-divider" />
               <div className="stats-row">
-                <span>A/R Ratio</span>
+                <span>A/R Ratio (Duration)</span>
                 <span>-</span>
                 <span>{acceptedRejectedRatio !== null ? acceptedRejectedRatio.toFixed(2) : "n/a"}</span>
               </div>
@@ -170,6 +170,30 @@ export default function InspectorPane({
               </ul>
             ) : (
               <p className="muted-copy">No waveform math stored yet.</p>
+            )}
+          </section>
+
+          <section className="inspector-block">
+            <h3>Slice History</h3>
+            {activeClip.commits.length > 0 ? (
+              <div className="commit-list">
+                {[...activeClip.commits].reverse().map((commitEntry) => (
+                  <div key={commitEntry.id} className="commit-card">
+                    <div className="commit-row">
+                      <strong>{commitEntry.message ?? "Auto revision"}</strong>
+                      <span>
+                        {commitEntry.is_milestone ? "milestone" : "auto"} • {statusLabels[commitEntry.status]}
+                      </span>
+                    </div>
+                    <p>{commitEntry.transcript_text || "(blank transcript)"}</p>
+                    <span className="commit-time">
+                      {new Date(commitEntry.created_at).toLocaleString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="muted-copy">No saved slice history yet.</p>
             )}
           </section>
 

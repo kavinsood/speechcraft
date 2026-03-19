@@ -5,6 +5,7 @@ import type {
   MediaCleanupResult,
   ReviewStatus,
   Slice,
+  SliceSummary,
   WaveformPeaks,
 } from "./types";
 
@@ -73,9 +74,14 @@ export async function fetchProject(projectId: string): Promise<ImportBatch> {
   return await parseJson<ImportBatch>(response);
 }
 
-export async function fetchProjectSlices(projectId: string): Promise<Slice[]> {
+export async function fetchProjectSlices(projectId: string): Promise<SliceSummary[]> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/slices`);
-  return await parseJson<Slice[]>(response);
+  return await parseJson<SliceSummary[]>(response);
+}
+
+export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}`);
+  return await parseJson<Slice>(response);
 }
 
 export async function fetchProjectExports(projectId: string): Promise<ExportRun[]> {
@@ -141,6 +147,26 @@ export async function updateClipTags(
   return await parseJson<Slice>(response);
 }
 
+export async function saveClipState(
+  clipId: string,
+  payload: {
+    modified_text?: string | null;
+    tags?: { name: string; color: string }[] | null;
+    status?: ReviewStatus | null;
+    message?: string | null;
+    is_milestone?: boolean;
+  },
+): Promise<Slice> {
+  const response = await fetch(`${API_BASE}/api/clips/${clipId}/save`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<Slice>(response);
+}
+
 export async function appendClipEdlOperation(
   clipId: string,
   payload: {
@@ -173,7 +199,7 @@ export async function redoClip(clipId: string): Promise<Slice> {
   return await parseJson<Slice>(response);
 }
 
-export async function splitClip(clipId: string, splitAtSeconds: number): Promise<Slice[]> {
+export async function splitClip(clipId: string, splitAtSeconds: number): Promise<SliceSummary[]> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/split`, {
     method: "POST",
     headers: {
@@ -181,14 +207,14 @@ export async function splitClip(clipId: string, splitAtSeconds: number): Promise
     },
     body: JSON.stringify({ split_at_seconds: splitAtSeconds }),
   });
-  return await parseJson<Slice[]>(response);
+  return await parseJson<SliceSummary[]>(response);
 }
 
-export async function mergeWithNextClip(clipId: string): Promise<Slice[]> {
+export async function mergeWithNextClip(clipId: string): Promise<SliceSummary[]> {
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/merge-next`, {
     method: "POST",
   });
-  return await parseJson<Slice[]>(response);
+  return await parseJson<SliceSummary[]>(response);
 }
 
 export async function runClipLabModel(

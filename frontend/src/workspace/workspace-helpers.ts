@@ -1,4 +1,4 @@
-import type { AudioVariant, ReviewStatus, Slice } from "../types";
+import type { AudioVariant, ReviewStatus, Slice, SliceSummary } from "../types";
 
 export const queuePriorityOrder: ReviewStatus[] = [
   "unresolved",
@@ -41,7 +41,7 @@ export function formatDurationCompact(totalSeconds: number): string {
 }
 
 export function getSliceMetadata<T>(
-  slice: Slice,
+  slice: SliceSummary,
   key: string,
   fallback: T,
 ): T {
@@ -49,53 +49,66 @@ export function getSliceMetadata<T>(
   return (value as T | undefined) ?? fallback;
 }
 
-export function getSliceTranscriptText(slice: Slice): string {
+export function getSliceTranscriptText(slice: SliceSummary): string {
   return slice.transcript?.modified_text ?? slice.transcript?.original_text ?? "";
 }
 
-export function getSliceDuration(slice: Slice): number {
+export function getSliceDuration(slice: SliceSummary): number {
   return Number((slice.duration_seconds ?? 0).toFixed(2));
 }
 
-export function getSliceOrderIndex(slice: Slice): number {
+export function getSliceOrderIndex(slice: SliceSummary): number {
   return Number(getSliceMetadata(slice, "order_index", 0));
 }
 
-export function getSliceOriginalStart(slice: Slice): number {
+export function getSliceOriginalStart(slice: SliceSummary): number {
   return Number(getSliceMetadata(slice, "original_start_time", 0));
 }
 
-export function getSliceOriginalEnd(slice: Slice): number {
+export function getSliceOriginalEnd(slice: SliceSummary): number {
   return Number(getSliceMetadata(slice, "original_end_time", getSliceDuration(slice)));
 }
 
-export function getSliceSpeakerName(slice: Slice): string {
+export function getSliceSpeakerName(slice: SliceSummary): string {
   return String(getSliceMetadata(slice, "speaker_name", "speaker_a"));
 }
 
-export function getSliceLanguage(slice: Slice): string {
+export function getSliceLanguage(slice: SliceSummary): string {
   return String(getSliceMetadata(slice, "language", "en"));
 }
 
-export function isSliceSuperseded(slice: Slice): boolean {
+export function isSliceSuperseded(slice: SliceSummary): boolean {
   return Boolean(getSliceMetadata(slice, "is_superseded", false));
 }
 
-export function getAlignmentSource(slice: Slice): string {
-  const alignmentData = slice.transcript?.alignment_data;
+export function getAlignmentSource(slice: SliceSummary): string {
+  const alignmentData =
+    slice.transcript && "alignment_data" in slice.transcript
+      ? slice.transcript.alignment_data
+      : undefined;
   if (alignmentData && typeof alignmentData === "object" && "source" in alignmentData) {
     return String(alignmentData.source ?? "manual");
   }
   return "manual";
 }
 
-export function getAlignmentConfidence(slice: Slice): number | null {
-  const alignmentData = slice.transcript?.alignment_data;
+export function getAlignmentConfidence(slice: SliceSummary): number | null {
+  const alignmentData =
+    slice.transcript && "alignment_data" in slice.transcript
+      ? slice.transcript.alignment_data
+      : undefined;
   if (alignmentData && typeof alignmentData === "object" && "confidence" in alignmentData) {
     const raw = alignmentData.confidence;
     return typeof raw === "number" ? raw : null;
   }
   return null;
+}
+
+export function getSliceAudioRevisionKey(slice: Slice): string {
+  return JSON.stringify({
+    active_variant_id: slice.active_variant_id ?? null,
+    edl_operations: slice.active_commit?.edl_operations ?? [],
+  });
 }
 
 export function getRedoTarget(slice: Slice): string | null {
@@ -116,7 +129,7 @@ export function sortVariantsForHistory(variants: AudioVariant[]): AudioVariant[]
   });
 }
 
-export function sortClipsForQueue(clips: Slice[]): Slice[] {
+export function sortClipsForQueue<T extends SliceSummary>(clips: T[]): T[] {
   return [...clips]
     .filter((slice) => !isSliceSuperseded(slice))
     .sort((left, right) => {
@@ -163,7 +176,7 @@ export function parseTagDraft(value: string): { name: string; color: string }[] 
 }
 
 export function clipMatchesFilters(
-  slice: Slice,
+  slice: SliceSummary,
   query: string,
   selectedFilterTags: string[],
   hideResolved: boolean,
