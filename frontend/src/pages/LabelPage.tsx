@@ -69,6 +69,7 @@ export default function LabelPage({
   const [isRunningExport, setIsRunningExport] = useState(false);
   const [isCleaningMedia, setIsCleaningMedia] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
+  const showDangerousDevActions = import.meta.env.DEV;
 
   async function loadWorkspace(projectId: string | null | undefined) {
     const requestId = latestWorkspaceRequestRef.current + 1;
@@ -216,6 +217,13 @@ export default function LabelPage({
 
   async function handleCleanupMedia() {
     if (!activeProject) {
+      return;
+    }
+    if (
+      !window.confirm(
+        "Cleanup removes superseded slices and unreferenced media files for this project. Continue?",
+      )
+    ) {
       return;
     }
 
@@ -370,9 +378,11 @@ export default function LabelPage({
     onHeaderActionsChange(
       activeProject ? (
         <>
-          <button type="button" onClick={() => void handleCleanupMedia()} disabled={isCleaningMedia}>
-            {isCleaningMedia ? "Cleaning media..." : "Cleanup Media"}
-          </button>
+          {showDangerousDevActions ? (
+            <button type="button" onClick={() => void handleCleanupMedia()} disabled={isCleaningMedia}>
+              {isCleaningMedia ? "Cleaning media..." : "Cleanup Media"}
+            </button>
+          ) : null}
           <button className="primary-button" type="button" onClick={() => void handleRunExport()} disabled={isRunningExport}>
             {isRunningExport ? "Running export..." : "Run Export"}
           </button>
@@ -383,7 +393,7 @@ export default function LabelPage({
     return () => {
       onHeaderActionsChange(null);
     };
-  }, [activeProject, isCleaningMedia, isRunningExport, onHeaderActionsChange]);
+  }, [activeProject, isCleaningMedia, isRunningExport, onHeaderActionsChange, showDangerousDevActions]);
 
   return (
     <ErrorBoundary

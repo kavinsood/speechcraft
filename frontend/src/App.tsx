@@ -139,7 +139,7 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
 }
 
 export default function App() {
-  if (window.location.pathname === "/backend-test") {
+  if (window.location.pathname === "/backend-test" && import.meta.env.DEV) {
     return <BackendTestPage />;
   }
 
