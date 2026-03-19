@@ -13,6 +13,8 @@ from app.models import (
     AudioVariantRunRequest,
     SliceEdlUpdate,
     SliceSplitRequest,
+    SliceStatusUpdate,
+    SliceTranscriptUpdate,
     SourceRecording,
 )
 from app.repository import SQLiteRepository
@@ -247,3 +249,15 @@ class RepositoryMediaTests(TestCase):
 
         self.assertEqual(len(source_recordings), 2)
         self.assertEqual({recording.batch_id for recording in source_recordings}, {"project-a", "project-b"})
+
+    def test_blank_modified_transcript_stays_blank_for_export(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        self.repository.update_slice_status(initial.id, SliceStatusUpdate(status="accepted"))
+        preview_before = self.repository.get_export_preview("phase1-demo")
+        self.assertTrue(any(f"{initial.id}.wav|" in line for line in preview_before.lines))
+
+        self.repository.update_slice_transcript(initial.id, SliceTranscriptUpdate(modified_text=""))
+        preview_after = self.repository.get_export_preview("phase1-demo")
+
+        self.assertFalse(any(f"{initial.id}.wav|" in line for line in preview_after.lines))

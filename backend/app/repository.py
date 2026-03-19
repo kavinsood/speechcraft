@@ -1161,7 +1161,7 @@ class SQLiteRepository:
     def _transcript_text(self, transcript: Transcript | None) -> str:
         if transcript is None:
             return ""
-        return transcript.modified_text or transcript.original_text
+        return transcript.modified_text if transcript.modified_text is not None else transcript.original_text
 
     def _speaker_name(self, slice_row: Slice) -> str:
         return str(self._slice_metadata(slice_row).get("speaker_name", "speaker_a"))
