@@ -1321,68 +1321,6 @@ button:disabled {
   gap: 0.55rem;
 }
 
-.backend-test-layout {
-  display: grid;
-  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
-  gap: 1rem;
-}
-
-.backend-test-summary,
-.backend-test-log {
-  padding: 1rem;
-}
-
-.backend-test-meta {
-  margin: 0;
-}
-
-.backend-test-meta div {
-  margin-bottom: 0.8rem;
-}
-
-.backend-test-meta dt {
-  font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: #6b7267;
-}
-
-.backend-test-meta dd {
-  margin: 0.15rem 0 0;
-  word-break: break-word;
-}
-
-.test-log-list {
-  display: grid;
-  gap: 0.75rem;
-}
-
-.test-log-card {
-  padding: 0.85rem;
-  border-radius: 1rem;
-  border: 1px solid rgba(97, 91, 74, 0.1);
-  background: rgba(244, 240, 231, 0.9);
-}
-
-.test-log-card pre {
-  margin: 0.55rem 0 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-  font-size: 0.79rem;
-  color: #223036;
-}
-
-.test-log-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.log-error {
-  border-color: rgba(201, 95, 68, 0.28);
-}
-
 .manifest-path {
   margin: 0;
   font-size: 0.82rem;
@@ -1492,11 +1430,6 @@ button:disabled {
   .resolve-dock-items {
     grid-template-columns: 1fr 1fr;
   }
-
-  .backend-test-layout {
-    grid-template-columns: 1fr;
-  }
-
   .clip-list {
     max-height: 18rem;
   }

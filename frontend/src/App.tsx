@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Settings2 } from "lucide-react";
 import { ApiError, fetchProjects } from "./api";
-import BackendTestPage from "./BackendTestPage";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
 import StepPlaceholderPage from "./pages/StepPlaceholderPage";
@@ -139,10 +138,6 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
 }
 
 export default function App() {
-  if (window.location.pathname === "/backend-test" && import.meta.env.DEV) {
-    return <BackendTestPage />;
-  }
-
   const [route, setRoute] = useState<AppRoute>(() => readRouteFromLocation());
   const [projectLoadStatus, setProjectLoadStatus] = useState<ProjectLoadStatus>("loading");
   const [projectLoadError, setProjectLoadError] = useState<string | null>(null);
