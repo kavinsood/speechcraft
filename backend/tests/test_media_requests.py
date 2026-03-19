@@ -1,7 +1,7 @@
 from tests.http_support import LiveServerTestCase
 
 
-class MediaRouteTests(LiveServerTestCase):
+class MediaRequestTests(LiveServerTestCase):
     def test_variant_media_route_serves_audio_file(self) -> None:
         slices = self.client.get("/api/projects/phase1-demo/slices").json()
         detail = self.client.get(f"/api/slices/{slices[0]['id']}").json()

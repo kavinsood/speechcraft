@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -12,7 +13,7 @@ import httpx
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-PYTHON_BIN = BACKEND_ROOT / ".venv" / "bin" / "python"
+SERVER_STARTUP_TIMEOUT_SECONDS = 20
 
 
 def _find_free_port() -> int:
@@ -23,12 +24,25 @@ def _find_free_port() -> int:
 
 class LiveServerTestCase(unittest.TestCase):
     @classmethod
+    def _read_server_log(cls) -> str:
+        if getattr(cls, "_server_log_path", None) is None:
+            return ""
+        try:
+            if getattr(cls, "_server_log_handle", None) is not None:
+                cls._server_log_handle.flush()
+            return cls._server_log_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+
+    @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls._tempdir = tempfile.TemporaryDirectory()
         root = Path(cls._tempdir.name)
         cls._port = _find_free_port()
         cls.base_url = f"http://127.0.0.1:{cls._port}"
+        cls._server_log_path = root / "uvicorn.log"
+        cls._server_log_handle = cls._server_log_path.open("w+", encoding="utf-8", buffering=1)
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str(BACKEND_ROOT)
@@ -39,7 +53,7 @@ class LiveServerTestCase(unittest.TestCase):
 
         cls._server = subprocess.Popen(
             [
-                str(PYTHON_BIN),
+                sys.executable,
                 "-m",
                 "uvicorn",
                 "app.main:app",
@@ -50,17 +64,19 @@ class LiveServerTestCase(unittest.TestCase):
             ],
             cwd=BACKEND_ROOT,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=cls._server_log_handle,
+            stderr=subprocess.STDOUT,
             text=True,
         )
 
-        deadline = time.time() + 20
+        deadline = time.time() + SERVER_STARTUP_TIMEOUT_SECONDS
         last_error: Exception | None = None
         while time.time() < deadline:
             if cls._server.poll() is not None:
-                stderr = cls._server.stderr.read() if cls._server.stderr is not None else ""
-                raise RuntimeError(f"uvicorn exited during test startup:\n{stderr}")
+                raise RuntimeError(
+                    "uvicorn exited during test startup:\n"
+                    f"{cls._read_server_log() or '<no server output>'}"
+                )
             try:
                 with httpx.Client(base_url=cls.base_url, timeout=1.0) as client:
                     response = client.get("/healthz")
@@ -76,7 +92,10 @@ class LiveServerTestCase(unittest.TestCase):
         except subprocess.TimeoutExpired:
             cls._server.kill()
             cls._server.wait(timeout=5)
-        raise RuntimeError(f"Timed out waiting for test server startup: {last_error}")
+        raise RuntimeError(
+            "Timed out waiting for test server startup: "
+            f"{last_error}\n{cls._read_server_log() or '<no server output>'}"
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -89,6 +108,8 @@ class LiveServerTestCase(unittest.TestCase):
                     cls._server.kill()
                     cls._server.wait(timeout=5)
         finally:
+            if getattr(cls, "_server_log_handle", None) is not None:
+                cls._server_log_handle.close()
             if getattr(cls, "_tempdir", None) is not None:
                 cls._tempdir.cleanup()
         super().tearDownClass()
