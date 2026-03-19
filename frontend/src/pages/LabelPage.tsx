@@ -294,20 +294,24 @@ export default function LabelPage({
   }
 
   async function splitClipMutation(clipId: string, splitAtSeconds: number): Promise<Slice[]> {
+    const existingIds = new Set(slices.map((slice) => slice.id));
     const nextSlices = await splitClip(clipId, splitAtSeconds);
     setSlices(nextSlices);
     const sorted = sortClipsForQueue(nextSlices);
     setVisibleQueueClipIds(sorted.map((slice) => slice.id));
-    setActiveClipId(sorted[0]?.id ?? null);
+    const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
+    setActiveClipId(nextActiveClip?.id ?? null);
     return nextSlices;
   }
 
   async function mergeNextClipMutation(clipId: string): Promise<Slice[]> {
+    const existingIds = new Set(slices.map((slice) => slice.id));
     const nextSlices = await mergeWithNextClip(clipId);
     setSlices(nextSlices);
     const sorted = sortClipsForQueue(nextSlices);
     setVisibleQueueClipIds(sorted.map((slice) => slice.id));
-    setActiveClipId(sorted[0]?.id ?? null);
+    const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
+    setActiveClipId(nextActiveClip?.id ?? null);
     return nextSlices;
   }
 
