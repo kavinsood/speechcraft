@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -551,19 +552,17 @@ class SQLiteRepository:
     def get_clip_audio_bytes(self, slice_id: str) -> bytes:
         with self._session() as session:
             slice_row = self._get_loaded_slice(session, slice_id)
-            active_variant = slice_row.active_variant
-            if active_variant is None:
-                return self._render_synthetic_wave_bytes(48000, 1, 2.0, slice_id)
-            try:
-                audio_path = self._materialize_variant_media(
-                    session,
-                    active_variant,
-                    slice_row.source_recording.num_channels if slice_row.source_recording is not None else None,
-                    persist=True,
-                )
-            except FileNotFoundError as exc:
-                raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
-            return self._apply_edl_to_wav_bytes(audio_path.read_bytes(), self._collect_edl_operations(session, slice_row))
+            return self._render_slice_audio_bytes(session, slice_row)
+
+    def get_slice_media_path(self, slice_id: str) -> Path:
+        with self._session() as session:
+            slice_row = self._get_loaded_slice(session, slice_id)
+            audio_bytes = self._render_slice_audio_bytes(session, slice_row)
+            target_path = self._slice_render_cache_path(slice_row)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if not target_path.exists():
+                target_path.write_bytes(audio_bytes)
+            return target_path
 
     def get_variant_media_path(self, variant_id: str) -> Path:
         with self._session() as session:
@@ -1364,6 +1363,33 @@ class SQLiteRepository:
             raise ValueError(
                 f"Audio asset sample-count mismatch: expected {expected_num_samples}, got {frames}"
             )
+
+    def _render_slice_audio_bytes(self, session: Session, slice_row: Slice) -> bytes:
+        active_variant = slice_row.active_variant
+        if active_variant is None:
+            return self._render_synthetic_wave_bytes(48000, 1, 2.0, slice_row.id)
+        try:
+            audio_path = self._materialize_variant_media(
+                session,
+                active_variant,
+                slice_row.source_recording.num_channels if slice_row.source_recording is not None else None,
+                persist=True,
+            )
+        except FileNotFoundError as exc:
+            raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
+        return self._apply_edl_to_wav_bytes(audio_path.read_bytes(), self._collect_edl_operations(session, slice_row))
+
+    def _slice_render_cache_path(self, slice_row: Slice) -> Path:
+        state_key = json.dumps(
+            {
+                "slice_id": slice_row.id,
+                "active_variant_id": slice_row.active_variant_id,
+                "active_commit_id": slice_row.active_commit_id,
+            },
+            sort_keys=True,
+        )
+        fingerprint = hashlib.sha1(state_key.encode("utf-8")).hexdigest()[:12]
+        return (self.media_root / "slices" / f"slice-{fingerprint}.wav").resolve()
 
     def _ingest_variant_asset(self, path: Path, variant_id: str) -> Path:
         source_path = path.expanduser().resolve()

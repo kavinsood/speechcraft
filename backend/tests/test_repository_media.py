@@ -1,3 +1,4 @@
+import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -6,6 +7,11 @@ from sqlmodel import Session, select
 
 from app.models import ActiveVariantUpdate, AudioVariant, AudioVariantRunRequest, SliceEdlUpdate, SliceSplitRequest
 from app.repository import SQLiteRepository
+
+
+def read_wav_duration_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav_file:
+        return wav_file.getnframes() / wav_file.getframerate()
 
 
 class RepositoryMediaTests(TestCase):
@@ -34,6 +40,28 @@ class RepositoryMediaTests(TestCase):
         )
 
         self.assertAlmostEqual(updated.duration_seconds, round(initial.duration_seconds + 0.2, 2), places=2)
+
+    def test_slice_media_path_reflects_edl_audio(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        updated = self.repository.append_edl_operation(
+            initial.id,
+            SliceEdlUpdate(
+                op="insert_silence",
+                range={"start_seconds": 0.1, "end_seconds": 0.1},
+                duration_seconds=0.2,
+            ),
+        )
+
+        self.assertIsNotNone(updated.active_variant_id)
+        rendered_path = self.repository.get_slice_media_path(initial.id)
+        raw_variant_path = self.repository.get_variant_media_path(updated.active_variant_id)
+
+        rendered_duration = read_wav_duration_seconds(rendered_path)
+        raw_variant_duration = read_wav_duration_seconds(raw_variant_path)
+
+        self.assertAlmostEqual(rendered_duration, updated.duration_seconds, places=2)
+        self.assertAlmostEqual(raw_variant_duration, initial.duration_seconds, places=2)
+        self.assertGreater(rendered_duration, raw_variant_duration)
 
     def test_cleanup_project_media_removes_superseded_slices_and_unused_variants(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]

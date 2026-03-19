@@ -2,7 +2,7 @@ import { startTransition, useEffect, useMemo, useRef, useState, type ReactNode }
 import {
   ApiError,
   appendClipEdlOperation,
-  buildVariantAudioUrl,
+  buildSliceAudioUrl,
   cleanupProjectMedia,
   fetchProjectExports,
   fetchProjectSlices,
@@ -157,11 +157,12 @@ export default function LabelPage({
   }, [slices, activeClipId, visibleQueueClipIds]);
 
   const activeClipAudioUrl = useMemo(() => {
-    if (!activeClip?.active_variant_id) {
+    if (!activeClip) {
       return null;
     }
-    return buildVariantAudioUrl(activeClip.active_variant_id);
-  }, [activeClip?.active_variant_id]);
+    const revision = `${activeClip.active_variant_id ?? "no-variant"}:${activeClip.active_commit_id ?? "base"}`;
+    return buildSliceAudioUrl(activeClip.id, revision);
+  }, [activeClip]);
 
   function handleClipSelect(nextClipId: string) {
     startTransition(() => {

@@ -230,6 +230,19 @@ def get_variant_media(variant_id: str) -> FileResponse:
     return FileResponse(path=path, media_type="audio/wav")
 
 
+@app.get("/media/slices/{slice_id}.wav")
+def get_slice_media(slice_id: str) -> FileResponse:
+    try:
+        path = repository.get_slice_media_path(slice_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
 @app.post("/api/import-batches", response_model=ImportBatch)
 def create_import_batch(payload: ImportBatchCreate) -> ImportBatch:
     return repository.create_import_batch(payload)

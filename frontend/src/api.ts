@@ -50,6 +50,14 @@ export function buildVariantAudioUrl(variantId: string): string {
   return `${API_BASE}/media/variants/${variantId}.wav`;
 }
 
+export function buildSliceAudioUrl(sliceId: string, revision?: string): string {
+  const url = new URL(`${API_BASE}/media/slices/${sliceId}.wav`);
+  if (revision) {
+    url.searchParams.set("rev", revision);
+  }
+  return url.toString();
+}
+
 export async function fetchHealthStrict(): Promise<{ status: string }> {
   const response = await fetch(`${API_BASE}/healthz`);
   return await parseJson<{ status: string }>(response);

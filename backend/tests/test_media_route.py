@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from fastapi.responses import FileResponse
 
-from app.main import get_variant_media
+from app.main import get_slice_media, get_variant_media
 
 
 def write_test_wav(path: Path) -> None:
@@ -25,6 +25,18 @@ class MediaRouteTests(TestCase):
 
             with patch("app.main.repository.get_variant_media_path", return_value=path):
                 response = get_variant_media("variant-test")
+
+            self.assertIsInstance(response, FileResponse)
+            self.assertEqual(Path(response.path), path)
+            self.assertEqual(response.media_type, "audio/wav")
+
+    def test_slice_media_route_returns_file_response(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "slice-test.wav"
+            write_test_wav(path)
+
+            with patch("app.main.repository.get_slice_media_path", return_value=path):
+                response = get_slice_media("slice-test")
 
             self.assertIsInstance(response, FileResponse)
             self.assertEqual(Path(response.path), path)
