@@ -5,7 +5,14 @@ from unittest import TestCase
 
 from sqlmodel import Session, select
 
-from app.models import ActiveVariantUpdate, AudioVariant, AudioVariantRunRequest, SliceEdlUpdate, SliceSplitRequest
+from app.models import (
+    ActiveVariantUpdate,
+    AudioVariant,
+    AudioVariantCreate,
+    AudioVariantRunRequest,
+    SliceEdlUpdate,
+    SliceSplitRequest,
+)
 from app.repository import SQLiteRepository
 
 
@@ -123,3 +130,29 @@ class RepositoryMediaTests(TestCase):
             with Session(self.repository.engine, expire_on_commit=False) as session:
                 updated_variant = session.get(AudioVariant, variant_id)
                 self.assertEqual(updated_variant.file_path, str(materialized_path))
+
+    def test_create_audio_variant_ignores_client_supplied_id(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        self.assertIsNotNone(initial.active_variant)
+
+        updated = self.repository.create_audio_variant(
+            initial.id,
+            AudioVariantCreate(
+                id="../../escape-test",
+                file_path=initial.active_variant.file_path,
+                sample_rate=initial.active_variant.sample_rate,
+                num_samples=initial.active_variant.num_samples,
+                generator_model="manual-copy",
+            ),
+        )
+
+        self.assertIsNotNone(updated.active_variant_id)
+        self.assertNotEqual(updated.active_variant_id, "../../escape-test")
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            variant = session.get(AudioVariant, updated.active_variant_id)
+            self.assertIsNotNone(variant)
+            variant_path = Path(variant.file_path).resolve()
+
+        self.assertTrue(variant_path.is_relative_to(self.repository.media_root.resolve()))
+        self.assertEqual(variant_path.name, f"{updated.active_variant_id}.wav")

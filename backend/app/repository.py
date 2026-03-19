@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import math
+import re
 import shutil
 import wave
 from dataclasses import dataclass, field
@@ -683,9 +684,10 @@ class SQLiteRepository:
             slice_row = self._get_slice(session, slice_id)
             recording = self._get_source_recording(session, slice_row.source_recording_id)
             self._validate_audio_asset(Path(payload.file_path), payload.sample_rate, recording.num_channels, payload.num_samples)
-            managed_variant_path = self._ingest_variant_asset(Path(payload.file_path), payload.id)
+            variant_id = self._new_id("variant")
+            managed_variant_path = self._ingest_variant_asset(Path(payload.file_path), variant_id)
             variant = AudioVariant(
-                id=payload.id,
+                id=variant_id,
                 slice_id=slice_row.id,
                 file_path=str(managed_variant_path),
                 is_original=False,
@@ -722,7 +724,7 @@ class SQLiteRepository:
             except FileNotFoundError as exc:
                 raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
             variant_id = self._new_id("variant")
-            target_path = self.media_root / "variants" / f"{variant_id}.wav"
+            target_path = self._managed_variant_path(variant_id)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source_path, target_path)
             variant = AudioVariant(
@@ -1389,13 +1391,28 @@ class SQLiteRepository:
             sort_keys=True,
         )
         fingerprint = hashlib.sha1(state_key.encode("utf-8")).hexdigest()[:12]
-        return (self.media_root / "slices" / f"slice-{fingerprint}.wav").resolve()
+        return self._managed_media_path("slices", f"slice-{fingerprint}")
+
+    def _validate_managed_media_id(self, identifier: str) -> str:
+        normalized = identifier.strip()
+        if not normalized:
+            raise ValueError("Managed media identifier cannot be empty")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", normalized) is None:
+            raise ValueError(f"Managed media identifier contains unsafe characters: {identifier}")
+        return normalized
+
+    def _managed_media_path(self, category: str, identifier: str) -> Path:
+        safe_identifier = self._validate_managed_media_id(identifier)
+        return (self.media_root / category / f"{safe_identifier}.wav").resolve()
+
+    def _managed_variant_path(self, variant_id: str) -> Path:
+        return self._managed_media_path("variants", variant_id)
 
     def _ingest_variant_asset(self, path: Path, variant_id: str) -> Path:
         source_path = path.expanduser().resolve()
         if not source_path.exists():
             raise ValueError(f"Audio asset not found: {source_path}")
-        target_path = (self.media_root / "variants" / f"{variant_id}.wav").resolve()
+        target_path = self._managed_variant_path(variant_id)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if source_path != target_path:
             shutil.copyfile(source_path, target_path)

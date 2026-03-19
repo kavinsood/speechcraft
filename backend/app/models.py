@@ -344,7 +344,7 @@ class SlicerHandoffRequest(SQLModel):
 
 
 class AudioVariantCreate(SQLModel):
-    id: str
+    id: str | None = None
     file_path: str
     sample_rate: int
     num_samples: int
