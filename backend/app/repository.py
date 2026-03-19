@@ -208,6 +208,14 @@ class SQLiteRepository:
                 or next_status != slice_row.status
             )
             if not state_changed and not payload.is_milestone:
+                message_only_request = (
+                    payload.message is not None
+                    and payload.modified_text is None
+                    and payload.tags is None
+                    and payload.status is None
+                )
+                if message_only_request:
+                    raise SliceSaveValidationError("message requires milestone or state change")
                 return self._get_slice_detail(session, slice_id)
 
             if payload.modified_text is not None:
@@ -960,7 +968,7 @@ class SQLiteRepository:
                         commit.message = baseline_message
                         commit_changed = True
                     if commit_changed:
-                        if legacy_snapshot_commit and not commit.status:
+                        if legacy_snapshot_commit:
                             commit.status = slice_row.status
                         session.add(commit)
                         changed = True

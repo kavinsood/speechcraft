@@ -12,7 +12,9 @@ from app.models import (
     AudioVariantCreate,
     AudioVariantRunRequest,
     EditCommit,
+    ReviewStatus,
     SliceEdlUpdate,
+    SliceSaveRequest,
     SliceSplitRequest,
     SliceStatusUpdate,
     SliceTagUpdate,
@@ -20,7 +22,7 @@ from app.models import (
     SourceRecording,
     TagPayload,
 )
-from app.repository import SQLiteRepository
+from app.repository import SQLiteRepository, SliceSaveValidationError
 
 
 def read_wav_duration_seconds(path: Path) -> float:
@@ -411,6 +413,57 @@ class RepositoryMediaTests(TestCase):
             self.assertEqual(blank_commit.transcript_text, "")
             self.assertEqual(empty_tags_commit.tags_payload, [])
 
+    def test_legacy_revision_migration_backfills_only_legacy_rows(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        self.repository.update_slice_status(initial.id, SliceStatusUpdate(status="accepted"))
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            commit = session.exec(
+                select(EditCommit).where(EditCommit.slice_id == initial.id).order_by(EditCommit.created_at)
+            ).first()
+            self.assertIsNotNone(commit)
+            commit.transcript_text = ""
+            commit.tags_payload = []
+            commit.status = ReviewStatus.UNRESOLVED
+            commit.active_variant_id_snapshot = None
+            commit.message = None
+            session.add(commit)
+            session.commit()
+
+        with self.repository.engine.begin() as connection:
+            connection.exec_driver_sql("PRAGMA user_version = 0")
+
+        restarted = SQLiteRepository(
+            db_path=Path(self.temp_dir.name) / "project.db",
+            legacy_seed_path=Path(self.temp_dir.name) / "missing-seed.json",
+            media_root=Path(self.temp_dir.name) / "media",
+            exports_root=Path(self.temp_dir.name) / "exports",
+        )
+
+        with Session(restarted.engine, expire_on_commit=False) as session:
+            commit = session.exec(
+                select(EditCommit).where(EditCommit.slice_id == initial.id).order_by(EditCommit.created_at)
+            ).first()
+            self.assertEqual(commit.transcript_text, "The workstation should make this painless.")
+            self.assertEqual(commit.tags_payload, [])
+            self.assertEqual(commit.status, ReviewStatus.ACCEPTED)
+            self.assertEqual(commit.active_variant_id_snapshot, initial.active_variant_id)
+            self.assertEqual(commit.message, "Imported slice baseline")
+
+        restarted_again = SQLiteRepository(
+            db_path=Path(self.temp_dir.name) / "project.db",
+            legacy_seed_path=Path(self.temp_dir.name) / "missing-seed.json",
+            media_root=Path(self.temp_dir.name) / "media",
+            exports_root=Path(self.temp_dir.name) / "exports",
+        )
+
+        with Session(restarted_again.engine, expire_on_commit=False) as session:
+            commit = session.exec(
+                select(EditCommit).where(EditCommit.slice_id == initial.id).order_by(EditCommit.created_at)
+            ).first()
+            self.assertEqual(commit.status, ReviewStatus.ACCEPTED)
+            self.assertEqual(commit.message, "Imported slice baseline")
+
     def test_cleanup_preserves_variants_referenced_by_surviving_revisions(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
         original_variant_id = initial.active_variant_id
@@ -434,3 +487,61 @@ class RepositoryMediaTests(TestCase):
         self.assertIsNotNone(restored.active_variant)
         self.assertTrue(self.repository.get_variant_media_path(generated_variant_id).exists())
 
+    def test_save_slice_state_skips_no_op_non_milestone_revision(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            before_count = len(
+                session.exec(select(EditCommit).where(EditCommit.slice_id == initial.id)).all()
+            )
+
+        self.repository.save_slice_state(initial.id, SliceSaveRequest())
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            after_count = len(
+                session.exec(select(EditCommit).where(EditCommit.slice_id == initial.id)).all()
+            )
+
+        self.assertEqual(after_count, before_count)
+
+    def test_save_slice_state_rejects_no_op_message_without_milestone(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            before_count = len(
+                session.exec(select(EditCommit).where(EditCommit.slice_id == initial.id)).all()
+            )
+
+        with self.assertRaisesRegex(SliceSaveValidationError, "message requires milestone or state change"):
+            self.repository.save_slice_state(initial.id, SliceSaveRequest(message="note only"))
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            after_count = len(
+                session.exec(select(EditCommit).where(EditCommit.slice_id == initial.id)).all()
+            )
+
+        self.assertEqual(after_count, before_count)
+
+    def test_save_slice_state_allows_no_op_milestone_with_message(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            before_commits = session.exec(
+                select(EditCommit).where(EditCommit.slice_id == initial.id).order_by(EditCommit.created_at)
+            ).all()
+
+        saved = self.repository.save_slice_state(
+            initial.id,
+            SliceSaveRequest(message="Saved slice milestone", is_milestone=True),
+        )
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            after_commits = session.exec(
+                select(EditCommit).where(EditCommit.slice_id == initial.id).order_by(EditCommit.created_at)
+            ).all()
+
+        self.assertEqual(len(after_commits), len(before_commits) + 1)
+        latest_commit = after_commits[-1]
+        self.assertEqual(saved.active_commit_id, latest_commit.id)
+        self.assertEqual(latest_commit.message, "Saved slice milestone")
+        self.assertTrue(latest_commit.is_milestone)
