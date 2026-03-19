@@ -127,7 +127,7 @@ class SQLiteRepository:
     def cleanup_project_media(self, project_id: str) -> MediaCleanupResult:
         with self._session() as session:
             self._get_batch(session, project_id)
-            referenced_variant_ids = set(session.exec(select(ReferenceAsset.audio_variant_id)).all())
+            protected_variant_ids = set(session.exec(select(ReferenceAsset.audio_variant_id)).all())
             deleted_slice_ids: list[str] = []
             deleted_variant_ids: list[str] = []
             deleted_paths: list[str] = []
@@ -140,7 +140,7 @@ class SQLiteRepository:
             ]
             for slice_row in superseded_slices:
                 variant_ids = {variant.id for variant in slice_row.variants}
-                referenced_ids = variant_ids & referenced_variant_ids
+                referenced_ids = variant_ids & protected_variant_ids
                 if referenced_ids:
                     skipped_reference_count += len(referenced_ids)
                     continue
@@ -160,9 +160,13 @@ class SQLiteRepository:
             session.flush()
 
             remaining_slices = self._get_all_batch_slices(session, project_id)
+            protected_variant_ids |= self._get_revision_referenced_variant_ids(
+                session,
+                [slice_row.id for slice_row in remaining_slices],
+            )
             for slice_row in remaining_slices:
                 for variant in list(slice_row.variants):
-                    if variant.id in referenced_variant_ids:
+                    if variant.id in protected_variant_ids:
                         continue
                     if variant.id == slice_row.active_variant_id or variant.is_original:
                         continue
@@ -173,6 +177,7 @@ class SQLiteRepository:
             session.commit()
 
         deleted_file_count = self._delete_unreferenced_media_files(deleted_paths)
+        deleted_file_count += self._prune_derived_media_cache()
         return MediaCleanupResult(
             project_id=project_id,
             deleted_slice_count=len(deleted_slice_ids),

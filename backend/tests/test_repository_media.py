@@ -11,11 +11,14 @@ from app.models import (
     AudioVariant,
     AudioVariantCreate,
     AudioVariantRunRequest,
+    EditCommit,
     SliceEdlUpdate,
     SliceSplitRequest,
     SliceStatusUpdate,
+    SliceTagUpdate,
     SliceTranscriptUpdate,
     SourceRecording,
+    TagPayload,
 )
 from app.repository import SQLiteRepository
 
@@ -263,3 +266,171 @@ class RepositoryMediaTests(TestCase):
         preview_after = self.repository.get_export_preview("phase1-demo")
 
         self.assertFalse(any(f"{initial.id}.wav|" in line for line in preview_after.lines))
+
+    def test_undo_redo_restores_metadata_history(self) -> None:
+        initial = self.repository.get_slice_detail(self.repository.get_project_slices("phase1-demo")[0].id)
+        original_text = initial.transcript.original_text if initial.transcript is not None else ""
+
+        updated_transcript = self.repository.update_slice_transcript(
+            initial.id,
+            SliceTranscriptUpdate(modified_text="Corrected transcript text"),
+        )
+        updated_tags = self.repository.update_slice_tags(
+            initial.id,
+            SliceTagUpdate(tags=[TagPayload(name="qa-pass", color="#336699")]),
+        )
+        updated_status = self.repository.update_slice_status(
+            initial.id,
+            SliceStatusUpdate(status="accepted"),
+        )
+
+        self.assertEqual(updated_transcript.transcript.modified_text, "Corrected transcript text")
+        self.assertEqual([tag.name for tag in updated_tags.tags], ["qa-pass"])
+        self.assertEqual(updated_status.status, "accepted")
+
+        undo_status = self.repository.undo_slice(initial.id)
+        self.assertEqual(undo_status.status, "unresolved")
+        self.assertEqual([tag.name for tag in undo_status.tags], ["qa-pass"])
+        self.assertEqual(undo_status.transcript.modified_text, "Corrected transcript text")
+
+        undo_tags = self.repository.undo_slice(initial.id)
+        self.assertEqual(undo_tags.tags, [])
+        self.assertEqual(undo_tags.transcript.modified_text, "Corrected transcript text")
+
+        undo_transcript = self.repository.undo_slice(initial.id)
+        self.assertEqual(undo_transcript.transcript.modified_text, None)
+        self.assertEqual(undo_transcript.transcript.original_text, original_text)
+
+        redo_transcript = self.repository.redo_slice(initial.id)
+        self.assertEqual(redo_transcript.transcript.modified_text, "Corrected transcript text")
+
+        redo_tags = self.repository.redo_slice(initial.id)
+        self.assertEqual([tag.name for tag in redo_tags.tags], ["qa-pass"])
+
+        redo_status = self.repository.redo_slice(initial.id)
+        self.assertEqual(redo_status.status, "accepted")
+
+    def test_metadata_only_revisions_reuse_audio_cache_and_public_models_hide_paths(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        self.repository.get_waveform_peaks(initial.id, 960)
+        media_before = self.repository.get_slice_media_path(initial.id)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            slice_row_before = self.repository._get_loaded_slice(session, initial.id)
+            peaks_before = self.repository._waveform_peaks_cache_path(slice_row_before, 960)
+
+        updated = self.repository.update_slice_transcript(
+            initial.id,
+            SliceTranscriptUpdate(modified_text="Metadata-only update"),
+        )
+        media_after = self.repository.get_slice_media_path(initial.id)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            slice_row_after = self.repository._get_loaded_slice(session, initial.id)
+            peaks_after = self.repository._waveform_peaks_cache_path(slice_row_after, 960)
+
+        self.assertEqual(media_before, media_after)
+        self.assertEqual(peaks_before, peaks_after)
+        self.assertTrue(peaks_after.exists())
+
+        summary_payload = initial.model_dump(mode="json")
+        detail_payload = updated.model_dump(mode="json")
+        self.assertNotIn("variants", summary_payload)
+        self.assertNotIn("alignment_data", summary_payload["transcript"])
+        self.assertNotIn("file_path", json.dumps(summary_payload))
+        self.assertNotIn("file_path", json.dumps(detail_payload))
+
+    def test_cleanup_project_media_prunes_stale_slice_and_peak_caches(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        self.repository.get_waveform_peaks(initial.id, 960)
+        old_media_path = self.repository.get_slice_media_path(initial.id)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            old_slice_row = self.repository._get_loaded_slice(session, initial.id)
+            old_peaks_path = self.repository._waveform_peaks_cache_path(old_slice_row, 960)
+
+        updated = self.repository.append_edl_operation(
+            initial.id,
+            SliceEdlUpdate(
+                op="insert_silence",
+                range={"start_seconds": 0.1, "end_seconds": 0.1},
+                duration_seconds=0.2,
+            ),
+        )
+        new_media_path = self.repository.get_slice_media_path(initial.id)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            new_slice_row = self.repository._get_loaded_slice(session, initial.id)
+            new_peaks_path = self.repository._waveform_peaks_cache_path(new_slice_row, 960)
+
+        self.assertNotEqual(old_media_path, new_media_path)
+        self.assertTrue(new_media_path.exists())
+        self.assertTrue(new_peaks_path.exists())
+
+        result = self.repository.cleanup_project_media("phase1-demo")
+
+        self.assertGreaterEqual(result.deleted_file_count, 2)
+        self.assertFalse(old_media_path.exists())
+        self.assertFalse(old_peaks_path.exists())
+        self.assertTrue(new_media_path.exists())
+        self.assertTrue(new_peaks_path.exists())
+
+    def test_restart_does_not_rewrite_intentional_blank_revision_history(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        self.repository.update_slice_transcript(initial.id, SliceTranscriptUpdate(modified_text=""))
+        self.repository.update_slice_transcript(initial.id, SliceTranscriptUpdate(modified_text="nonblank now"))
+        self.repository.update_slice_tags(initial.id, SliceTagUpdate(tags=[]))
+        self.repository.update_slice_tags(
+            initial.id,
+            SliceTagUpdate(tags=[TagPayload(name="later", color="#111111")]),
+        )
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            commits = session.exec(
+                select(EditCommit).where(EditCommit.slice_id == initial.id).order_by(EditCommit.created_at)
+            ).all()
+            blank_commit = [commit for commit in commits if commit.transcript_text == ""][-1]
+            empty_tags_commit = [commit for commit in commits if commit.tags_payload == []][-1]
+            blank_id = blank_commit.id
+            empty_tags_id = empty_tags_commit.id
+
+        with self.repository.engine.begin() as connection:
+            connection.exec_driver_sql("PRAGMA user_version = 0")
+
+        restarted = SQLiteRepository(
+            db_path=Path(self.temp_dir.name) / "project.db",
+            legacy_seed_path=Path(self.temp_dir.name) / "missing-seed.json",
+            media_root=Path(self.temp_dir.name) / "media",
+            exports_root=Path(self.temp_dir.name) / "exports",
+        )
+
+        with Session(restarted.engine, expire_on_commit=False) as session:
+            blank_commit = session.get(EditCommit, blank_id)
+            empty_tags_commit = session.get(EditCommit, empty_tags_id)
+            self.assertEqual(blank_commit.transcript_text, "")
+            self.assertEqual(empty_tags_commit.tags_payload, [])
+
+    def test_cleanup_preserves_variants_referenced_by_surviving_revisions(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        original_variant_id = initial.active_variant_id
+        self.assertIsNotNone(original_variant_id)
+
+        generated = self.repository.run_audio_variant(
+            initial.id,
+            AudioVariantRunRequest(generator_model="deepfilternet"),
+        )
+        generated_variant_id = generated.active_variant_id
+        self.repository.set_active_variant(
+            initial.id,
+            ActiveVariantUpdate(active_variant_id=original_variant_id),
+        )
+
+        result = self.repository.cleanup_project_media("phase1-demo")
+
+        self.assertNotIn(generated_variant_id, result.deleted_variant_ids)
+        restored = self.repository.undo_slice(initial.id)
+        self.assertEqual(restored.active_variant_id, generated_variant_id)
+        self.assertIsNotNone(restored.active_variant)
+        self.assertTrue(self.repository.get_variant_media_path(generated_variant_id).exists())
+
