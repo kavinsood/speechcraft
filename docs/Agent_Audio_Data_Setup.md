@@ -1,82 +1,63 @@
 # Agent Audio Data Setup
 
-This repo expects real imported project audio to live in a stable repo-owned location, not in `/tmp`.
+This repo now stores managed runtime media under `backend/data/media/`, not `backend/media/`.
 
-## Canonical Location
+## Canonical Runtime Layout
 
-Put restored source media under:
+The managed media root is:
 
-- `backend/media/`
+- `backend/data/media/`
 
-Keep the recovered archive directory structure intact underneath that folder. The current working layout is:
+Current subdirectories:
 
-- `backend/media/Charactors/EmmaWatson/voxCPM/raw/...`
-- `backend/media/Charactors/HeyBillieRae/voxCPM/audio/...`
+- `backend/data/media/sources/`
+- `backend/data/media/variants/`
+- `backend/data/media/slices/`
+- `backend/data/media/peaks/`
 
-Do not flatten or rename these subtrees unless you also rewrite every affected `audio_path` in project state.
+What each directory means:
 
-## Source Archive
+- `sources/`: managed source recordings created by demo seeding or import flows
+- `variants/`: immutable physical slice variants
+- `slices/`: cached rendered slice audio for the active slice state
+- `peaks/`: cached waveform peak JSON keyed by slice audio state and bin count
 
-The known-good archive we used was:
+## Persistence Location
 
-- `~/Downloads/speechcraft-final-machine-state.tar.gz`
+Project and slice state now lives in:
 
-That archive contains the real media needed by imported projects that otherwise render as offline.
+- `backend/data/project.db`
 
-## Extraction Rule
+Legacy JSON at `backend/data/phase1-demo.json` is only used as a one-time seed/import source when the SQLite database does not exist yet.
 
-Extract the archive contents into a stable location inside the repo, then copy or move the media subtree into:
+## Media Path Rules
 
-- `backend/media/`
-
-Do not extract to:
-
-- `/tmp/...`
-- a user-specific home directory path that is not part of the repo
-
-Those locations make the recovered project state brittle and machine-specific.
-
-## State That Must Match The Media
-
-Imported clips are resolved through `audio_path` values stored in:
-
-- `backend/data/phase1-demo.json`
-
-For imported projects, those paths must point at actual files under this repo, for example:
-
-- `/home/kavin/github/speechcraft/backend/media/Charactors/EmmaWatson/voxCPM/raw/output_004.wav_0000000000_0000173120.wav`
-- `/home/kavin/github/speechcraft/backend/media/Charactors/HeyBillieRae/voxCPM/audio/billie_000001.wav`
-
-If the files are present but `audio_path` still points somewhere else, the UI will show media-offline behavior.
-
-## Important Distinction
-
-Not every clip in `backend/data/phase1-demo.json` should have a real source file.
-
-- Imported clips should have a real `audio_path`.
-- Built-in synthetic demo clips may still have `audio_path: null`.
-
-That is expected. Do not try to backfill synthetic demo clips with archive media.
-
-## Recommended Recovery Procedure
-
-1. Ensure `backend/media/` exists.
-2. Restore the media subtree from `~/Downloads/speechcraft-final-machine-state.tar.gz` into `backend/media/`.
-3. Preserve the `Charactors/...` structure exactly as recovered.
-4. Rewrite imported clip `audio_path` entries in `backend/data/phase1-demo.json` so they point to the local repo path under `backend/media/`.
-5. Restart the backend.
-6. Open the `Label` step and verify imported clips render real waveforms instead of an offline state.
+- Do not point runtime media into `/tmp`.
+- Do not rely on client-visible absolute server paths.
+- Managed variant, slice, and peak artifacts should stay under `backend/data/media/`.
+- Source recordings should use stable local paths. Managed source assets should prefer `backend/data/media/sources/`.
 
 ## Verification Checklist
 
-- `backend/media/` exists and contains the recovered audio files.
-- Imported clip `audio_path` values resolve to real files on disk.
-- The backend can serve `/api/clips/{clip_id}/audio` for imported clips.
-- The frontend waveform loads for imported clips.
-- No restored paths point into `/tmp`.
+- `backend/data/project.db` exists after backend startup.
+- `backend/data/media/` exists with the expected subdirectories.
+- `GET /media/variants/{variant_id}.wav` serves managed variant media.
+- `GET /media/slices/{slice_id}.wav` serves edited slice media.
+- `GET /api/clips/{clip_id}/waveform-peaks` returns cached or generated peaks for the current slice audio state.
+- No managed media path points into `/tmp`.
+
+## Recovery Notes
+
+If you are restoring a machine state or import dataset:
+
+1. Put stable source recordings in a non-temporary location.
+2. Prefer copying repo-owned runtime media into `backend/data/media/`.
+3. Start the backend so SQLite can seed or migrate state.
+4. Verify that edited slice playback works through `/media/slices/{slice_id}.wav`.
+5. Verify that waveform peaks appear and that `backend/data/media/peaks/` populates.
 
 ## Operational Notes For Agents
 
-- Treat `backend/media/` as repo-owned runtime data.
-- Prefer stable absolute paths rooted in the current repo checkout when rewriting `audio_path`.
-- If a clip is imported and its file is missing, the correct behavior is media offline, not synthetic fallback.
+- Treat `backend/data/media/` as managed runtime data, not source-controlled product code.
+- Avoid changing managed file paths by hand unless you are intentionally migrating data.
+- If imported source media is missing, the correct behavior is media-offline or validation failure, not silent synthetic substitution.
