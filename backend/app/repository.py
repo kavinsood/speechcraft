@@ -777,136 +777,145 @@ class SQLiteRepository:
 
     def _seed_from_legacy_json(self, session: Session) -> None:
         legacy = json.loads(self.legacy_seed_path.read_text())
-        batch_payload = legacy["projects"]["phase1-demo"]
-        batch = ImportBatch(
-            id=batch_payload["id"],
-            name=batch_payload["name"],
-            created_at=datetime.fromisoformat(batch_payload["created_at"].replace("Z", "+00:00")),
-        )
-        session.add(batch)
-        session.flush()
+        source_recordings: dict[tuple[str, str], SourceRecording] = {}
+        projects = legacy.get("projects", {})
+        clips_by_project = legacy.get("clips_by_project", {})
+        exports_by_project = legacy.get("exports_by_project", {})
 
-        source_recordings: dict[str, SourceRecording] = {}
-        active_clips = legacy.get("clips_by_project", {}).get(batch.id, [])
-        for clip_payload in active_clips:
-            source_id = clip_payload["source_file_id"]
-            if source_id in source_recordings:
-                continue
-            source_duration = max(
-                item["original_end_time"]
-                for item in active_clips
-                if item["source_file_id"] == source_id
+        for project_id, batch_payload in projects.items():
+            batch = ImportBatch(
+                id=batch_payload["id"],
+                name=batch_payload["name"],
+                created_at=datetime.fromisoformat(batch_payload["created_at"].replace("Z", "+00:00")),
             )
-            source_path = self.media_root / "sources" / f"{source_id}.wav"
-            source_path.parent.mkdir(parents=True, exist_ok=True)
-            if not source_path.exists():
-                source_path.write_bytes(
-                    self._render_synthetic_wave_bytes(
-                        clip_payload["sample_rate"],
-                        clip_payload["channels"],
-                        max(source_duration + 1.0, 1.0),
-                        source_id,
-                    )
-                )
-            source_recording = SourceRecording(
-                id=source_id,
-                batch_id=batch.id,
-                file_path=str(source_path),
-                sample_rate=clip_payload["sample_rate"],
-                num_channels=clip_payload["channels"],
-                num_samples=max(int((source_duration + 1.0) * clip_payload["sample_rate"]), 1),
-            )
-            session.add(source_recording)
-            source_recordings[source_id] = source_recording
-
-        session.flush()
-        for clip_payload in active_clips:
-            variant_path = self.media_root / "variants" / f"{clip_payload['id']}.wav"
-            variant_path.parent.mkdir(parents=True, exist_ok=True)
-            if clip_payload.get("audio_path") and Path(clip_payload["audio_path"]).exists():
-                shutil.copyfile(Path(clip_payload["audio_path"]).expanduser(), variant_path)
-            elif not variant_path.exists():
-                variant_path.write_bytes(
-                    self._render_synthetic_wave_bytes(
-                        clip_payload["sample_rate"],
-                        clip_payload["channels"],
-                        max(clip_payload["duration_seconds"], 0.2),
-                        clip_payload["id"],
-                    )
-                )
-            variant_id = f"variant-{clip_payload['id']}"
-            transcript_id = f"transcript-{clip_payload['id']}"
-            active_commit_id = f"edit-{clip_payload['id']}" if clip_payload.get("clip_edl") else None
-            slice_row = Slice(
-                id=clip_payload["id"],
-                source_recording_id=clip_payload["source_file_id"],
-                active_variant_id=variant_id,
-                active_commit_id=active_commit_id,
-                status=self._legacy_status_to_storage(clip_payload["review_status"]),
-                model_metadata={
-                    "order_index": clip_payload["order_index"],
-                    "source_file_id": clip_payload["source_file_id"],
-                    "working_asset_id": clip_payload["working_asset_id"],
-                    "original_start_time": clip_payload["original_start_time"],
-                    "original_end_time": clip_payload["original_end_time"],
-                    "speaker_name": clip_payload["speaker_name"],
-                    "language": clip_payload["language"],
-                    "is_superseded": clip_payload["is_superseded"],
-                    "updated_at": clip_payload["updated_at"],
-                },
-                created_at=datetime.fromisoformat(clip_payload["created_at"].replace("Z", "+00:00")),
-            )
-            variant = AudioVariant(
-                id=variant_id,
-                slice_id=slice_row.id,
-                file_path=str(variant_path),
-                is_original=True,
-                generator_model="slicer",
-                sample_rate=clip_payload["sample_rate"],
-                num_samples=max(int(clip_payload["duration_seconds"] * clip_payload["sample_rate"]), 1),
-            )
-            transcript = Transcript(
-                id=transcript_id,
-                slice_id=slice_row.id,
-                original_text=clip_payload["transcript"]["text_initial"],
-                modified_text=clip_payload["transcript"]["text_current"],
-                is_modified=clip_payload["transcript"]["text_current"] != clip_payload["transcript"]["text_initial"],
-                alignment_data={
-                    "source": clip_payload["transcript"].get("source", "manual"),
-                    "confidence": clip_payload["transcript"].get("confidence"),
-                },
-                )
-            session.add(slice_row)
-            session.add(variant)
-            session.add(transcript)
-            if active_commit_id is not None:
-                session.add(
-                    EditCommit(
-                        id=active_commit_id,
-                        slice_id=slice_row.id,
-                        edl_operations=clip_payload["clip_edl"],
-                    )
-                )
+            session.add(batch)
             session.flush()
-            self._replace_slice_tags(session, slice_row, [TagPayload(**tag) for tag in clip_payload["tags"]])
-        for export_payload in legacy.get("exports_by_project", {}).get(batch.id, []):
-            session.add(
-                ExportRun(
-                    id=export_payload["id"],
-                    batch_id=batch.id,
-                    status=self._job_status_from_legacy(export_payload["status"]),
-                    output_root=export_payload["output_root"],
-                    manifest_path=export_payload["manifest_path"],
-                    accepted_clip_count=export_payload["accepted_clip_count"],
-                    failed_clip_count=export_payload["failed_clip_count"],
-                    created_at=datetime.fromisoformat(export_payload["created_at"].replace("Z", "+00:00")),
-                    completed_at=(
-                        datetime.fromisoformat(export_payload["completed_at"].replace("Z", "+00:00"))
-                        if export_payload.get("completed_at")
-                        else None
-                    ),
+
+            active_clips = clips_by_project.get(project_id, [])
+            for clip_payload in active_clips:
+                source_key = (batch.id, clip_payload["source_file_id"])
+                if source_key in source_recordings:
+                    continue
+                source_duration = max(
+                    item["original_end_time"]
+                    for item in active_clips
+                    if item["source_file_id"] == clip_payload["source_file_id"]
                 )
-            )
+                recording_id = f"source-{batch.id}-{clip_payload['source_file_id']}"
+                source_path = self._managed_media_path("sources", recording_id)
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                if not source_path.exists():
+                    source_path.write_bytes(
+                        self._render_synthetic_wave_bytes(
+                            clip_payload["sample_rate"],
+                            clip_payload["channels"],
+                            max(source_duration + 1.0, 1.0),
+                            recording_id,
+                        )
+                    )
+                source_recording = SourceRecording(
+                    id=recording_id,
+                    batch_id=batch.id,
+                    file_path=str(source_path),
+                    sample_rate=clip_payload["sample_rate"],
+                    num_channels=clip_payload["channels"],
+                    num_samples=max(int((source_duration + 1.0) * clip_payload["sample_rate"]), 1),
+                )
+                session.add(source_recording)
+                source_recordings[source_key] = source_recording
+
+            session.flush()
+            for clip_payload in active_clips:
+                variant_id = f"variant-{clip_payload['id']}"
+                transcript_id = f"transcript-{clip_payload['id']}"
+                active_commit_id = f"edit-{clip_payload['id']}" if clip_payload.get("clip_edl") else None
+                recording_id = f"source-{batch.id}-{clip_payload['source_file_id']}"
+                variant_path = self._managed_variant_path(variant_id)
+                variant_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_audio_path = Path(clip_payload["audio_path"]).expanduser() if clip_payload.get("audio_path") else None
+                if raw_audio_path is not None and raw_audio_path.exists():
+                    resolved_audio_path = raw_audio_path.resolve()
+                    if resolved_audio_path != variant_path:
+                        shutil.copyfile(resolved_audio_path, variant_path)
+                elif not variant_path.exists():
+                    variant_path.write_bytes(
+                        self._render_synthetic_wave_bytes(
+                            clip_payload["sample_rate"],
+                            clip_payload["channels"],
+                            max(clip_payload["duration_seconds"], 0.2),
+                            clip_payload["id"],
+                        )
+                    )
+                slice_row = Slice(
+                    id=clip_payload["id"],
+                    source_recording_id=recording_id,
+                    active_variant_id=variant_id,
+                    active_commit_id=active_commit_id,
+                    status=self._legacy_status_to_storage(clip_payload["review_status"]),
+                    model_metadata={
+                        "order_index": clip_payload["order_index"],
+                        "source_file_id": clip_payload["source_file_id"],
+                        "working_asset_id": clip_payload["working_asset_id"],
+                        "original_start_time": clip_payload["original_start_time"],
+                        "original_end_time": clip_payload["original_end_time"],
+                        "speaker_name": clip_payload["speaker_name"],
+                        "language": clip_payload["language"],
+                        "is_superseded": clip_payload["is_superseded"],
+                        "updated_at": clip_payload["updated_at"],
+                    },
+                    created_at=datetime.fromisoformat(clip_payload["created_at"].replace("Z", "+00:00")),
+                )
+                variant = AudioVariant(
+                    id=variant_id,
+                    slice_id=slice_row.id,
+                    file_path=str(variant_path),
+                    is_original=True,
+                    generator_model="slicer",
+                    sample_rate=clip_payload["sample_rate"],
+                    num_samples=max(int(clip_payload["duration_seconds"] * clip_payload["sample_rate"]), 1),
+                )
+                transcript = Transcript(
+                    id=transcript_id,
+                    slice_id=slice_row.id,
+                    original_text=clip_payload["transcript"]["text_initial"],
+                    modified_text=clip_payload["transcript"]["text_current"],
+                    is_modified=clip_payload["transcript"]["text_current"] != clip_payload["transcript"]["text_initial"],
+                    alignment_data={
+                        "source": clip_payload["transcript"].get("source", "manual"),
+                        "confidence": clip_payload["transcript"].get("confidence"),
+                    },
+                )
+                session.add(slice_row)
+                session.add(variant)
+                session.add(transcript)
+                if active_commit_id is not None:
+                    session.add(
+                        EditCommit(
+                            id=active_commit_id,
+                            slice_id=slice_row.id,
+                            edl_operations=clip_payload["clip_edl"],
+                        )
+                    )
+                session.flush()
+                self._replace_slice_tags(session, slice_row, [TagPayload(**tag) for tag in clip_payload["tags"]])
+            for export_payload in exports_by_project.get(batch.id, []):
+                session.add(
+                    ExportRun(
+                        id=export_payload["id"],
+                        batch_id=batch.id,
+                        status=self._job_status_from_legacy(export_payload["status"]),
+                        output_root=export_payload["output_root"],
+                        manifest_path=export_payload["manifest_path"],
+                        accepted_clip_count=export_payload["accepted_clip_count"],
+                        failed_clip_count=export_payload["failed_clip_count"],
+                        created_at=datetime.fromisoformat(export_payload["created_at"].replace("Z", "+00:00")),
+                        completed_at=(
+                            datetime.fromisoformat(export_payload["completed_at"].replace("Z", "+00:00"))
+                            if export_payload.get("completed_at")
+                            else None
+                        ),
+                    )
+                )
 
     def _seed_demo(self, session: Session) -> None:
         batch = ImportBatch(id="phase1-demo", name="Phase 1 Demo Project")

@@ -1,3 +1,4 @@
+import json
 import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,6 +13,7 @@ from app.models import (
     AudioVariantRunRequest,
     SliceEdlUpdate,
     SliceSplitRequest,
+    SourceRecording,
 )
 from app.repository import SQLiteRepository
 
@@ -19,6 +21,39 @@ from app.repository import SQLiteRepository
 def read_wav_duration_seconds(path: Path) -> float:
     with wave.open(str(path), "rb") as wav_file:
         return wav_file.getnframes() / wav_file.getframerate()
+
+
+def build_legacy_clip(project_id: str, clip_id: str, source_file_id: str, order_index: int) -> dict[str, object]:
+    timestamp = "2026-03-18T15:16:30Z"
+    return {
+        "audio_path": None,
+        "channels": 1,
+        "clip_edl": [],
+        "created_at": timestamp,
+        "duration_seconds": 1.5,
+        "edit_state": "clean",
+        "id": clip_id,
+        "is_superseded": False,
+        "language": "en",
+        "order_index": order_index,
+        "original_end_time": 1.5,
+        "original_start_time": 0.0,
+        "project_id": project_id,
+        "review_status": "candidate",
+        "sample_rate": 48000,
+        "source_file_id": source_file_id,
+        "speaker_name": "speaker_a",
+        "tags": [],
+        "transcript": {
+            "text_current": f"Transcript for {clip_id}",
+            "text_initial": f"Transcript for {clip_id}",
+            "source": "manual",
+            "confidence": 1.0,
+            "updated_at": timestamp,
+        },
+        "updated_at": timestamp,
+        "working_asset_id": f"working-{clip_id}",
+    }
 
 
 class RepositoryMediaTests(TestCase):
@@ -158,3 +193,57 @@ class RepositoryMediaTests(TestCase):
 
         self.assertTrue(variant_path.is_relative_to(self.repository.media_root.resolve()))
         self.assertEqual(variant_path.name, f"{updated.active_variant_id}.wav")
+
+    def test_legacy_seed_imports_all_projects_without_source_collisions(self) -> None:
+        root = Path(self.temp_dir.name)
+        legacy_path = root / "legacy-seed.json"
+        legacy_payload = {
+            "projects": {
+                "project-a": {
+                    "id": "project-a",
+                    "name": "Project A",
+                    "status": "ready",
+                    "export_status": "idle",
+                    "created_at": "2026-03-18T15:16:30Z",
+                    "updated_at": "2026-03-18T15:16:30Z",
+                },
+                "project-b": {
+                    "id": "project-b",
+                    "name": "Project B",
+                    "status": "ready",
+                    "export_status": "idle",
+                    "created_at": "2026-03-18T15:16:30Z",
+                    "updated_at": "2026-03-18T15:16:30Z",
+                },
+            },
+            "clips_by_project": {
+                "project-a": [build_legacy_clip("project-a", "clip-a", "shared-source", 0)],
+                "project-b": [build_legacy_clip("project-b", "clip-b", "shared-source", 0)],
+            },
+            "commits_by_clip": {},
+            "history_by_clip": {},
+            "exports_by_project": {
+                "project-a": [],
+                "project-b": [],
+            },
+        }
+        legacy_path.write_text(json.dumps(legacy_payload))
+
+        migrated_repository = SQLiteRepository(
+            db_path=root / "legacy-project.db",
+            legacy_seed_path=legacy_path,
+            media_root=root / "legacy-media",
+            exports_root=root / "legacy-exports",
+        )
+
+        projects = migrated_repository.list_projects()
+
+        self.assertEqual({project.id for project in projects}, {"project-a", "project-b"})
+        self.assertEqual(len(migrated_repository.get_project_slices("project-a")), 1)
+        self.assertEqual(len(migrated_repository.get_project_slices("project-b")), 1)
+
+        with Session(migrated_repository.engine, expire_on_commit=False) as session:
+            source_recordings = session.exec(select(SourceRecording)).all()
+
+        self.assertEqual(len(source_recordings), 2)
+        self.assertEqual({recording.batch_id for recording in source_recordings}, {"project-a", "project-b"})
