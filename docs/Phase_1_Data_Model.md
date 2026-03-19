@@ -2,281 +2,204 @@
 
 ## Purpose
 
-This document defines a practical data model for Phase 1 of Speechcraft.
+This document defines the logical Phase 1 data model for Speechcraft as it exists after the native SQLite refactor.
 
-The goal is to support the Clip Prep Workstation cleanly now while preserving provenance and leaving room for later phases without introducing unnecessary complexity.
-
-This is a logical model, not a final database schema.
+The goal is to support a browser-first review workstation that preserves provenance, keeps audio assets managed on disk, and makes both undo/redo and export reproducible.
 
 ## Design Principles
 
 The Phase 1 data model must satisfy these rules:
 
-- Original source audio is immutable
-- Derived assets preserve lineage
-- Clip editing is per-clip only
-- Each clip preserves source provenance
-- Export is reproducible from committed state
-- The model can grow later without requiring a rewrite of core clip lineage
+- Original source recordings are immutable.
+- Physical slice variants are immutable files.
+- The logical unit of work is the slice.
+- Every slice preserves provenance back to a source recording and source-relative time bounds.
+- Audio edits are represented non-destructively as per-slice EDL operations.
+- Undo/redo restores full slice state, not just waveform math.
+- Saved milestones are part of the same revision chain as regular slice edits.
+- Export is reproducible from the latest persisted accepted slice state.
 
 ## Core Entities
 
 Phase 1 needs these core entities:
 
-- `Project`
-- `SourceFile`
-- `DerivedAsset`
-- `Clip`
-- `ClipCommit`
+- `ImportBatch`
+- `SourceRecording`
+- `AudioVariant`
+- `Slice`
+- `SliceRevision`
 - `Transcript`
 - `Tag`
-- `ClipTag`
+- `SliceTag`
 - `ExportRun`
 
-Optional support entities that may be useful early:
+## ImportBatch
 
-- `Job`
-- `ProjectSetting`
-
-## Project
-
-`Project` is the top-level container for all work.
+`ImportBatch` is the project-level container for review work.
 
 Suggested fields:
 
 - `id`
 - `name`
-- `root_path`
 - `created_at`
-- `updated_at`
-- `active_export_id`
-- `status`
-
-Suggested project statuses:
-
-- `active`
-- `archived`
+- derived `updated_at`
+- derived `export_status`
 
 Responsibilities:
 
-- Owns source files, derived assets, clips, and exports
-- Defines the workspace boundary
-- Provides the context for review progress and export
+- Own source recordings, slices, and export runs
+- Define the review workspace boundary
+- Provide project-level recency and export status
 
-## SourceFile
+## SourceRecording
 
-`SourceFile` represents an immutable original source recording.
+`SourceRecording` represents an immutable long-form audio source.
 
 Suggested fields:
 
 - `id`
-- `project_id`
-- `path`
-- `display_name`
+- `batch_id`
+- `parent_recording_id`
+- `file_path`
 - `sample_rate`
-- `channels`
-- `duration_seconds`
-- `hash`
-- `created_at`
+- `num_channels`
+- `num_samples`
+- `processing_recipe`
 
 Rules:
 
-- Never modified in place by the app
-- Serves as the provenance anchor for all downstream clip work
+- Never modified in place by the Phase 1 editor
+- Acts as the provenance anchor for downstream slices
+- May point at a managed source asset or a stable external path
 
-## DerivedAsset
+## AudioVariant
 
-`DerivedAsset` represents an audio file produced from another asset.
-
-This covers:
-
-- denoised outputs
-- dereverbed outputs
-- deechoed outputs
-- any other upstream enhancement output
-- optionally rendered intermediate assets later
+`AudioVariant` represents an immutable physical slice-level WAV file.
 
 Suggested fields:
 
 - `id`
-- `project_id`
-- `kind`
-- `path`
-- `parent_asset_type`
-- `parent_asset_id`
-- `created_by_job_id`
-- `created_at`
+- `slice_id`
+- `file_path`
+- `is_original`
+- `generator_model`
 - `sample_rate`
-- `channels`
-- `duration_seconds`
-- `hash`
+- `num_samples`
 
-Suggested `kind` values:
+Rules:
 
-- `denoised`
-- `dereverbed`
-- `deechoed`
-- `working_source`
-- `other`
+- Variants are physical files, not transient buffers
+- The active variant determines the base audio used for playback and export
+- Variant files should live under the managed media root when the app owns them
 
-Lineage rule:
+## Slice
 
-- Every derived asset must point back to exactly one parent asset
-
-This keeps provenance explicit and allows later audit or rebuilding.
-
-## Clip
-
-`Clip` is the primary unit of work in Phase 1.
-
-This entity must support both current needs and future-proof provenance.
+`Slice` is the primary review entity in Phase 1.
 
 Suggested fields:
 
 - `id`
-- `project_id`
+- `source_recording_id`
+- `active_variant_id`
+- `active_revision_id`
+- `status`
+- `model_metadata`
+- `created_at`
+
+Required provenance fields stored in slice metadata:
+
 - `source_file_id`
-- `working_asset_type`
-- `working_asset_id`
 - `original_start_time`
 - `original_end_time`
-- `clip_edl`
-- `review_status`
-- `edit_state`
 - `speaker_name`
 - `language`
+- `order_index`
 - `is_superseded`
-- `superseded_by_clip_id`
-- `created_at`
-- `updated_at`
 
-Required provenance fields:
+Suggested review statuses:
 
-- `source_file_id`
-- `original_start_time`
-- `original_end_time`
-- `clip_edl`
+- `unresolved`
+- `accepted`
+- `rejected`
+- `quarantined`
 
 Interpretation:
 
-- `source_file_id`: the immutable original source
-- `working_asset_id`: the current upstream asset this clip was cut from
-- `original_start_time` and `original_end_time`: source-relative boundaries
-- `clip_edl`: non-destructive per-clip edit recipe
+- `unresolved`: still needs a human decision or additional work
+- `accepted`: approved for export
+- `rejected`: excluded from export
+- `quarantined`: blocked for QA or follow-up
 
-Suggested `review_status` values:
+## SliceRevision
 
-- `candidate`
-- `in_review`
-- `accepted`
-- `rejected`
-- `needs_attention`
-
-Suggested `edit_state` values:
-
-- `clean`
-- `dirty`
-- `committed`
-
-### About `clip_edl`
-
-`clip_edl` should be stored as structured data, not opaque text.
-
-Logical operations may include:
-
-- `keep_range`
-- `delete_range`
-- `insert_silence`
-
-That is enough for Phase 1.
-
-The EDL should describe the clip's current state relative to the clip's original region, not relative to the whole source file.
-
-## ClipCommit
-
-`ClipCommit` stores durable milestones for a clip.
-
-This separates meaningful saved states from transient local edits.
+`SliceRevision` stores immutable full-state slice snapshots.
 
 Suggested fields:
 
 - `id`
-- `clip_id`
-- `parent_commit_id`
+- `slice_id`
+- `parent_revision_id`
+- `edl_operations`
+- `transcript_text`
+- `status`
+- `tags_payload`
+- `active_variant_id_snapshot`
 - `message`
-- `clip_edl_snapshot`
-- `transcript_snapshot`
-- `review_status_snapshot`
+- `is_milestone`
 - `created_at`
 
 Rules:
 
-- Commits are append-only
-- Export should use the latest commit, not in-progress dirty state
-- Commits must be reversible or loadable for comparison later
-
-This does not need to become a full Git-like system.
+- Revisions are append-only
+- Undo/redo moves the active slice pointer through these revisions
+- Audio edits and metadata edits both produce revisions
+- Milestones are revisions with extra user-facing intent, not a separate shadow system
 
 ## Transcript
 
-`Transcript` stores the current text associated with a clip.
+`Transcript` stores source and edited text for a slice.
 
 Suggested fields:
 
 - `id`
-- `clip_id`
-- `text_current`
-- `text_initial`
-- `source`
-- `confidence`
-- `updated_at`
-
-Suggested `source` values:
-
-- `whisper`
-- `manual`
-- `mixed`
+- `slice_id`
+- `original_text`
+- `modified_text`
+- `is_modified`
+- `alignment_data`
 
 Rules:
 
-- `text_initial` preserves the first machine-generated transcript
-- `text_current` is what the user is editing toward export
+- `original_text` preserves the upstream transcript
+- `modified_text` may be blank and still be intentional valid data
+- Alignment metadata is detail-only; queue payloads should not overfetch it
 
-This gives you a clean comparison point during review.
+## Tag And SliceTag
 
-## Tag
-
-`Tag` defines a user-visible label available within a project.
+`Tag` defines a reusable user-visible label.
 
 Suggested fields:
 
 - `id`
-- `project_id`
 - `name`
 - `color`
-- `created_at`
 
-Tags should be project-scoped for simplicity.
+`SliceTag` is the many-to-many join between slices and tags.
 
-## ClipTag
+Rules:
 
-`ClipTag` links tags to clips.
-
-Suggested fields:
-
-- `clip_id`
-- `tag_id`
-
-This keeps tagging flexible without hardcoding many boolean fields on `Clip`.
+- Tags support filtering and QA
+- Tags do not determine export by themselves
+- Tags must be captured in slice revisions so undo/redo can restore them
 
 ## ExportRun
 
-`ExportRun` represents one export attempt for a project.
+`ExportRun` captures project-level export attempts.
 
 Suggested fields:
 
 - `id`
-- `project_id`
+- `batch_id`
 - `status`
 - `output_root`
 - `manifest_path`
@@ -285,83 +208,31 @@ Suggested fields:
 - `created_at`
 - `completed_at`
 
-Suggested `status` values:
+Rules:
 
-- `queued`
-- `running`
-- `succeeded`
-- `failed`
+- Export uses accepted persisted slice state
+- Exported transcript text comes from the current persisted transcript value
+- Export failures must not corrupt prior runs
+
+## Managed Artifact Layout
+
+The runtime-managed media root is:
+
+- `backend/data/media/`
+
+Expected artifact categories:
+
+- `sources/`
+- `variants/`
+- `slices/`
+- `peaks/`
 
 Rules:
 
-- Exports are immutable records
-- A new export creates a new `ExportRun`
-- Prior successful exports should remain inspectable even after later changes
-
-## Job
-
-`Job` is optional but useful even in Phase 1 because rendering and precomputation are background work.
-
-Suggested fields:
-
-- `id`
-- `project_id`
-- `kind`
-- `status`
-- `payload`
-- `result`
-- `created_at`
-- `started_at`
-- `completed_at`
-
-Relevant Phase 1 job kinds:
-
-- `generate_peaks`
-- `render_clip`
-- `export_project`
-
-Upstream phases may later add:
-
-- `denoise`
-- `dereverb`
-- `deecho`
-- `segment`
-- `transcribe`
-
-## Relationships
-
-The most important logical relationships are:
-
-- A `Project` has many `SourceFile`
-- A `Project` has many `DerivedAsset`
-- A `Project` has many `Clip`
-- A `SourceFile` has many `Clip`
-- A `Clip` has one current `Transcript`
-- A `Clip` has many `ClipCommit`
-- A `Clip` has many `Tag` through `ClipTag`
-- A `Project` has many `ExportRun`
-
-## Future-Proofing Without Extra Complexity
-
-This model is intentionally ready for later phases without implementing them now.
-
-The main future-proof choices are:
-
-- `source_file_id` on `Clip`
-- source-relative `original_start_time` and `original_end_time`
-- explicit `working_asset_id`
-- append-only `ClipCommit`
-- lineage on `DerivedAsset`
-
-These let later phases add:
-
-- smarter upstream re-segmentation
-- source-level rebuilds
-- session-level editing
-- richer audit trails
-
-Without forcing Phase 1 to implement those features now.
+- Variant, slice-render, and peak caches are managed artifacts
+- Slice render and peak cache keys should be derived from audio state, not every metadata-only revision
+- Cache cleanup must prune stale slice and peak artifacts
 
 ## One-Line Summary
 
-The Phase 1 data model treats each clip as a provenance-preserving, per-clip-editable unit derived from immutable source audio and rendered into reproducible export artifacts.
+Phase 1 uses immutable source recordings and immutable variants underneath a full-state slice revision model, so playback, undo/redo, and export all operate from the same persisted slice state.

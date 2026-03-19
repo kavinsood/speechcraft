@@ -139,7 +139,7 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
 }
 
 export default function App() {
-  if (window.location.pathname === "/backend-test") {
+  if (window.location.pathname === "/backend-test" && import.meta.env.DEV) {
     return <BackendTestPage />;
   }
 
@@ -167,8 +167,7 @@ export default function App() {
     try {
       const nextProjects = await fetchProjects();
       const sortedProjects = [...nextProjects].sort(
-        (left, right) =>
-          new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+        (left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
       );
       const fallbackProjectId = sortedProjects[0]?.id ?? null;
       const selectedProjectId =
@@ -373,7 +372,10 @@ export default function App() {
       {activeProject ? (
         <footer className="workstation-footer">
           <span>{activeProject.name}</span>
-          <span>{activeProject.export_status.replace(/_/g, " ")}</span>
+          <span>updated {new Date(activeProject.updated_at).toLocaleDateString()}</span>
+          <span>
+            export {activeProject.export_status ? activeProject.export_status.replace(/_/g, " ") : "n/a"}
+          </span>
           <span>{stepDefinitions[activeStepIndex]?.shortLabel ?? "In"} active</span>
         </footer>
       ) : null}

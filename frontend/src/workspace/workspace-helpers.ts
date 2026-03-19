@@ -1,17 +1,15 @@
-import type { Clip, ProjectDetail, ReviewStatus } from "../types";
+import type { AudioVariant, ReviewStatus, Slice, SliceSummary } from "../types";
 
 export const queuePriorityOrder: ReviewStatus[] = [
-  "candidate",
-  "needs_attention",
-  "in_review",
+  "unresolved",
+  "quarantined",
   "accepted",
   "rejected",
 ];
 
 export const statusLabels: Record<ReviewStatus, string> = {
-  candidate: "Candidate",
-  needs_attention: "Needs Attention",
-  in_review: "In Review",
+  unresolved: "Unresolved",
+  quarantined: "Quarantined",
   accepted: "Accepted",
   rejected: "Rejected",
 };
@@ -24,9 +22,7 @@ export function formatClipTimestamp(value: number): string {
   const totalCentiseconds = Math.max(0, Math.round(value * 100));
   const seconds = Math.floor(totalCentiseconds / 100);
   const centiseconds = totalCentiseconds % 100;
-  return `${seconds.toString().padStart(2, "0")}.${centiseconds
-    .toString()
-    .padStart(2, "0")}`;
+  return `${seconds.toString().padStart(2, "0")}.${centiseconds.toString().padStart(2, "0")}`;
 }
 
 export function formatDurationCompact(totalSeconds: number): string {
@@ -44,57 +40,116 @@ export function formatDurationCompact(totalSeconds: number): string {
   return `${seconds}s`;
 }
 
-export function recalculateProjectDetail(detail: ProjectDetail): ProjectDetail {
-  const accepted = detail.clips.filter((clip) => clip.review_status === "accepted");
-  const rejected = detail.clips.filter((clip) => clip.review_status === "rejected");
-  const needsAttention = detail.clips.filter(
-    (clip) => clip.review_status === "needs_attention",
-  );
-
-  return {
-    ...detail,
-    stats: {
-      ...detail.stats,
-      total_clips: detail.clips.length,
-      accepted_clips: accepted.length,
-      rejected_clips: rejected.length,
-      needs_attention_clips: needsAttention.length,
-      total_duration_seconds: Number(
-        detail.clips.reduce((sum, clip) => sum + clip.duration_seconds, 0).toFixed(2),
-      ),
-      accepted_duration_seconds: Number(
-        accepted.reduce((sum, clip) => sum + clip.duration_seconds, 0).toFixed(2),
-      ),
-    },
-  };
+export function getSliceMetadata<T>(
+  slice: SliceSummary,
+  key: string,
+  fallback: T,
+): T {
+  const value = slice.model_metadata?.[key];
+  return (value as T | undefined) ?? fallback;
 }
 
-export function sortClipsForQueue(clips: Clip[]): Clip[] {
-  return [...clips].sort((left, right) => {
-    const leftPriority = queuePriorityOrder.indexOf(left.review_status);
-    const rightPriority = queuePriorityOrder.indexOf(right.review_status);
+export function getSliceTranscriptText(slice: SliceSummary): string {
+  return slice.transcript?.modified_text ?? slice.transcript?.original_text ?? "";
+}
 
-    if (leftPriority !== rightPriority) {
-      return leftPriority - rightPriority;
-    }
+export function getSliceDuration(slice: SliceSummary): number {
+  return Number((slice.duration_seconds ?? 0).toFixed(2));
+}
 
-    if (left.order_index !== right.order_index) {
-      return left.order_index - right.order_index;
-    }
+export function getSliceOrderIndex(slice: SliceSummary): number {
+  return Number(getSliceMetadata(slice, "order_index", 0));
+}
 
-    return left.created_at.localeCompare(right.created_at);
+export function getSliceOriginalStart(slice: SliceSummary): number {
+  return Number(getSliceMetadata(slice, "original_start_time", 0));
+}
+
+export function getSliceOriginalEnd(slice: SliceSummary): number {
+  return Number(getSliceMetadata(slice, "original_end_time", getSliceDuration(slice)));
+}
+
+export function getSliceSpeakerName(slice: SliceSummary): string {
+  return String(getSliceMetadata(slice, "speaker_name", "speaker_a"));
+}
+
+export function getSliceLanguage(slice: SliceSummary): string {
+  return String(getSliceMetadata(slice, "language", "en"));
+}
+
+export function isSliceSuperseded(slice: SliceSummary): boolean {
+  return Boolean(getSliceMetadata(slice, "is_superseded", false));
+}
+
+export function getAlignmentSource(slice: SliceSummary): string {
+  const alignmentData =
+    slice.transcript && "alignment_data" in slice.transcript
+      ? slice.transcript.alignment_data
+      : undefined;
+  if (alignmentData && typeof alignmentData === "object" && "source" in alignmentData) {
+    return String(alignmentData.source ?? "manual");
+  }
+  return "manual";
+}
+
+export function getAlignmentConfidence(slice: SliceSummary): number | null {
+  const alignmentData =
+    slice.transcript && "alignment_data" in slice.transcript
+      ? slice.transcript.alignment_data
+      : undefined;
+  if (alignmentData && typeof alignmentData === "object" && "confidence" in alignmentData) {
+    const raw = alignmentData.confidence;
+    return typeof raw === "number" ? raw : null;
+  }
+  return null;
+}
+
+export function getSliceAudioRevisionKey(slice: Slice): string {
+  return JSON.stringify({
+    active_variant_id: slice.active_variant_id ?? null,
+    edl_operations: slice.active_commit?.edl_operations ?? [],
   });
 }
 
+export function getRedoTarget(slice: Slice): string | null {
+  if (!slice.active_commit_id) {
+    return slice.commits.find((commit) => commit.parent_commit_id == null)?.id ?? null;
+  }
+  return (
+    slice.commits.find((commit) => commit.parent_commit_id === slice.active_commit_id)?.id ?? null
+  );
+}
+
+export function sortVariantsForHistory(variants: AudioVariant[]): AudioVariant[] {
+  return [...variants].sort((left, right) => {
+    if (left.is_original !== right.is_original) {
+      return left.is_original ? -1 : 1;
+    }
+    return left.id.localeCompare(right.id);
+  });
+}
+
+export function sortClipsForQueue<T extends SliceSummary>(clips: T[]): T[] {
+  return [...clips]
+    .filter((slice) => !isSliceSuperseded(slice))
+    .sort((left, right) => {
+      const leftPriority = queuePriorityOrder.indexOf(left.status);
+      const rightPriority = queuePriorityOrder.indexOf(right.status);
+
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+      }
+
+      if (getSliceOrderIndex(left) !== getSliceOrderIndex(right)) {
+        return getSliceOrderIndex(left) - getSliceOrderIndex(right);
+      }
+
+      return left.created_at.localeCompare(right.created_at);
+    });
+}
+
 export function buildTagColor(name: string): string {
-  const palette = [
-    "#8a7a3d",
-    "#2f6c8f",
-    "#c95f44",
-    "#3c8452",
-    "#8b5fbf",
-    "#9a6a2f",
-  ];
+  const palette = ["#8a7a3d", "#2f6c8f", "#c95f44", "#3c8452", "#8b5fbf", "#9a6a2f"];
   const seed = name.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0);
   return palette[seed % palette.length];
 }
@@ -121,19 +176,19 @@ export function parseTagDraft(value: string): { name: string; color: string }[] 
 }
 
 export function clipMatchesFilters(
-  clip: Clip,
+  slice: SliceSummary,
   query: string,
   selectedFilterTags: string[],
   hideResolved: boolean,
 ): boolean {
-  if (hideResolved && (clip.review_status === "accepted" || clip.review_status === "rejected")) {
+  if (hideResolved && (slice.status === "accepted" || slice.status === "rejected")) {
     return false;
   }
 
   if (
     selectedFilterTags.length > 0 &&
-    !selectedFilterTags.some(
-      (selectedTag) => clip.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
+    !selectedFilterTags.some((selectedTag) =>
+      slice.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
     )
   ) {
     return false;
@@ -144,12 +199,12 @@ export function clipMatchesFilters(
   }
 
   const haystacks = [
-    clip.id,
-    clip.transcript.text_current,
-    clip.review_status,
-    clip.speaker_name,
-    clip.language,
-    ...clip.tags.map((tag) => tag.name),
+    slice.id,
+    getSliceTranscriptText(slice),
+    slice.status,
+    getSliceSpeakerName(slice),
+    getSliceLanguage(slice),
+    ...slice.tags.map((tag) => tag.name),
   ];
 
   return haystacks.some((value) => value.toLowerCase().includes(query));

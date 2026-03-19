@@ -1,23 +1,26 @@
-export type ReviewStatus =
-  | "candidate"
-  | "in_review"
-  | "accepted"
-  | "rejected"
-  | "needs_attention";
+export type ReviewStatus = "unresolved" | "accepted" | "rejected" | "quarantined";
 
-export type EditState = "clean" | "dirty" | "committed";
-
-export type ClipTag = {
+export type Tag = {
+  id: string;
   name: string;
   color: string;
 };
 
 export type Transcript = {
-  text_current: string;
-  text_initial: string;
-  source: string;
-  confidence?: number | null;
-  updated_at: string;
+  id: string;
+  slice_id: string;
+  original_text: string;
+  modified_text?: string | null;
+  is_modified: boolean;
+  alignment_data?: Record<string, unknown> | null;
+};
+
+export type TranscriptSummary = {
+  id: string;
+  slice_id: string;
+  original_text: string;
+  modified_text?: string | null;
+  is_modified: boolean;
 };
 
 export type ClipRange = {
@@ -25,101 +28,105 @@ export type ClipRange = {
   end_seconds: number;
 };
 
-export type ClipEdlOperation = {
-  op: string;
-  range?: ClipRange | null;
-  duration_seconds?: number | null;
-};
-
-export type Clip = {
+export type EditCommit = {
   id: string;
-  project_id: string;
-  order_index: number;
-  source_file_id: string;
-  working_asset_id: string;
-  audio_path?: string | null;
-  original_start_time: number;
-  original_end_time: number;
-  clip_edl: ClipEdlOperation[];
-  review_status: ReviewStatus;
-  edit_state: EditState;
-  speaker_name: string;
-  language: string;
-  transcript: Transcript;
-  tags: ClipTag[];
-  is_superseded: boolean;
-  duration_seconds: number;
-  sample_rate: number;
-  channels: number;
-  created_at: string;
-  updated_at: string;
-};
-
-export type Project = {
-  id: string;
-  name: string;
-  status: string;
-  export_status: "not_exported" | "export_in_progress" | "export_succeeded" | "export_failed";
-  created_at: string;
-  updated_at: string;
-};
-
-export type ProjectStats = {
-  total_clips: number;
-  accepted_clips: number;
-  rejected_clips: number;
-  needs_attention_clips: number;
-  total_duration_seconds: number;
-  accepted_duration_seconds: number;
-};
-
-export type ProjectDetail = {
-  project: Project;
-  stats: ProjectStats;
-  clips: Clip[];
-};
-
-export type ClipCommit = {
-  id: string;
-  clip_id: string;
+  slice_id: string;
   parent_commit_id?: string | null;
-  message: string;
-  transcript_snapshot: string;
-  review_status_snapshot: ReviewStatus;
-  clip_edl_snapshot: ClipEdlOperation[];
+  edl_operations: {
+    op: string;
+    range?: ClipRange | null;
+    duration_seconds?: number | null;
+  }[];
+  transcript_text: string;
+  status: ReviewStatus;
+  tags: Tag[];
+  active_variant_id?: string | null;
+  message?: string | null;
+  is_milestone: boolean;
   created_at: string;
 };
 
-export type ExportPreview = {
-  project_id: string;
-  manifest_path: string;
-  accepted_clip_count: number;
-  lines: string[];
+export type AudioVariant = {
+  id: string;
+  slice_id: string;
+  is_original: boolean;
+  generator_model?: string | null;
+  sample_rate: number;
+  num_samples: number;
 };
 
-export type ClipMutationResult = {
-  operation: string;
-  project_detail: ProjectDetail;
-  created_clip_ids: string[];
-  superseded_clip_ids: string[];
+export type SourceRecording = {
+  id: string;
+  batch_id: string;
+  parent_recording_id?: string | null;
+  sample_rate: number;
+  num_channels: number;
+  num_samples: number;
+  processing_recipe?: string | null;
 };
 
-export type ClipHistoryResult = {
-  clip: Clip;
+export type SliceSummary = {
+  id: string;
+  source_recording_id: string;
+  active_variant_id?: string | null;
+  active_commit_id?: string | null;
+  status: ReviewStatus;
+  duration_seconds: number;
+  model_metadata?: Record<string, unknown> | null;
+  created_at: string;
+  transcript?: TranscriptSummary | null;
+  tags: Tag[];
+  active_variant_generator_model?: string | null;
   can_undo: boolean;
   can_redo: boolean;
 };
 
+export type Slice = SliceSummary & {
+  transcript?: Transcript | null;
+  source_recording: SourceRecording;
+  variants: AudioVariant[];
+  commits: EditCommit[];
+  active_variant?: AudioVariant | null;
+  active_commit?: EditCommit | null;
+};
+
+export type ImportBatch = {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  export_status?: "pending" | "running" | "completed" | "failed" | null;
+};
+
+export type Project = ImportBatch;
+
 export type ExportRun = {
   id: string;
-  project_id: string;
-  status: "queued" | "running" | "succeeded" | "failed";
+  batch_id: string;
+  status: "pending" | "running" | "completed" | "failed";
   output_root: string;
   manifest_path: string;
   accepted_clip_count: number;
   failed_clip_count: number;
   created_at: string;
   completed_at?: string | null;
+};
+
+export type ExportPreview = {
+  project_id: string;
+  manifest_path: string;
+  accepted_slice_count: number;
+  lines: string[];
+};
+
+export type MediaCleanupResult = {
+  project_id: string;
+  deleted_slice_count: number;
+  deleted_variant_count: number;
+  deleted_file_count: number;
+  skipped_reference_count: number;
+  deleted_slice_ids: string[];
+  deleted_variant_ids: string[];
 };
 
 export type WaveformPeaks = {

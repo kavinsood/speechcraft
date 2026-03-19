@@ -5,6 +5,8 @@ description = "FastAPI backend for the Speechcraft Phase 1 Clip Prep Workstation
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0,<1.0.0",
+  "pydantic>=2.11.0,<3.0.0",
+  "sqlmodel>=0.0.24,<1.0.0",
   "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 

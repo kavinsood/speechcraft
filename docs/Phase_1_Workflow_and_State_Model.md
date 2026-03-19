@@ -1,12 +1,12 @@
-# Phase 1 Workflow and State Model
+# Phase 1 Workflow And State Model
 
 ## Purpose
 
-This document defines how Phase 1 fits into the larger preprocessing workflow and describes the object and workflow state transitions that the app must support.
+This document describes how the Phase 1 review workstation behaves after the native slice/revision refactor.
 
-Phase 1 is a distinct product phase, but it depends on upstream systems and produces inputs for downstream fine-tuning.
+Phase 1 is the manual QA boundary between upstream segmentation/transcription and downstream fine-tuning.
 
-## End-to-End Workflow Context
+## End-To-End Workflow Context
 
 The full preprocessing path is:
 
@@ -14,238 +14,185 @@ The full preprocessing path is:
 
 Phase 1 begins only after:
 
-- Smart segmentation has created candidate clip boundaries
-- Whisper has produced initial transcripts for those candidate clips
+- upstream processing has created candidate slice boundaries
+- upstream ASR has produced initial transcript text
 
 Phase 1 ends when:
 
-- Accepted clips are exported as rendered files plus a `.list`
+- accepted slices are exported as rendered audio plus a `.list`
 
-## Core Workflow Model
+## Practical User Flow
 
-The practical user flow in Phase 1 is:
+The user flow in Phase 1 is:
 
-1. Open a project with candidate clips
-2. Enter the clip review queue
-3. Inspect each candidate clip
-4. Correct transcript and audio issues
-5. Mark the clip as accepted, rejected, or needing attention
-6. Continue until the queue is resolved
-7. Export accepted clips
-8. Hand off to fine-tuning
+1. Open a project with candidate slices.
+2. Work through the unresolved review queue.
+3. Correct transcript and audio issues.
+4. Adjust slice audio with EDL operations when needed.
+5. Save meaningful milestones.
+6. Mark slices as accepted, rejected, or quarantined.
+7. Export accepted slices.
 
-This turns machine-generated candidates into trusted training data.
+## Object Tiers
 
-## Object Lifecycle
+There are four key object tiers in the current implementation:
 
-There are three key object tiers relevant to this phase:
-
-1. `SourceFile`
-2. `CandidateClip`
-3. `Clip`
-
-For Phase 1, `CandidateClip` and `Clip` may be implemented as one logical object with status-driven behavior, but the conceptual distinction matters:
-
-- A `CandidateClip` is auto-generated and not yet trusted
-- A `Clip` is the accepted unit of manual review and export
-
-The system should preserve enough structure to distinguish auto-generated proposals from human-approved results.
-
-## Source File State
-
-Source files are not edited in Phase 1.
-
-A source file moves through these external states:
-
-- `available`
-- `processed_upstream`
-- `used_for_candidates`
-
-Within Phase 1, source files act as provenance anchors only.
-
-They remain immutable.
-
-## Candidate Clip State Machine
-
-Every candidate clip enters Phase 1 in:
-
-- `candidate`
-
-From there, it may move through:
-
-- `in_review`
-- `accepted`
-- `rejected`
-- `needs_attention`
-
-Allowed transitions:
-
-- `candidate -> in_review`
-- `candidate -> accepted`
-- `candidate -> rejected`
-- `candidate -> needs_attention`
-- `in_review -> accepted`
-- `in_review -> rejected`
-- `in_review -> needs_attention`
-- `needs_attention -> in_review`
-- `accepted -> in_review`
-
-The last transition matters because users may discover issues after initially accepting a clip.
-
-`rejected` should also be reversible:
-
-- `rejected -> in_review`
-
-This keeps the system forgiving during manual QA.
-
-## Editing State Versus Review State
-
-Review state and editing state are separate concerns.
-
-Review state answers:
-
-- Is this clip approved for training?
-
-Editing state answers:
-
-- Does this clip have unsaved local changes?
-- Does this clip have committed changes?
-
-Minimum editing states:
-
-- `clean`
-- `dirty`
-- `committed`
+1. `SourceRecording`
+2. `AudioVariant`
+3. `Slice`
+4. `SliceRevision`
 
 Interpretation:
 
-- `clean`: no uncommitted changes since last commit
-- `dirty`: local edits exist
-- `committed`: the latest meaningful state has been saved as a milestone
+- `SourceRecording` is the immutable provenance anchor.
+- `AudioVariant` is the immutable physical file chosen as the slice's active base audio.
+- `Slice` is the logical review object shown in the queue.
+- `SliceRevision` is the persisted full-state history chain used for undo/redo and milestones.
 
-The app should not collapse review status and edit status into one field.
+## Review Status State Machine
 
-## Split and Merge Behavior
+Every slice enters Phase 1 in:
 
-Phase 1 includes split and merge actions, so the workflow must define state results.
+- `unresolved`
 
-### Split
+From there, it may move through:
 
-When a clip is split:
-
-- The original clip should no longer remain a single active export unit
-- Two new child clips are created
-- Each child clip inherits provenance from the same `source_file_id`
-- Each child clip gets its own `original_start_time` and `original_end_time`
-- Each child clip gets its own `clip_edl`
-- Each child clip starts in `in_review`
-
-The original clip may be:
-
-- archived as superseded
-
-This is better than hard deletion because it preserves history.
-
-### Merge
-
-When clips are merged:
-
-- A new merged clip is created
-- The original clips are marked superseded or inactive
-- The merged clip starts in `in_review`
-- The merged clip is not auto-accepted
-
-This ensures the user validates the result after the merge.
-
-## Editor Entry Rules
-
-A user enters the Clip Prep Workstation on any clip whose status is:
-
-- `candidate`
-- `in_review`
-- `needs_attention`
 - `accepted`
 - `rejected`
+- `quarantined`
 
-But the default queue should prioritize:
+Allowed transitions are intentionally forgiving:
 
-1. `candidate`
-2. `needs_attention`
-3. `in_review`
+- `unresolved -> accepted`
+- `unresolved -> rejected`
+- `unresolved -> quarantined`
+- `accepted -> unresolved`
+- `rejected -> unresolved`
+- `quarantined -> unresolved`
 
-This keeps unresolved work at the top.
+The key rule is simple:
+
+- `accepted` means exportable if transcript text is present
+- everything else is non-exportable by default
+
+## Local Drafts Versus Persisted Revisions
+
+There are two editing layers in the current UI:
+
+- local draft state for transcript/tag edits before the user saves
+- persisted slice revisions for saved metadata, EDL edits, variant changes, and milestones
+
+Interpretation:
+
+- Transcript and tag text can exist as unsaved local drafts in the editor.
+- EDL operations are persisted immediately as new slice revisions.
+- Status changes are persisted immediately as new slice revisions.
+- `Save Slice` writes a full-state milestone revision with the current transcript, tags, and status.
+
+## Undo / Redo Contract
+
+Undo/redo operates on persisted slice revisions.
+
+That means undo/redo must restore:
+
+- EDL operations
+- transcript text
+- tags
+- review status
+- active variant selection
+
+Undo/redo is not allowed to be waveform-only math while leaving human metadata behind.
+
+## Milestone Contract
+
+Milestones are not a separate snapshot system anymore.
+
+Instead:
+
+- every persisted edit creates a `SliceRevision`
+- meaningful user saves are marked with `is_milestone = true`
+
+This keeps history linear and makes milestone inspection consistent with undo/redo.
+
+## Split Behavior
+
+When a slice is split:
+
+- the original slice becomes superseded
+- two new child slices are created
+- each child inherits provenance from the original source recording
+- each child gets its own transcript text
+- each child gets its own persisted revision baseline
+- each child starts as `unresolved`
+
+The split itself is represented by new child slice state, not by mutating the original slice in place.
+
+## Merge Behavior
+
+When slices are merged:
+
+- the original slices become superseded
+- a new merged slice is created
+- the merged slice gets a new physical merged variant
+- the merged slice gets a baseline revision
+- the merged slice starts as `unresolved`
+
+The user must still validate the merged result after the merge.
+
+## Queue And Detail Loading
+
+The current frontend/API split is:
+
+- queue endpoint: lightweight slice summaries for browsing and filtering
+- detail endpoint: heavy active-slice data including revisions and variants
+
+This is important because the queue should not fetch full history and variant trees for every slice.
+
+## Playback And Waveform Contract
+
+The editor must satisfy:
+
+- what the user sees in the waveform
+- what the user hears during playback
+- what the backend reports as `duration_seconds`
+
+all refer to the same edited slice state.
+
+Current implementation:
+
+- playback uses `/media/slices/{slice_id}.wav`
+- slice media is cached by audio state
+- waveform peaks are cached by audio state and bin count
 
 ## Export Eligibility Rules
 
-A clip is export-eligible when:
+A slice is export-eligible when:
 
-- Review status is `accepted`
-- There are no uncommitted edits
-- Required metadata is present:
-  `speaker`, `language`, transcript text
+- status is `accepted`
+- transcript text is non-empty after trimming
+- persisted slice state is internally consistent
 
-A clip is not export-eligible when:
+A slice is not export-eligible when:
 
-- Review status is `candidate`
-- Review status is `in_review`
-- Review status is `rejected`
-- Review status is `needs_attention`
-- The clip has unsaved edits
+- status is `unresolved`
+- status is `rejected`
+- status is `quarantined`
+- transcript text is blank
 
-This keeps export deterministic.
+Unsaved local transcript/tag drafts are not part of export until the user saves them.
 
-## Export State Machine
-
-Export is a project-level operation.
-
-Project export states:
-
-- `not_exported`
-- `export_in_progress`
-- `export_succeeded`
-- `export_failed`
-
-If the project changes after a successful export, the project should return to:
-
-- `not_exported`
-
-That makes it clear the current export is now stale.
-
-## Upstream and Downstream Contracts
-
-### Upstream Contract
-
-Phase 1 assumes upstream systems provide:
-
-- Candidate clips
-- Initial transcripts
-- Provenance to source assets
-
-Phase 1 should not need to know how enhancement, VAD, or Whisper were implemented internally.
-
-### Downstream Contract
-
-Downstream fine-tuning assumes Phase 1 provides:
-
-- A final exported clip set
-- Rendered audio for accepted clips
-- A `.list` manifest with trusted text
-
-Downstream systems should consume only exported artifacts, not in-progress review state.
-
-## Failure and Recovery Rules
+## Failure And Recovery Rules
 
 Phase 1 must support recovery from interruptions.
 
-Minimum rules:
+Minimum guarantees:
 
-- Unsaved local edits are scoped clearly and should not be silently lost
-- Committed clip states must survive app restarts
-- Project review status must persist
-- Export failures must not corrupt prior successful exports
-
-The project should always be able to reopen into a consistent state.
+- persisted slice revisions survive restart
+- undo/redo remains available after reload
+- accepted/rejected/quarantined state persists
+- stale slice render and peak caches can be pruned safely
+- export failures do not corrupt prior successful exports
 
 ## One-Line Summary
 
-Phase 1 is the stateful manual QA boundary where candidate clips move from auto-generated review items into accepted, exportable training data.
+Phase 1 is a slice-first review workflow where playback, waveform peaks, undo/redo, milestones, and export all derive from the same persisted slice revision model.
