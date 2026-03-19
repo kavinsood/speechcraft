@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -32,6 +34,32 @@ from .models import (
 from .repository import SliceSaveValidationError, repository
 
 
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://127.0.0.1:4173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://localhost:5173",
+)
+
+
+def get_allowed_origins(raw_value: str | None = None) -> list[str]:
+    env_value = raw_value if raw_value is not None else os.getenv("SPEECHCRAFT_ALLOWED_ORIGINS")
+    if env_value is None or not env_value.strip():
+        return list(DEFAULT_ALLOWED_ORIGINS)
+
+    origins: list[str] = []
+    for origin in env_value.split(","):
+        normalized = origin.strip().rstrip("/")
+        if not normalized:
+            continue
+        if normalized == "*":
+            raise ValueError("SPEECHCRAFT_ALLOWED_ORIGINS cannot include '*' when credentials are enabled")
+        if normalized not in origins:
+            origins.append(normalized)
+
+    return origins or list(DEFAULT_ALLOWED_ORIGINS)
+
+
 app = FastAPI(
     title="Speechcraft API",
     version="0.3.0",
@@ -40,7 +68,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

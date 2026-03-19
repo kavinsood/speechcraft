@@ -34,6 +34,8 @@ Current backend capabilities:
 - Export preview and export runs
 - Media cleanup for superseded slices, unused variants, and stale derived caches
 - Legacy JSON import into SQLite on first startup when `backend/data/phase1-demo.json` exists
+- Request-level backend regression tests under `backend/tests/`
+- Non-destructive backend smoke script at `backend/scripts/smoke_backend.py`
 
 Current managed runtime data:
 
@@ -65,7 +67,6 @@ Current frontend capabilities:
 - Backend-authoritative duration and backend-generated waveform peaks
 - Edited-slice playback from the slice media route
 - Export preview and export history
-- Dev-only destructive tooling page at `/backend-test`
 - Dev-only cleanup action with confirmation
 
 ## Decisions Reflected In The Current Code

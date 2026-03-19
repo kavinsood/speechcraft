@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import shutil
 import wave
@@ -68,19 +69,38 @@ class SliceSaveValidationError(ValueError):
     """Raised when a slice save request is syntactically valid but semantically invalid."""
 
 
+def _configured_path(env_name: str, fallback: Path) -> Path:
+    raw_value = os.getenv(env_name)
+    if raw_value is None or not raw_value.strip():
+        return fallback
+    return Path(raw_value).expanduser()
+
+
 @dataclass
 class SQLiteRepository:
     db_path: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent.parent / "data" / "project.db"
+        default_factory=lambda: _configured_path(
+            "SPEECHCRAFT_DB_PATH",
+            Path(__file__).resolve().parent.parent / "data" / "project.db",
+        )
     )
     legacy_seed_path: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent.parent / "data" / "phase1-demo.json"
+        default_factory=lambda: _configured_path(
+            "SPEECHCRAFT_LEGACY_SEED_PATH",
+            Path(__file__).resolve().parent.parent / "data" / "phase1-demo.json",
+        )
     )
     media_root: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent.parent / "data" / "media"
+        default_factory=lambda: _configured_path(
+            "SPEECHCRAFT_MEDIA_ROOT",
+            Path(__file__).resolve().parent.parent / "data" / "media",
+        )
     )
     exports_root: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent.parent / "exports"
+        default_factory=lambda: _configured_path(
+            "SPEECHCRAFT_EXPORTS_ROOT",
+            Path(__file__).resolve().parent.parent / "exports",
+        )
     )
     engine: Any = field(init=False)
 
