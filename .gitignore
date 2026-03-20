@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
 .venv/
 venv/
 *.egg-info/
@@ -11,7 +15,9 @@ build/
 backend/data/*.json
 backend/data/*.db
 backend/data/media/
+backend/media/
 backend/exports/
+repomix-output.xml
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
