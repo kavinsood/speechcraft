@@ -167,11 +167,9 @@ class SQLiteRepository:
     def cleanup_project_media(self, project_id: str) -> MediaCleanupResult:
         with self._session() as session:
             self._get_batch(session, project_id)
-            protected_variant_ids = set(session.exec(select(ReferenceAsset.audio_variant_id)).all())
             deleted_slice_ids: list[str] = []
             deleted_variant_ids: list[str] = []
             deleted_paths: list[str] = []
-            skipped_reference_count = 0
 
             superseded_slices = [
                 slice_row
@@ -179,11 +177,6 @@ class SQLiteRepository:
                 if self._slice_metadata(slice_row).get("is_superseded", False)
             ]
             for slice_row in superseded_slices:
-                variant_ids = {variant.id for variant in slice_row.variants}
-                referenced_ids = variant_ids & protected_variant_ids
-                if referenced_ids:
-                    skipped_reference_count += len(referenced_ids)
-                    continue
                 deleted_slice_ids.append(slice_row.id)
                 deleted_variant_ids.extend(variant.id for variant in slice_row.variants)
                 deleted_paths.extend(variant.file_path for variant in slice_row.variants)
@@ -200,7 +193,7 @@ class SQLiteRepository:
             session.flush()
 
             remaining_slices = self._get_all_batch_slices(session, project_id)
-            protected_variant_ids |= self._get_revision_referenced_variant_ids(
+            protected_variant_ids = self._get_revision_referenced_variant_ids(
                 session,
                 [slice_row.id for slice_row in remaining_slices],
             )
@@ -223,7 +216,7 @@ class SQLiteRepository:
             deleted_slice_count=len(deleted_slice_ids),
             deleted_variant_count=len(deleted_variant_ids),
             deleted_file_count=deleted_file_count,
-            skipped_reference_count=skipped_reference_count,
+            skipped_reference_count=0,
             deleted_slice_ids=deleted_slice_ids,
             deleted_variant_ids=deleted_variant_ids,
         )
@@ -935,22 +928,94 @@ class SQLiteRepository:
         self._warm_slice_artifacts_for_id(slice_id)
         return detail
 
-    def create_reference_asset(self, payload: ReferenceAssetCreate) -> ReferenceAsset:
+    def create_reference_asset_from_slice(
+        self,
+        payload: ReferenceAssetCreateFromSlice,
+    ) -> ReferenceAssetDetail:
         with self._session() as session:
-            if session.get(AudioVariant, payload.audio_variant_id) is None:
-                raise KeyError(payload.audio_variant_id)
-            asset = ReferenceAsset(**payload.model_dump())
+            slice_row = self._get_loaded_slice(session, payload.slice_id)
+            source_variant_id = slice_row.active_variant_id
+            if source_variant_id is None:
+                raise ValueError("Slice has no active variant to save as a reference")
+
+            source_variant = next(
+                (variant for variant in slice_row.variants if variant.id == source_variant_id),
+                None,
+            )
+            if source_variant is None:
+                raise KeyError(source_variant_id)
+
+            rendered_audio_bytes = self._render_slice_audio_bytes(session, slice_row)
+            sample_rate, channels, num_samples = self._wav_metadata(rendered_audio_bytes)
+            reference_variant_id = self._new_id("reference-variant")
+            storage_key = self._reference_variant_storage_key(reference_variant_id)
+            managed_path = self._managed_reference_variant_path(reference_variant_id)
+            managed_path.parent.mkdir(parents=True, exist_ok=True)
+            managed_path.write_bytes(rendered_audio_bytes)
+            self._validate_audio_asset(managed_path, sample_rate, channels, num_samples)
+
+            transcript_text = self._transcript_text(slice_row.transcript).strip() or None
+            now = utc_now()
+            asset = ReferenceAsset(
+                id=self._new_id("reference"),
+                project_id=slice_row.source_recording.batch_id,
+                name=payload.name or self._default_reference_asset_name(slice_row),
+                status=ReferenceAssetStatus.ACTIVE,
+                transcript_text=transcript_text,
+                speaker_name=self._speaker_name(slice_row),
+                language=self._language(slice_row),
+                mood_label=payload.mood_label,
+                created_from_run_id=None,
+                created_from_candidate_id=None,
+                model_metadata={
+                    "origin": "slice-variant",
+                    "source_slice_id": slice_row.id,
+                    "source_audio_variant_id": source_variant.id,
+                    "source_edit_commit_id": slice_row.active_commit_id,
+                    "source_original_start_seconds": self._slice_metadata(slice_row).get("original_start_time"),
+                    "source_original_end_seconds": self._slice_metadata(slice_row).get("original_end_time"),
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            variant = ReferenceVariant(
+                id=reference_variant_id,
+                reference_asset_id=asset.id,
+                source_kind=ReferenceSourceKind.SLICE_VARIANT,
+                source_recording_id=slice_row.source_recording_id,
+                source_slice_id=slice_row.id,
+                source_audio_variant_id=source_variant.id,
+                # Label-derived saves preserve lineage back to the upstream slice and variant,
+                # but the copied media may already reflect EDL edits or processing, so exact
+                # source span bounds are not authoritative here.
+                source_start_seconds=None,
+                source_end_seconds=None,
+                file_path=storage_key,
+                is_original=True,
+                generator_model=source_variant.generator_model,
+                sample_rate=sample_rate,
+                num_samples=num_samples,
+                model_metadata={
+                    "origin": "label-rendered-slice",
+                    "source_edit_commit_id": slice_row.active_commit_id,
+                },
+            )
+            self._validate_reference_variant_provenance(session, asset, variant)
             session.add(asset)
+            session.add(variant)
+            session.flush()
+            asset.active_variant_id = variant.id
+            session.add(asset)
+            self._validate_reference_asset_integrity(session, asset, [variant])
             session.commit()
-            session.refresh(asset)
-            asset.created_at = self._as_utc(asset.created_at)
-            return asset
+            return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset.id))
 
     def _session(self) -> Session:
         return Session(self.engine, expire_on_commit=False)
 
     def _run_data_migrations(self) -> None:
         version = self._get_data_version()
+        migrated_reference_picker_schema = False
         if version < DATA_VERSION_EXTERNAL_VARIANT_REHOME:
             self._migrate_external_variant_media()
             self._set_data_version(DATA_VERSION_EXTERNAL_VARIANT_REHOME)
@@ -2526,5 +2591,19 @@ class SQLiteRepository:
         }
         return mapping[status]
 
+_repository_instance: SQLiteRepository | None = None
 
-repository = SQLiteRepository()
+
+def get_repository() -> SQLiteRepository:
+    global _repository_instance
+    if _repository_instance is None:
+        _repository_instance = SQLiteRepository()
+    return _repository_instance
+
+
+class _RepositoryProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_repository(), name)
+
+
+repository = _RepositoryProxy()

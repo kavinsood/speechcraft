@@ -12,6 +12,9 @@ from app.models import (
     AudioVariantCreate,
     AudioVariantRunRequest,
     EditCommit,
+    ReferenceAsset,
+    ReferenceAssetCreateFromSlice,
+    ReferenceVariant,
     ReviewStatus,
     SliceEdlUpdate,
     SliceSaveRequest,
@@ -545,3 +548,203 @@ class RepositoryMediaTests(TestCase):
         self.assertEqual(saved.active_commit_id, latest_commit.id)
         self.assertEqual(latest_commit.message, "Saved slice milestone")
         self.assertTrue(latest_commit.is_milestone)
+
+    def test_list_source_recordings_exposes_duration_seconds(self) -> None:
+        recordings = self.repository.list_source_recordings("phase1-demo")
+
+        self.assertEqual(len(recordings), 1)
+        self.assertEqual(recordings[0].id, "src-001")
+        self.assertAlmostEqual(recordings[0].duration_seconds, 20.0, places=2)
+
+    def test_save_current_slice_state_as_reference_copies_media_into_reference_library(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        detail = self.repository.get_slice_detail(initial.id)
+        self.assertIsNotNone(detail.active_variant_id)
+
+        saved = self.repository.create_reference_asset_from_slice(
+            ReferenceAssetCreateFromSlice(
+                slice_id=detail.id,
+                mood_label="warm",
+            )
+        )
+
+        self.assertEqual(saved.project_id, "phase1-demo")
+        self.assertEqual(saved.mood_label, "warm")
+        self.assertEqual(saved.active_variant.source_slice_id, detail.id)
+        self.assertEqual(saved.active_variant.source_audio_variant_id, detail.active_variant_id)
+        self.assertIsNone(saved.active_variant.source_start_seconds)
+        self.assertIsNone(saved.active_variant.source_end_seconds)
+        self.assertTrue(saved.active_variant.is_original)
+
+        reference_audio_path = self.repository.get_reference_variant_media_path(saved.active_variant.id)
+        slice_audio_path = self.repository.get_variant_media_path(detail.active_variant_id)
+        self.assertTrue(reference_audio_path.exists())
+        self.assertNotEqual(reference_audio_path, slice_audio_path)
+        self.assertEqual(reference_audio_path.read_bytes(), slice_audio_path.read_bytes())
+
+        library = self.repository.list_reference_assets("phase1-demo")
+        self.assertEqual(len(library), 1)
+        self.assertEqual(library[0].id, saved.id)
+        self.assertEqual(library[0].source_slice_id, detail.id)
+        self.assertEqual(library[0].source_edit_commit_id, detail.active_commit_id)
+        self.assertEqual(library[0].mood_label, "warm")
+
+    def test_save_current_slice_state_as_reference_uses_rendered_slice_audio_not_raw_variant_truth(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        detail = self.repository.get_slice_detail(initial.id)
+        self.assertIsNotNone(detail.active_variant_id)
+
+        self.repository.append_edl_operation(
+            initial.id,
+            SliceEdlUpdate(
+                op="insert_silence",
+                range={"start_seconds": 0.1, "end_seconds": 0.1},
+                duration_seconds=0.2,
+            ),
+        )
+
+        saved = self.repository.create_reference_asset_from_slice(
+            ReferenceAssetCreateFromSlice(
+                slice_id=initial.id,
+            )
+        )
+
+        reference_audio_path = self.repository.get_reference_variant_media_path(saved.active_variant.id)
+        rendered_slice_path = self.repository.get_slice_media_path(initial.id)
+        raw_variant_path = self.repository.get_variant_media_path(detail.active_variant_id)
+
+        self.assertEqual(reference_audio_path.read_bytes(), rendered_slice_path.read_bytes())
+        self.assertNotEqual(reference_audio_path.read_bytes(), raw_variant_path.read_bytes())
+        self.assertIsNone(saved.active_variant.source_start_seconds)
+        self.assertIsNone(saved.active_variant.source_end_seconds)
+
+    def test_reference_picker_migration_rehomes_legacy_reference_assets(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+        detail = self.repository.get_slice_detail(initial.id)
+        self.assertIsNotNone(detail.active_variant_id)
+
+        with self.repository.engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE IF EXISTS referencevariant")
+            connection.exec_driver_sql("DROP TABLE IF EXISTS referencepickerrun")
+            connection.exec_driver_sql("DROP TABLE IF EXISTS referenceasset")
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE referenceasset (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    audio_variant_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO referenceasset (id, name, audio_variant_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("legacy-ref-001", "Legacy Ref", detail.active_variant_id, "2026-03-18T15:16:30+00:00"),
+            )
+            connection.exec_driver_sql("PRAGMA user_version = 2")
+
+        restarted = SQLiteRepository(
+            db_path=Path(self.temp_dir.name) / "project.db",
+            legacy_seed_path=Path(self.temp_dir.name) / "missing-seed.json",
+            media_root=Path(self.temp_dir.name) / "media",
+            exports_root=Path(self.temp_dir.name) / "exports",
+        )
+
+        library = restarted.list_reference_assets("phase1-demo")
+        self.assertEqual(len(library), 1)
+        self.assertEqual(library[0].id, "legacy-ref-001")
+        self.assertIsNotNone(library[0].active_variant)
+        self.assertEqual(library[0].active_variant.source_audio_variant_id, detail.active_variant_id)
+
+        with Session(restarted.engine, expire_on_commit=False) as session:
+            asset_row = session.get(ReferenceAsset, "legacy-ref-001")
+            self.assertIsNotNone(asset_row)
+            variant_rows = session.exec(
+                select(ReferenceVariant).where(ReferenceVariant.reference_asset_id == asset_row.id)
+            ).all()
+
+        self.assertEqual(len(variant_rows), 1)
+        self.assertEqual(variant_rows[0].file_path, f"reference-variants/{variant_rows[0].id}.wav")
+        self.assertTrue(restarted.get_reference_variant_media_path(variant_rows[0].id).exists())
+
+    def test_reference_picker_migration_preserves_legacy_table_and_writes_report_for_unresolved_rows(self) -> None:
+        with self.repository.engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE IF EXISTS referencevariant")
+            connection.exec_driver_sql("DROP TABLE IF EXISTS referencepickerrun")
+            connection.exec_driver_sql("DROP TABLE IF EXISTS referenceasset")
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE referenceasset (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    audio_variant_id TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO referenceasset (id, name, audio_variant_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("legacy-ref-missing", "Missing Ref", "variant-does-not-exist", "2026-03-18T15:16:30+00:00"),
+            )
+            connection.exec_driver_sql("PRAGMA user_version = 2")
+
+        restarted = SQLiteRepository(
+            db_path=Path(self.temp_dir.name) / "project.db",
+            legacy_seed_path=Path(self.temp_dir.name) / "missing-seed.json",
+            media_root=Path(self.temp_dir.name) / "media",
+            exports_root=Path(self.temp_dir.name) / "exports",
+        )
+
+        with restarted.engine.begin() as connection:
+            legacy_tables = connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='referenceasset_legacy'"
+            ).fetchall()
+
+        self.assertEqual(len(legacy_tables), 1)
+
+        reports_root = Path(self.temp_dir.name) / "migration-reports"
+        report_files = sorted(reports_root.glob("referenceasset-migration-*.json"))
+        self.assertEqual(len(report_files), 1)
+        report_payload = json.loads(report_files[0].read_text())
+        self.assertEqual(report_payload["issue_count"], 1)
+        self.assertEqual(report_payload["issues"][0]["legacy_asset_id"], "legacy-ref-missing")
+        self.assertEqual(report_payload["issues"][0]["reason"], "missing_audio_variant")
+
+        with Session(restarted.engine, expire_on_commit=False) as session:
+            existing_variant = session.exec(select(AudioVariant)).first()
+            self.assertIsNotNone(existing_variant)
+            repaired_variant = AudioVariant(
+                id="variant-does-not-exist",
+                slice_id=existing_variant.slice_id,
+                file_path=existing_variant.file_path,
+                is_original=False,
+                generator_model="repair-seed",
+                sample_rate=existing_variant.sample_rate,
+                num_samples=existing_variant.num_samples,
+            )
+            session.add(repaired_variant)
+            session.commit()
+
+        retried = SQLiteRepository(
+            db_path=Path(self.temp_dir.name) / "project.db",
+            legacy_seed_path=Path(self.temp_dir.name) / "missing-seed.json",
+            media_root=Path(self.temp_dir.name) / "media",
+            exports_root=Path(self.temp_dir.name) / "exports",
+        )
+
+        library = retried.list_reference_assets("phase1-demo")
+        self.assertEqual(len(library), 1)
+        self.assertEqual(library[0].id, "legacy-ref-missing")
+
+        with retried.engine.begin() as connection:
+            legacy_tables = connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='referenceasset_legacy'"
+            ).fetchall()
+
+        self.assertEqual(len(legacy_tables), 0)
