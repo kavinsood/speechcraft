@@ -63,6 +63,7 @@ export type SourceRecording = {
   num_channels: number;
   num_samples: number;
   processing_recipe?: string | null;
+  duration_seconds: number;
 };
 
 export type SliceSummary = {
@@ -133,4 +134,52 @@ export type WaveformPeaks = {
   clip_id: string;
   bins: number;
   peaks: number[];
+};
+
+export type ReferenceAssetStatus = "draft" | "active" | "archived";
+export type ReferenceSourceKind = "source_recording" | "slice_variant" | "reference_variant";
+
+export type ReferenceVariant = {
+  id: string;
+  reference_asset_id: string;
+  source_kind: ReferenceSourceKind;
+  source_recording_id?: string | null;
+  source_slice_id?: string | null;
+  source_audio_variant_id?: string | null;
+  source_reference_variant_id?: string | null;
+  source_start_seconds?: number | null;
+  source_end_seconds?: number | null;
+  is_original: boolean;
+  generator_model?: string | null;
+  sample_rate: number;
+  num_samples: number;
+  deleted: boolean;
+  created_at: string;
+};
+
+export type ReferenceAssetSummary = {
+  id: string;
+  project_id: string;
+  name: string;
+  status: ReferenceAssetStatus;
+  transcript_text?: string | null;
+  speaker_name?: string | null;
+  language?: string | null;
+  mood_label?: string | null;
+  active_variant_id?: string | null;
+  created_from_run_id?: string | null;
+  created_from_candidate_id?: string | null;
+  source_slice_id?: string | null;
+  source_audio_variant_id?: string | null;
+  source_edit_commit_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  active_variant?: ReferenceVariant | null;
+};
+
+export type ReferenceAssetDetail = ReferenceAssetSummary & {
+  notes?: string | null;
+  favorite_rank?: number | null;
+  model_metadata?: Record<string, unknown> | null;
+  variants: ReferenceVariant[];
 };

@@ -3,9 +3,12 @@ import type {
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
+  ReferenceAssetDetail,
+  ReferenceAssetSummary,
   ReviewStatus,
   Slice,
   SliceSummary,
+  SourceRecording,
   WaveformPeaks,
 } from "./types";
 
@@ -59,6 +62,10 @@ export function buildSliceAudioUrl(sliceId: string, revision?: string): string {
   return url.toString();
 }
 
+export function buildReferenceVariantAudioUrl(variantId: string): string {
+  return `${API_BASE}/media/reference-variants/${variantId}.wav`;
+}
+
 export async function fetchHealthStrict(): Promise<{ status: string }> {
   const response = await fetch(`${API_BASE}/healthz`);
   return await parseJson<{ status: string }>(response);
@@ -77,6 +84,23 @@ export async function fetchProject(projectId: string): Promise<ImportBatch> {
 export async function fetchProjectSlices(projectId: string): Promise<SliceSummary[]> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/slices`);
   return await parseJson<SliceSummary[]>(response);
+}
+
+export async function fetchProjectSourceRecordings(projectId: string): Promise<SourceRecording[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/source-recordings`);
+  return await parseJson<SourceRecording[]>(response);
+}
+
+export async function fetchProjectReferenceAssets(
+  projectId: string,
+): Promise<ReferenceAssetSummary[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-assets`);
+  return await parseJson<ReferenceAssetSummary[]>(response);
+}
+
+export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAssetDetail> {
+  const response = await fetch(`${API_BASE}/api/reference-assets/${assetId}`);
+  return await parseJson<ReferenceAssetDetail>(response);
 }
 
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {

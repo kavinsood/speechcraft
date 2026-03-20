@@ -3,10 +3,11 @@ import { Settings2 } from "lucide-react";
 import { ApiError, fetchProjects } from "./api";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
+import ReferencePage from "./pages/ReferencePage";
 import StepPlaceholderPage from "./pages/StepPlaceholderPage";
 import type { Project } from "./types";
 
-type AppStep = "ingest" | "enhance" | "segment" | "label" | "train" | "deploy";
+type AppStep = "ingest" | "enhance" | "segment" | "label" | "reference" | "train" | "deploy";
 type ProjectLoadStatus = "loading" | "ready" | "error";
 
 type AppRoute = {
@@ -33,6 +34,7 @@ const stepDefinitions: StepDefinition[] = [
   { id: "enhance", label: "Enhance", shortLabel: "En", glyph: "E", tone: "Clean the raw signal" },
   { id: "segment", label: "Segment", shortLabel: "Se", glyph: "S", tone: "Split into candidates" },
   { id: "label", label: "Label", shortLabel: "La", glyph: "L", tone: "Human review and repair" },
+  { id: "reference", label: "Reference", shortLabel: "Re", glyph: "R", tone: "Mine and curate steering clips" },
   { id: "train", label: "Train", shortLabel: "Tr", glyph: "T", tone: "Fine-tune the voice" },
   { id: "deploy", label: "Deploy", shortLabel: "De", glyph: "D", tone: "Ship for inference" },
 ];
@@ -122,16 +124,25 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
     };
   }
 
-  if (step === "train") {
+  if (step === "reference") {
     return {
       eyebrow: "Step 05",
+      title: activeProject?.name ?? "Reference Workstation",
+      description:
+        "Curate reusable steering clips from source recordings and saved slice states without polluting the label queue.",
+    };
+  }
+
+  if (step === "train") {
+    return {
+      eyebrow: "Step 06",
       title: "Training shell",
       description: "Stage the fine-tuning workspace without forcing a job model too early.",
     };
   }
 
   return {
-    eyebrow: "Step 06",
+    eyebrow: "Step 07",
     title: "Deployment shell",
     description: "Hold inference, serving, and release actions in a final workstation stage.",
   };
@@ -235,8 +246,10 @@ export default function App() {
     pageContent = <IngestPage {...pageProps} />;
   } else if (route.step === "label") {
     pageContent = <LabelPage {...pageProps} onHeaderActionsChange={setPageHeaderActions} />;
+  } else if (route.step === "reference") {
+    pageContent = <ReferencePage {...pageProps} />;
   } else {
-    const configByStep: Record<Exclude<AppStep, "ingest" | "label">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
+    const configByStep: Record<Exclude<AppStep, "ingest" | "label" | "reference">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
       enhance: {
         leftTitle: "Planned modules",
         rightTitle: "Notes",
