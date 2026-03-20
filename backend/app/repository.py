@@ -32,8 +32,16 @@ from .models import (
     MediaCleanupResult,
     ProjectSummary,
     ReferenceAsset,
-    ReferenceAssetCreate,
+    ReferenceAssetCreateFromSlice,
+    ReferenceAssetDetail,
+    ReferenceAssetStatus,
+    ReferenceAssetSummary,
+    ReferencePickerRun,
+    ReferenceSourceKind,
+    ReferenceVariant,
+    ReferenceVariantView,
     ReviewStatus,
+    ReferenceRunStatus,
     SliceRevision,
     SliceSaveRequest,
     SliceDetail,
@@ -62,7 +70,9 @@ from .models import (
 
 DATA_VERSION_EXTERNAL_VARIANT_REHOME = 1
 DATA_VERSION_SLICE_REVISION_HISTORY = 2
-LATEST_DATA_VERSION = DATA_VERSION_SLICE_REVISION_HISTORY
+DATA_VERSION_REFERENCE_PICKER_SCHEMA = 3
+DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS = 4
+LATEST_DATA_VERSION = DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS
 
 
 class SliceSaveValidationError(ValueError):
@@ -126,6 +136,16 @@ class SQLiteRepository:
     def get_project(self, project_id: str) -> ProjectSummary:
         with self._session() as session:
             return self._project_summary(session, self._get_batch(session, project_id))
+
+    def list_source_recordings(self, project_id: str) -> list[SourceRecordingView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            recordings = session.exec(
+                select(SourceRecording)
+                .where(SourceRecording.batch_id == project_id)
+                .order_by(SourceRecording.parent_recording_id.is_not(None), SourceRecording.id)
+            ).all()
+            return [self._source_recording_view(recording) for recording in recordings]
 
     def get_project_slices(self, project_id: str) -> list[SliceSummary]:
         with self._session() as session:
@@ -685,6 +705,27 @@ class SQLiteRepository:
                 raise KeyError(variant_id)
             return self._resolve_variant_media_path(Path(variant.file_path))
 
+    def get_reference_variant_media_path(self, variant_id: str) -> Path:
+        with self._session() as session:
+            variant = session.get(ReferenceVariant, variant_id)
+            if variant is None:
+                raise KeyError(variant_id)
+            return self._resolve_reference_variant_media_path(variant.file_path)
+
+    def list_reference_assets(self, project_id: str) -> list[ReferenceAssetSummary]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            assets = session.exec(
+                select(ReferenceAsset)
+                .where(ReferenceAsset.project_id == project_id)
+                .order_by(ReferenceAsset.updated_at.desc(), ReferenceAsset.created_at.desc())
+            ).all()
+            return [self._to_reference_asset_summary(session, asset) for asset in assets]
+
+    def get_reference_asset(self, asset_id: str) -> ReferenceAssetDetail:
+        with self._session() as session:
+            return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset_id))
+
     def create_import_batch(self, payload: ImportBatchCreate) -> ProjectSummary:
         with self._session() as session:
             batch = ImportBatch(id=payload.id, name=payload.name)
@@ -917,6 +958,17 @@ class SQLiteRepository:
         if version < DATA_VERSION_SLICE_REVISION_HISTORY:
             self._migrate_legacy_slice_revision_history()
             self._set_data_version(DATA_VERSION_SLICE_REVISION_HISTORY)
+            version = DATA_VERSION_SLICE_REVISION_HISTORY
+        if version < DATA_VERSION_REFERENCE_PICKER_SCHEMA:
+            self._migrate_reference_picker_schema()
+            self._set_data_version(DATA_VERSION_REFERENCE_PICKER_SCHEMA)
+            version = DATA_VERSION_REFERENCE_PICKER_SCHEMA
+            migrated_reference_picker_schema = True
+        if not migrated_reference_picker_schema and self._table_exists("referenceasset_legacy"):
+            self._migrate_reference_picker_legacy_rows()
+        if version < DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS:
+            self._migrate_reference_variant_storage_keys()
+            self._set_data_version(DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS)
 
     def _get_data_version(self) -> int:
         with self.engine.begin() as connection:
@@ -926,6 +978,21 @@ class SQLiteRepository:
     def _set_data_version(self, version: int) -> None:
         with self.engine.begin() as connection:
             connection.exec_driver_sql(f"PRAGMA user_version = {version}")
+
+    def _table_exists(self, table_name: str) -> bool:
+        with self.engine.begin() as connection:
+            return bool(
+                connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+                    (table_name,),
+                ).fetchone()
+            )
+
+    def _table_columns(self, connection: Any, table_name: str) -> set[str]:
+        return {
+            row[1]
+            for row in connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+        }
 
     def _migrate_editcommit_schema(self) -> None:
         with self.engine.begin() as connection:
@@ -1006,6 +1073,148 @@ class SQLiteRepository:
                     latest_commit = sorted(slice_row.commits, key=lambda commit: commit.created_at)[-1]
                     slice_row.active_commit_id = latest_commit.id
                     session.add(slice_row)
+                    changed = True
+            if changed:
+                session.commit()
+
+    def _migrate_reference_picker_schema(self) -> None:
+        with self.engine.begin() as connection:
+            columns = self._table_columns(connection, "referenceasset")
+            if columns and "project_id" not in columns:
+                connection.exec_driver_sql("ALTER TABLE referenceasset RENAME TO referenceasset_legacy")
+
+        SQLModel.metadata.create_all(self.engine)
+        self._migrate_reference_picker_legacy_rows()
+
+    def _migrate_reference_picker_legacy_rows(self) -> None:
+        if not self._table_exists("referenceasset_legacy"):
+            return
+        unresolved_rows: list[dict[str, Any]] = []
+        with self.engine.begin() as connection:
+            legacy_rows = [
+                dict(row._mapping)
+                for row in connection.exec_driver_sql(
+                    "SELECT id, name, audio_variant_id, created_at FROM referenceasset_legacy"
+                ).fetchall()
+            ]
+
+        with self._session() as session:
+            for row in legacy_rows:
+                asset_id = str(row["id"])
+                if session.get(ReferenceAsset, asset_id) is not None:
+                    continue
+
+                legacy_variant_id = str(row["audio_variant_id"])
+                source_variant = session.get(AudioVariant, legacy_variant_id)
+                if source_variant is None:
+                    unresolved_rows.append(
+                        {
+                            "legacy_asset_id": asset_id,
+                            "name": str(row["name"]),
+                            "audio_variant_id": legacy_variant_id,
+                            "reason": "missing_audio_variant",
+                        }
+                    )
+                    continue
+
+                try:
+                    slice_row = self._get_loaded_slice(session, source_variant.slice_id)
+                except KeyError:
+                    unresolved_rows.append(
+                        {
+                            "legacy_asset_id": asset_id,
+                            "name": str(row["name"]),
+                            "audio_variant_id": legacy_variant_id,
+                            "reason": "missing_slice",
+                            "source_slice_id": source_variant.slice_id,
+                        }
+                    )
+                    continue
+
+                created_at = self._coerce_datetime(row["created_at"])
+                now = created_at
+                asset = ReferenceAsset(
+                    id=asset_id,
+                    project_id=slice_row.source_recording.batch_id,
+                    name=str(row["name"]),
+                    status=ReferenceAssetStatus.ACTIVE,
+                    transcript_text=self._transcript_text(slice_row.transcript).strip() or None,
+                    speaker_name=self._speaker_name(slice_row),
+                    language=self._language(slice_row),
+                    model_metadata={
+                        "origin": "legacy-referenceasset",
+                        "legacy_audio_variant_id": legacy_variant_id,
+                    },
+                    created_at=created_at,
+                    updated_at=now,
+                )
+                session.add(asset)
+                session.flush()
+
+                try:
+                    source_path = self._get_variant_audio_path(
+                        source_variant,
+                        slice_row.source_recording.num_channels if slice_row.source_recording is not None else None,
+                    )
+                except (FileNotFoundError, ValueError):
+                    asset.status = ReferenceAssetStatus.ARCHIVED
+                    asset.model_metadata = {
+                        **(asset.model_metadata or {}),
+                        "migration_warning": "source_variant_media_missing",
+                    }
+                    session.add(asset)
+                    continue
+
+                reference_variant_id = self._new_id("reference-variant")
+                storage_key = self._reference_variant_storage_key(reference_variant_id)
+                managed_path = self._managed_reference_variant_path(reference_variant_id)
+                managed_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_path, managed_path)
+                channels, _sample_width, sample_rate, num_samples = self._read_pcm_wav_header(managed_path)
+                self._validate_audio_asset(managed_path, sample_rate, channels, num_samples)
+                variant = ReferenceVariant(
+                    id=reference_variant_id,
+                    reference_asset_id=asset.id,
+                    source_kind=ReferenceSourceKind.SLICE_VARIANT,
+                    source_recording_id=slice_row.source_recording_id,
+                    source_slice_id=slice_row.id,
+                    source_audio_variant_id=source_variant.id,
+                    source_start_seconds=None,
+                    source_end_seconds=None,
+                    file_path=storage_key,
+                    is_original=True,
+                    generator_model=source_variant.generator_model,
+                    sample_rate=sample_rate,
+                    num_samples=num_samples,
+                    created_at=created_at,
+                    model_metadata={
+                        "origin": "legacy-referenceasset",
+                        "legacy_audio_variant_id": legacy_variant_id,
+                    },
+                )
+                self._validate_reference_variant_provenance(session, asset, variant)
+                session.add(variant)
+                session.flush()
+                asset.active_variant_id = variant.id
+                session.add(asset)
+                self._validate_reference_asset_integrity(session, asset, [variant])
+
+            session.commit()
+
+        report_path = self._write_reference_asset_migration_report(unresolved_rows) if unresolved_rows else None
+        if report_path is None:
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql("DROP TABLE IF EXISTS referenceasset_legacy")
+
+    def _migrate_reference_variant_storage_keys(self) -> None:
+        with self._session() as session:
+            variants = session.exec(select(ReferenceVariant)).all()
+            changed = False
+            for variant in variants:
+                normalized_key = self._normalize_reference_variant_storage_key(variant.file_path, variant.id)
+                if normalized_key != variant.file_path:
+                    variant.file_path = normalized_key
+                    session.add(variant)
                     changed = True
             if changed:
                 session.commit()
@@ -1430,6 +1639,16 @@ class SQLiteRepository:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
+    def _coerce_datetime(self, value: datetime | str | None) -> datetime:
+        if isinstance(value, datetime):
+            return self._as_utc(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return self._as_utc(datetime.fromisoformat(value))
+            except ValueError:
+                pass
+        return utc_now()
+
     def _project_summary(self, session: Session, batch: ImportBatch) -> ProjectSummary:
         created_at = self._as_utc(batch.created_at)
         updated_at = created_at
@@ -1517,6 +1736,175 @@ class SQLiteRepository:
             num_channels=recording.num_channels,
             num_samples=recording.num_samples,
             processing_recipe=recording.processing_recipe,
+            duration_seconds=round(recording.duration_s, 2),
+        )
+
+    def _reference_variant_view(self, variant: ReferenceVariant | None) -> ReferenceVariantView | None:
+        if variant is None:
+            return None
+        return ReferenceVariantView(
+            id=variant.id,
+            reference_asset_id=variant.reference_asset_id,
+            source_kind=variant.source_kind,
+            source_recording_id=variant.source_recording_id,
+            source_slice_id=variant.source_slice_id,
+            source_audio_variant_id=variant.source_audio_variant_id,
+            source_reference_variant_id=variant.source_reference_variant_id,
+            source_start_seconds=variant.source_start_seconds,
+            source_end_seconds=variant.source_end_seconds,
+            is_original=variant.is_original,
+            generator_model=variant.generator_model,
+            sample_rate=variant.sample_rate,
+            num_samples=variant.num_samples,
+            deleted=variant.deleted,
+            created_at=self._as_utc(variant.created_at),
+        )
+
+    def _get_reference_asset_row(self, session: Session, asset_id: str) -> ReferenceAsset:
+        asset = session.get(ReferenceAsset, asset_id)
+        if asset is None:
+            raise KeyError(asset_id)
+        return asset
+
+    def _get_reference_variants(self, session: Session, asset_id: str) -> list[ReferenceVariant]:
+        return session.exec(
+            select(ReferenceVariant)
+            .where(ReferenceVariant.reference_asset_id == asset_id)
+            .order_by(ReferenceVariant.created_at)
+        ).all()
+
+    def _validate_reference_variant_provenance(
+        self,
+        session: Session,
+        asset: ReferenceAsset,
+        variant: ReferenceVariant,
+    ) -> None:
+        if variant.reference_asset_id != asset.id:
+            raise ValueError("Reference variant does not belong to the specified asset")
+
+        if variant.source_kind == ReferenceSourceKind.SOURCE_RECORDING:
+            if variant.source_recording_id is None:
+                raise ValueError("Source-recording variants require source_recording_id")
+            if any(
+                value is not None
+                for value in [
+                    variant.source_slice_id,
+                    variant.source_audio_variant_id,
+                    variant.source_reference_variant_id,
+                ]
+            ):
+                raise ValueError("Source-recording variants must not mix other source kinds")
+            recording = self._get_source_recording(session, variant.source_recording_id)
+            if recording.batch_id != asset.project_id:
+                raise ValueError("Reference variant source recording does not belong to the asset project")
+        elif variant.source_kind == ReferenceSourceKind.SLICE_VARIANT:
+            if variant.source_slice_id is None or variant.source_audio_variant_id is None:
+                raise ValueError("Slice-derived reference variants require slice and audio variant ids")
+            if variant.source_reference_variant_id is not None:
+                raise ValueError("Slice-derived reference variants cannot also reference a reference variant")
+            source_slice = self._get_loaded_slice(session, variant.source_slice_id)
+            source_variant = session.get(AudioVariant, variant.source_audio_variant_id)
+            if source_variant is None:
+                raise KeyError(variant.source_audio_variant_id)
+            if source_variant.slice_id != source_slice.id:
+                raise ValueError("Source audio variant does not belong to the referenced slice")
+            if source_slice.source_recording.batch_id != asset.project_id:
+                raise ValueError("Reference variant slice does not belong to the asset project")
+            if (
+                variant.source_recording_id is not None
+                and variant.source_recording_id != source_slice.source_recording_id
+            ):
+                raise ValueError("Reference variant source recording does not match the referenced slice")
+        elif variant.source_kind == ReferenceSourceKind.REFERENCE_VARIANT:
+            if variant.source_reference_variant_id is None:
+                raise ValueError("Reference-derived variants require source_reference_variant_id")
+            if any(
+                value is not None
+                for value in [
+                    variant.source_recording_id,
+                    variant.source_slice_id,
+                    variant.source_audio_variant_id,
+                ]
+            ):
+                raise ValueError("Reference-derived variants must not mix other source kinds")
+            source_reference_variant = session.get(ReferenceVariant, variant.source_reference_variant_id)
+            if source_reference_variant is None:
+                raise KeyError(variant.source_reference_variant_id)
+            parent_asset = session.get(ReferenceAsset, source_reference_variant.reference_asset_id)
+            if parent_asset is None:
+                raise KeyError(source_reference_variant.reference_asset_id)
+            if parent_asset.project_id != asset.project_id:
+                raise ValueError("Reference-derived variants must stay within the same project")
+        else:
+            raise ValueError(f"Unsupported reference source kind: {variant.source_kind}")
+
+        if (variant.source_start_seconds is None) != (variant.source_end_seconds is None):
+            raise ValueError("Reference source bounds must be stored as a complete pair or both null")
+        if variant.source_start_seconds is not None and variant.source_end_seconds is not None:
+            if not math.isfinite(variant.source_start_seconds) or not math.isfinite(variant.source_end_seconds):
+                raise ValueError("Reference source bounds must be finite")
+            if variant.source_end_seconds <= variant.source_start_seconds:
+                raise ValueError("Reference source bounds must have positive duration")
+
+    def _validate_reference_asset_integrity(
+        self,
+        session: Session,
+        asset: ReferenceAsset,
+        variants: list[ReferenceVariant] | None = None,
+    ) -> None:
+        if asset.active_variant_id is None:
+            return
+        if variants is None:
+            variants = self._get_reference_variants(session, asset.id)
+        if not any(variant.id == asset.active_variant_id for variant in variants):
+            raise ValueError("Reference asset active variant must belong to the asset")
+
+    def _to_reference_asset_summary(
+        self,
+        session: Session,
+        asset: ReferenceAsset,
+    ) -> ReferenceAssetSummary:
+        variants = self._get_reference_variants(session, asset.id)
+        self._validate_reference_asset_integrity(session, asset, variants)
+        active_variant = next(
+            (variant for variant in variants if variant.id == asset.active_variant_id),
+            None,
+        )
+        return ReferenceAssetSummary(
+            id=asset.id,
+            project_id=asset.project_id,
+            name=asset.name,
+            status=asset.status,
+            transcript_text=asset.transcript_text,
+            speaker_name=asset.speaker_name,
+            language=asset.language,
+            mood_label=asset.mood_label,
+            active_variant_id=asset.active_variant_id,
+            created_from_run_id=asset.created_from_run_id,
+            created_from_candidate_id=asset.created_from_candidate_id,
+            source_slice_id=self._reference_asset_metadata(asset).get("source_slice_id"),
+            source_audio_variant_id=self._reference_asset_metadata(asset).get("source_audio_variant_id"),
+            source_edit_commit_id=self._reference_asset_metadata(asset).get("source_edit_commit_id"),
+            created_at=self._as_utc(asset.created_at),
+            updated_at=self._as_utc(asset.updated_at),
+            active_variant=self._reference_variant_view(active_variant),
+        )
+
+    def _to_reference_asset_detail(
+        self,
+        session: Session,
+        asset: ReferenceAsset,
+    ) -> ReferenceAssetDetail:
+        variants = self._get_reference_variants(session, asset.id)
+        for variant in variants:
+            self._validate_reference_variant_provenance(session, asset, variant)
+        summary = self._to_reference_asset_summary(session, asset)
+        return ReferenceAssetDetail(
+            **summary.model_dump(mode="json"),
+            notes=asset.notes,
+            favorite_rank=asset.favorite_rank,
+            model_metadata=asset.model_metadata,
+            variants=[self._reference_variant_view(variant) for variant in variants if variant is not None],
         )
 
     def _revision_view(self, commit: EditCommit) -> SliceRevision:
@@ -1868,6 +2256,70 @@ class SQLiteRepository:
 
     def _managed_variant_path(self, variant_id: str) -> Path:
         return self._managed_media_path("variants", variant_id)
+
+    def _reference_variant_storage_key(self, variant_id: str) -> str:
+        safe_identifier = self._validate_managed_media_id(variant_id)
+        return f"reference-variants/{safe_identifier}.wav"
+
+    def _managed_reference_variant_path(self, variant_id: str) -> Path:
+        return (self.media_root / self._reference_variant_storage_key(variant_id)).resolve()
+
+    def _reference_asset_metadata(self, asset: ReferenceAsset) -> dict[str, Any]:
+        return dict(asset.model_metadata or {})
+
+    def _normalize_reference_variant_storage_key(self, raw_value: str, variant_id: str) -> str:
+        raw_path = Path(raw_value)
+        if raw_path.is_absolute():
+            resolved = raw_path.expanduser().resolve(strict=False)
+            media_root = self.media_root.resolve()
+            if resolved.is_relative_to(media_root):
+                return resolved.relative_to(media_root).as_posix()
+            return raw_value
+        if raw_value.startswith("reference-variants/"):
+            return raw_value
+        return self._reference_variant_storage_key(variant_id)
+
+    def _resolve_reference_variant_media_path(self, raw_value: str) -> Path:
+        raw_path = Path(raw_value)
+        if raw_path.is_absolute():
+            return self._resolve_variant_media_path(raw_path)
+        resolved = (self.media_root / raw_path).resolve(strict=False)
+        media_root = self.media_root.resolve()
+        if not resolved.is_relative_to(media_root):
+            raise ValueError(f"Managed reference media path escapes media root: {resolved}")
+        if not resolved.exists():
+            raise FileNotFoundError(resolved)
+        return resolved
+
+    def _reference_asset_migration_reports_root(self) -> Path:
+        return (self.db_path.parent / "migration-reports").resolve()
+
+    def _write_reference_asset_migration_report(self, issues: list[dict[str, Any]]) -> Path | None:
+        if not issues:
+            return None
+        reports_root = self._reference_asset_migration_reports_root()
+        reports_root.mkdir(parents=True, exist_ok=True)
+        report_path = reports_root / f"referenceasset-migration-{utc_now().strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        payload = {
+            "generated_at": utc_now().isoformat(),
+            "issue_count": len(issues),
+            "issues": issues,
+        }
+        report_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        return report_path
+
+    def _default_reference_asset_name(self, slice_row: Slice) -> str:
+        transcript_text = self._transcript_text(slice_row.transcript).strip()
+        if transcript_text:
+            words = transcript_text.split()
+            preview = " ".join(words[:6]).strip()
+            if len(words) > 6:
+                preview = f"{preview}..."
+            return preview
+        speaker = self._speaker_name(slice_row)
+        start = float(self._slice_metadata(slice_row).get("original_start_time", 0.0))
+        end = float(self._slice_metadata(slice_row).get("original_end_time", self._slice_duration(slice_row)))
+        return f"{speaker} {start:.2f}-{end:.2f}s"
 
     def _prune_derived_media_cache(self) -> int:
         with self._session() as session:

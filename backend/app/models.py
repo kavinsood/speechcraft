@@ -34,6 +34,25 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class ReferenceRunStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ReferenceAssetStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class ReferenceSourceKind(str, Enum):
+    SOURCE_RECORDING = "source_recording"
+    SLICE_VARIANT = "slice_variant"
+    REFERENCE_VARIANT = "reference_variant"
+
+
 # ==========================================
 # LINK TABLES (MANY-TO-MANY)
 # ==========================================
@@ -242,6 +261,7 @@ class SourceRecordingView(SQLModel):
     num_channels: int
     num_samples: int
     processing_recipe: str | None = None
+    duration_seconds: float = 0.0
 
 
 class SliceRevision(SQLModel):
@@ -283,13 +303,61 @@ class SliceDetail(SliceSummary):
     active_commit: SliceRevision | None = None
 
 
-class ReferenceAsset(SQLModel, table=True):
-    """A stable pointer to an exact variant selected as reference audio."""
-
+class ReferencePickerRun(SQLModel, table=True):
     id: str = Field(primary_key=True)
-    name: str
-    audio_variant_id: str = Field(foreign_key="audiovariant.id", unique=True)
+    project_id: str = Field(foreign_key="importbatch.id")
+    status: ReferenceRunStatus = Field(default=ReferenceRunStatus.QUEUED)
+    mode: str = "both"
+    config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    artifact_root: str
+    candidate_count: int = 0
+    error_message: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class ReferenceAsset(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    project_id: str = Field(foreign_key="importbatch.id")
+    name: str
+    status: ReferenceAssetStatus = Field(default=ReferenceAssetStatus.ACTIVE)
+    transcript_text: str | None = None
+    speaker_name: str | None = None
+    language: str | None = None
+    mood_label: str | None = None
+    notes: str | None = None
+    favorite_rank: int | None = None
+    active_variant_id: str | None = None
+    created_from_run_id: str | None = Field(default=None, foreign_key="referencepickerrun.id")
+    created_from_candidate_id: str | None = None
+    model_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ReferenceVariant(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    reference_asset_id: str = Field(foreign_key="referenceasset.id")
+    source_kind: ReferenceSourceKind
+    source_recording_id: str | None = Field(default=None, foreign_key="sourcerecording.id")
+    source_slice_id: str | None = Field(default=None, foreign_key="slice.id")
+    source_audio_variant_id: str | None = Field(default=None, foreign_key="audiovariant.id")
+    source_reference_variant_id: str | None = Field(default=None, foreign_key="referencevariant.id")
+    source_start_seconds: float | None = None
+    source_end_seconds: float | None = None
+    file_path: str
+    is_original: bool = False
+    generator_model: str | None = None
+    sample_rate: int
+    num_samples: int
+    model_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    deleted: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def duration_s(self) -> float:
+        return self.num_samples / self.sample_rate if self.sample_rate else 0.0
 
 
 class ExportRun(SQLModel, table=True):
@@ -435,10 +503,55 @@ class AudioVariantCreate(SQLModel):
     generator_model: str
 
 
-class ReferenceAssetCreate(SQLModel):
+class ReferenceVariantView(SQLModel):
     id: str
+    reference_asset_id: str
+    source_kind: ReferenceSourceKind
+    source_recording_id: str | None = None
+    source_slice_id: str | None = None
+    source_audio_variant_id: str | None = None
+    source_reference_variant_id: str | None = None
+    source_start_seconds: float | None = None
+    source_end_seconds: float | None = None
+    is_original: bool = False
+    generator_model: str | None = None
+    sample_rate: int
+    num_samples: int
+    deleted: bool = False
+    created_at: datetime
+
+
+class ReferenceAssetSummary(SQLModel):
+    id: str
+    project_id: str
     name: str
-    audio_variant_id: str
+    status: ReferenceAssetStatus
+    transcript_text: str | None = None
+    speaker_name: str | None = None
+    language: str | None = None
+    mood_label: str | None = None
+    active_variant_id: str | None = None
+    created_from_run_id: str | None = None
+    created_from_candidate_id: str | None = None
+    source_slice_id: str | None = None
+    source_audio_variant_id: str | None = None
+    source_edit_commit_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    active_variant: ReferenceVariantView | None = None
+
+
+class ReferenceAssetDetail(ReferenceAssetSummary):
+    notes: str | None = None
+    favorite_rank: int | None = None
+    model_metadata: dict[str, Any] | None = None
+    variants: list[ReferenceVariantView] = Field(default_factory=list)
+
+
+class ReferenceAssetCreateFromSlice(SQLModel):
+    slice_id: str
+    name: str | None = None
+    mood_label: str | None = None
 
 
 class WaveformPeaks(SQLModel):

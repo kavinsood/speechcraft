@@ -16,8 +16,9 @@ from .models import (
     MediaCleanupResult,
     ProjectSummary,
     RecordingDerivativeCreate,
-    ReferenceAsset,
-    ReferenceAssetCreate,
+    ReferenceAssetCreateFromSlice,
+    ReferenceAssetDetail,
+    ReferenceAssetSummary,
     SliceSaveRequest,
     SliceDetail,
     SliceSummary,
@@ -28,6 +29,7 @@ from .models import (
     SliceTranscriptUpdate,
     SourceRecording,
     SourceRecordingCreate,
+    SourceRecordingView,
     SlicerHandoffRequest,
     WaveformPeaks,
 )
@@ -89,6 +91,14 @@ def list_projects() -> list[ProjectSummary]:
 def get_project(project_id: str) -> ProjectSummary:
     try:
         return repository.get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.get("/api/projects/{project_id}/source-recordings", response_model=list[SourceRecordingView])
+def list_project_source_recordings(project_id: str) -> list[SourceRecordingView]:
+    try:
+        return repository.list_source_recordings(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
@@ -278,6 +288,19 @@ def get_variant_media(variant_id: str) -> FileResponse:
     return FileResponse(path=path, media_type="audio/wav")
 
 
+@app.get("/media/reference-variants/{variant_id}.wav")
+def get_reference_variant_media(variant_id: str) -> FileResponse:
+    try:
+        path = repository.get_reference_variant_media_path(variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Reference variant not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
 @app.get("/media/slices/{slice_id}.wav")
 def get_slice_media(slice_id: str) -> FileResponse:
     try:
@@ -319,6 +342,38 @@ def create_preprocessed_recording(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/projects/{project_id}/reference-assets", response_model=list[ReferenceAssetSummary])
+def list_project_reference_assets(project_id: str) -> list[ReferenceAssetSummary]:
+    try:
+        return repository.list_reference_assets(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"Reference asset integrity error: {exc}") from exc
+
+
+@app.get("/api/reference-assets/{asset_id}", response_model=ReferenceAssetDetail)
+def get_reference_asset(asset_id: str) -> ReferenceAssetDetail:
+    try:
+        return repository.get_reference_asset(asset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Reference asset not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"Reference asset integrity error: {exc}") from exc
+
+
+@app.post("/api/reference-assets/from-slice", response_model=ReferenceAssetDetail)
+def create_reference_asset_from_slice(
+    payload: ReferenceAssetCreateFromSlice,
+) -> ReferenceAssetDetail:
+    try:
+        return repository.create_reference_asset_from_slice(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/source-recordings/{recording_id}/slice-handoff", response_model=list[SliceDetail])
 def register_slicer_chunks(recording_id: str, payload: SlicerHandoffRequest) -> list[SliceDetail]:
     try:
@@ -327,11 +382,3 @@ def register_slicer_chunks(recording_id: str, payload: SlicerHandoffRequest) -> 
         raise HTTPException(status_code=404, detail="Source recording not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/reference-assets", response_model=ReferenceAsset)
-def create_reference_asset(payload: ReferenceAssetCreate) -> ReferenceAsset:
-    try:
-        return repository.create_reference_asset(payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Audio variant not found") from exc
