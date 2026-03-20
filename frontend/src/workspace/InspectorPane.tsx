@@ -1,4 +1,5 @@
-import type { ExportRun, ReviewStatus, Slice } from "../types";
+import { useEffect, useState, type FormEvent } from "react";
+import type { ExportRun, ReferenceAssetSummary, ReviewStatus, Slice } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatDurationCompact,
@@ -35,6 +36,10 @@ type InspectorPaneProps = {
   onRetryLoad: () => void;
   onStatusChange: (status: ReviewStatus) => void;
   onVariantSelect: (variantId: string) => void;
+  existingReferenceForCurrentState: ReferenceAssetSummary | null;
+  onOpenExistingReference: (assetId: string) => void;
+  onSaveAsReference: (options?: { name?: string | null; mood_label?: string | null }) => void;
+  isSavingReference: boolean;
 };
 
 export default function InspectorPane({
@@ -51,7 +56,32 @@ export default function InspectorPane({
   onRetryLoad,
   onStatusChange,
   onVariantSelect,
+  existingReferenceForCurrentState,
+  onOpenExistingReference,
+  onSaveAsReference,
+  isSavingReference,
 }: InspectorPaneProps) {
+  const [showSaveAnotherForm, setShowSaveAnotherForm] = useState(false);
+  const [referenceName, setReferenceName] = useState("");
+  const [referenceMoodLabel, setReferenceMoodLabel] = useState("");
+
+  useEffect(() => {
+    setShowSaveAnotherForm(false);
+    setReferenceName("");
+    setReferenceMoodLabel("");
+  }, [activeClip?.id, activeClip?.active_commit_id, existingReferenceForCurrentState?.id]);
+
+  function handleSaveAnotherSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onSaveAsReference({
+      name: referenceName.trim() || null,
+      mood_label: referenceMoodLabel.trim() || null,
+    });
+    setShowSaveAnotherForm(false);
+    setReferenceName("");
+    setReferenceMoodLabel("");
+  }
+
   return (
     <aside className="inspector-column panel">
       <div className="panel-header">
@@ -222,6 +252,87 @@ export default function InspectorPane({
             ) : (
               <p className="muted-copy">No variants attached to this slice.</p>
             )}
+          </section>
+
+          <section className="inspector-block">
+            <h3>Reference Library</h3>
+            <p className="muted-copy">
+              Saves the current rendered slice audio, including active edits.
+            </p>
+            {existingReferenceForCurrentState ? (
+              <>
+                <div className="commit-card selected">
+                  <div className="commit-row">
+                    <strong>{existingReferenceForCurrentState.name}</strong>
+                    <span>{existingReferenceForCurrentState.status}</span>
+                  </div>
+                  <p>
+                    This current slice state is already saved in the reference library.
+                  </p>
+                </div>
+                <div className="button-row">
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => onOpenExistingReference(existingReferenceForCurrentState.id)}
+                  >
+                    Open Existing
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowSaveAnotherForm((current) => !current)}
+                    disabled={isSavingReference}
+                  >
+                    {showSaveAnotherForm ? "Cancel" : "Save Another..."}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => onSaveAsReference()}
+                disabled={isSavingReference}
+              >
+                {isSavingReference ? "Saving reference..." : "Save Current Slice State"}
+              </button>
+            )}
+            {showSaveAnotherForm ? (
+              <form className="selection-panel reference-save-form" onSubmit={handleSaveAnotherSubmit}>
+                <label>
+                  <span>Name</span>
+                  <input
+                    className="search-input"
+                    type="text"
+                    value={referenceName}
+                    onChange={(event) => setReferenceName(event.target.value)}
+                    placeholder="Optional custom name"
+                  />
+                </label>
+                <label>
+                  <span>Mood Label</span>
+                  <input
+                    className="search-input"
+                    type="text"
+                    value={referenceMoodLabel}
+                    onChange={(event) => setReferenceMoodLabel(event.target.value)}
+                    placeholder="Optional mood or use-case"
+                  />
+                </label>
+                <div className="button-row">
+                  <button className="primary-button" type="submit" disabled={isSavingReference}>
+                    {isSavingReference ? "Saving reference..." : "Save Another Reference"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowSaveAnotherForm(false)}
+                    disabled={isSavingReference}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : null}
           </section>
 
           <section className="inspector-block">

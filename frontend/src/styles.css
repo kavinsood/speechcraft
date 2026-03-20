@@ -1182,6 +1182,17 @@ button:disabled {
   width: 100%;
 }
 
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.reference-save-form {
+  margin-top: 0.85rem;
+}
+
 .tag-token-list {
   display: flex;
   flex-wrap: wrap;

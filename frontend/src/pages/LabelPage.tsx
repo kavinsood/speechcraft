@@ -4,6 +4,7 @@ import {
   appendClipEdlOperation,
   buildSliceAudioUrl,
   cleanupProjectMedia,
+  fetchProjectReferenceAssets,
   fetchProjectExports,
   fetchSliceDetail,
   fetchProjectSlices,
@@ -11,6 +12,7 @@ import {
   redoClip,
   runClipLabModel,
   runProjectExport,
+  saveCurrentSliceAsReference,
   saveClipState,
   setActiveVariant,
   splitClip,
@@ -26,7 +28,14 @@ import {
   getSliceDuration,
   sortClipsForQueue,
 } from "../workspace/workspace-helpers";
-import type { ExportRun, Project, ReviewStatus, Slice, SliceSummary } from "../types";
+import type {
+  ExportRun,
+  Project,
+  ReferenceAssetSummary,
+  ReviewStatus,
+  Slice,
+  SliceSummary,
+} from "../types";
 
 type WorkspaceStatus = "loading" | "error" | "ready";
 
@@ -84,8 +93,10 @@ export default function LabelPage({
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
+  const [referenceAssets, setReferenceAssets] = useState<ReferenceAssetSummary[]>([]);
   const [isRunningExport, setIsRunningExport] = useState(false);
   const [isCleaningMedia, setIsCleaningMedia] = useState(false);
+  const [isSavingReference, setIsSavingReference] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
   const latestDetailRequestRef = useRef(0);
   const showDangerousDevActions = import.meta.env.DEV;
@@ -101,6 +112,7 @@ export default function LabelPage({
     if (!projectId) {
       setSlices([]);
       setExportRuns([]);
+      setReferenceAssets([]);
       setActiveClipId(null);
       setVisibleQueueClipIds([]);
       setWorkspaceStatus("ready");
@@ -113,6 +125,17 @@ export default function LabelPage({
         fetchProjectSlices(projectId),
         fetchProjectExports(projectId),
       ]);
+      let nextReferenceAssets: ReferenceAssetSummary[] = [];
+
+      try {
+        nextReferenceAssets = await fetchProjectReferenceAssets(projectId);
+      } catch (error) {
+        if (latestWorkspaceRequestRef.current === requestId) {
+          setWorkspaceNotice(
+            getErrorMessage(error, "The reference library did not load, so duplicate-save protection is unavailable right now."),
+          );
+        }
+      }
 
       if (latestWorkspaceRequestRef.current !== requestId) {
         return;
@@ -122,6 +145,7 @@ export default function LabelPage({
       setSlices(nextSlices);
       setActiveClip(null);
       setExportRuns(nextExports);
+      setReferenceAssets(nextReferenceAssets);
       setVisibleQueueClipIds(sortedSlices.map((slice) => slice.id));
       setActiveClipId((current) =>
         sortedSlices.some((slice) => slice.id === current) ? current : (sortedSlices[0]?.id ?? null),
@@ -136,6 +160,7 @@ export default function LabelPage({
       setSlices([]);
       setActiveClip(null);
       setExportRuns([]);
+      setReferenceAssets([]);
       setActiveClipId(null);
       setVisibleQueueClipIds([]);
       setWorkspaceStatus("error");
@@ -388,6 +413,48 @@ export default function LabelPage({
     }
   }
 
+  async function handleSaveAsReference(options?: {
+    name?: string | null;
+    mood_label?: string | null;
+  }) {
+    if (!activeClip) {
+      return;
+    }
+    if (!activeClip.active_variant_id) {
+      setWorkspaceNotice("This slice does not have an active variant to save.");
+      return;
+    }
+
+    setIsSavingReference(true);
+    try {
+      const reference = await saveCurrentSliceAsReference({
+        slice_id: activeClip.id,
+        name: options?.name ?? null,
+        mood_label: options?.mood_label ?? null,
+      });
+      if (activeProject) {
+        setReferenceAssets(await fetchProjectReferenceAssets(activeProject.id));
+      }
+      setWorkspaceNotice(`Saved reference: ${reference.name}.`);
+    } catch (error) {
+      setWorkspaceNotice(getErrorMessage(error, "Saving this slice as a reference failed."));
+    } finally {
+      setIsSavingReference(false);
+    }
+  }
+
+  function openReferenceAssetInLibrary(assetId: string) {
+    if (!activeProject) {
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.pathname = "/reference";
+    url.searchParams.set("project", activeProject.id);
+    url.searchParams.set("asset", assetId);
+    window.history.pushState({}, "", url);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }
+
   const datasetStatusCounts = useMemo(() => {
     const counts: Record<ReviewStatus, number> = {
       unresolved: 0,
@@ -431,6 +498,18 @@ export default function LabelPage({
       : null;
   const canUndo = Boolean(activeClip?.can_undo);
   const canRedo = Boolean(activeClip?.can_redo);
+  const existingReferenceForCurrentState = useMemo(() => {
+    if (!activeClip?.active_commit_id) {
+      return null;
+    }
+    return (
+      referenceAssets.find(
+        (asset) =>
+          asset.source_slice_id === activeClip.id
+          && asset.source_edit_commit_id === activeClip.active_commit_id,
+      ) ?? null
+    );
+  }, [activeClip?.active_commit_id, activeClip?.id, referenceAssets]);
 
   useEffect(() => {
     onHeaderActionsChange(
@@ -532,6 +611,10 @@ export default function LabelPage({
               });
             }}
             onVariantSelect={(variantId) => void setActiveVariantMutation(variantId)}
+            existingReferenceForCurrentState={existingReferenceForCurrentState}
+            onOpenExistingReference={openReferenceAssetInLibrary}
+            onSaveAsReference={(options) => void handleSaveAsReference(options)}
+            isSavingReference={isSavingReference}
           />
         </div>
       </div>

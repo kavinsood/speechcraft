@@ -276,3 +276,18 @@ export async function fetchWaveformPeaks(
   const response = await fetch(`${API_BASE}/api/clips/${clipId}/waveform-peaks?bins=${bins}`);
   return await parseJson<WaveformPeaks>(response);
 }
+
+export async function saveCurrentSliceAsReference(payload: {
+  slice_id: string;
+  name?: string | null;
+  mood_label?: string | null;
+}): Promise<ReferenceAssetDetail> {
+  const response = await fetch(`${API_BASE}/api/reference-assets/from-slice`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceAssetDetail>(response);
+}
