@@ -84,6 +84,8 @@ As of `2026-03-21`, the branch has crossed the first real picker threshold.
 - lightweight async-shaped local worker behavior exists for picker runs
 - source-backed candidate generation exists
 - ranked candidate browse exists on the `reference` page
+- current-run rerank exists with positive / negative candidate anchors
+- rerank keeps baseline `default_scores` intact and returns separate intent-shaped score fields
 - candidate preview media is materialized lazily and cached under the run artifact root
 - candidate promotion to `ReferenceAsset` exists using canonical candidate bounds as-is
 - candidate preview cache writes are atomic rather than direct final-path writes
@@ -98,20 +100,26 @@ As of `2026-03-21`, the branch has crossed the first real picker threshold.
 - repository-side integrity validation exists for reference provenance and active-variant membership
 - repository instantiation is lazy instead of import-time eager
 - `ReferencePage` has been split into real run / candidate / library panes rather than remaining one large render surface
+- frontend interaction tests now exist for the `reference` page state machine:
+  - failed-run polling termination
+  - explicit source-selection default on multi-source projects
+  - promoted-candidate state across runs
+  - rerank interaction coverage
+- rerank requests are debounced on the frontend so rapid toggle bursts do not spam the backend
+- run artifacts now store a self-described `acoustic_signature_v1` feature set keyed by `candidate_id`
 
 ### Partially Complete
 
 - the candidate miner is now energy-scaffolded rather than whole-recording sliding-window only, but it is not yet truly speech-aware
 - picker runs use an async-shaped local thread model, but not a claim-based durable worker contract
 - frontend state is cleaner than before, but the page still coordinates most picker state centrally
+- current rerank uses a deterministic acoustic-signature feature vector, not yet a stronger speaker/style embedding
 
 ### Not Started
 
-- positive / negative rerank loop
 - browser-side candidate auto-trim
 - cluster / mood discovery lens
 - reference-specific processing surface
-- frontend interaction tests for the `reference` page state machine
 
 ### Completedness Estimate
 
@@ -128,10 +136,9 @@ The next slice to build is Phase 1C, not another broad infrastructure pass.
 
 The next branch milestone should be:
 
-- positive / negative rerank over the existing candidate pool
 - browser-side trim suggestion on candidate preview audio
 - trim-aware candidate promotion using absolute source-relative bounds
-- lightweight frontend interaction coverage for the `reference` page state machine
+- frontend interaction coverage for rerank and trim behavior
 
 This intentionally still defers:
 
@@ -139,12 +146,15 @@ This intentionally still defers:
 - reference-specific processing depth
 - truly speech-aware candidate mining beyond the current energy scaffold
 - generalized background-job infrastructure
+- saved-reference anchors for rerank until there is a real asset-embedding cache / backfill policy
 
 Why:
 
 - the product now has a real run -> candidate -> preview -> promote path
 - the biggest remaining user-facing gap is intent shaping and trim refinement
 - those features should now land on top of a hardened real picker surface, not a temporary shell
+- rerank is not real without stored embeddings, so embeddings are part of Phase 1C itself, not a side dependency
+- the current rerank substrate is intentionally modest (`acoustic_signature_v1`) and should not be mistaken for the final long-term reference-intent representation
 
 ### Verification Completed So Far
 
@@ -248,9 +258,24 @@ Phase 1B still does not include:
 
 Phase 1C then adds:
 
-- positive / negative rerank
 - browser-side trim suggestion
 - trim-aware promotion from candidate
+
+Phase 1C also locks the following rules:
+
+- rerank does not overwrite `default_scores`; baseline run scores stay intact
+- rerank returns separate intent-shaped score fields such as `intent_score` and `rerank_score`
+- trim-aware promotion from candidate may only save the candidate as-is or a trimmed subspan of that candidate
+- backend validation must reject trim bounds that extend outside the candidate's canonical bounds
+- the center pane remains the temporary candidate work surface for selection, rerank, and trim
+- the right pane remains the durable saved-library surface
+
+Phase 1C intentionally defers:
+
+- saved `ReferenceAsset` anchors until a real reference-embedding cache / backfill plan exists
+- broader cross-run preference shaping
+- clustering as a requirement for rerank
+- stronger semantic/style embedding families beyond the current acoustic-signature substrate
 
 ### Phase 2: Discovery And Library Depth
 
@@ -804,7 +829,7 @@ Positive and negative anchors should be first-class.
 Sources allowed as anchors:
 
 - candidate ids from the current run
-- saved `ReferenceAsset` ids
+- saved `ReferenceAsset` ids later, after asset-embedding storage and backfill exist
 - active slice variants later
 
 Initial rerank equation:
@@ -817,6 +842,13 @@ Final score combines:
 - intent score
 - quality bonus
 - risk penalty
+
+For Phase 1C:
+
+- keep baseline `default_scores` unchanged in the candidate manifest and baseline list response
+- rerank responses must return separate fields for rerank output rather than mutating the baseline score fields
+- current-run candidate anchors are in scope first
+- saved-reference anchors are deferred until there is a real embedding cache / backfill policy for older library assets
 
 Clustering must not be required for reranking to work.
 
@@ -892,6 +924,7 @@ This contract must be explicit.
 - browser trim suggestion is computed relative to the preview buffer
 - before promotion, the browser must convert the final trim back into absolute source-relative bounds
 - the backend validates and cuts using those absolute bounds
+- backend validation must also enforce that the requested trim remains inside the candidate's canonical bounds, not merely inside the overall source duration
 
 Do not persist preview-relative offsets as reference truth.
 
@@ -1083,9 +1116,14 @@ Recommended rerank request:
 
 - positive candidate ids
 - negative candidate ids
-- positive reference asset ids
-- negative reference asset ids
+- positive reference asset ids later
+- negative reference asset ids later
 - mode
+
+Phase 1C recommendation:
+
+- start with candidate-anchor rerank only
+- add saved-reference anchors only after asset embeddings exist for new and legacy library entries
 
 ## Reference Asset Endpoints
 
@@ -1116,6 +1154,7 @@ Promotion from candidate must:
 - create the initial `ReferenceVariant`
 - set the asset's active variant
 - preserve provenance back to the candidate run and source media lineage
+- reject requested trim bounds that extend outside the candidate's canonical start and end bounds
 
 Do not silently jump from a derivative-backed candidate preview to a raw-parent source cut unless the UI explicitly asked for that policy.
 
