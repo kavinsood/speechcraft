@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ReferencePage from "./ReferencePage";
@@ -12,6 +12,7 @@ vi.mock("../api", () => ({
   fetchReferenceRun: vi.fn(),
   fetchReferenceRunCandidates: vi.fn(),
   promoteReferenceCandidate: vi.fn(),
+  rerankReferenceRunCandidates: vi.fn(),
   buildReferenceCandidateAudioUrl: vi.fn((runId: string, candidateId: string) => `/candidate/${runId}/${candidateId}.wav`),
   buildReferenceVariantAudioUrl: vi.fn((variantId: string) => `/reference/${variantId}.wav`),
   ApiError: class ApiError extends Error {
@@ -33,6 +34,7 @@ import {
   fetchReferenceAsset,
   fetchReferenceRun,
   fetchReferenceRunCandidates,
+  rerankReferenceRunCandidates,
 } from "../api";
 
 const mockedFetchProjectSourceRecordings = vi.mocked(fetchProjectSourceRecordings);
@@ -41,6 +43,7 @@ const mockedFetchProjectReferenceAssets = vi.mocked(fetchProjectReferenceAssets)
 const mockedFetchReferenceAsset = vi.mocked(fetchReferenceAsset);
 const mockedFetchReferenceRun = vi.mocked(fetchReferenceRun);
 const mockedFetchReferenceRunCandidates = vi.mocked(fetchReferenceRunCandidates);
+const mockedRerankReferenceRunCandidates = vi.mocked(rerankReferenceRunCandidates);
 
 function makeRecording(id: string) {
   return {
@@ -153,6 +156,55 @@ describe("ReferencePage", () => {
     expect(sourceOne.checked).toBe(false);
     expect(sourceTwo.checked).toBe(false);
     expect(startButton.disabled).toBe(true);
+  });
+
+  it("reranks candidates when a like anchor is toggled", async () => {
+    mockedFetchProjectSourceRecordings.mockResolvedValue([makeRecording("src-1")]);
+    mockedFetchProjectReferenceRuns.mockResolvedValue([makeRun("run-current", "completed")]);
+    mockedFetchProjectReferenceAssets.mockResolvedValue([]);
+    mockedFetchReferenceRun.mockResolvedValue(makeRun("run-current", "completed"));
+    mockedFetchReferenceRunCandidates.mockResolvedValue([
+      makeCandidate("run-current", "cand-a"),
+      makeCandidate("run-current", "cand-b"),
+    ]);
+    mockedRerankReferenceRunCandidates.mockResolvedValue({
+      run_id: "run-current",
+      mode: "both",
+      positive_candidate_ids: ["cand-b"],
+      negative_candidate_ids: [],
+      candidates: [
+        {
+          ...makeCandidate("run-current", "cand-b"),
+          mode: "both",
+          base_score: 0.92,
+          intent_score: 0.75,
+          rerank_score: 1.67,
+        },
+        {
+          ...makeCandidate("run-current", "cand-a"),
+          mode: "both",
+          base_score: 0.92,
+          intent_score: -0.1,
+          rerank_score: 0.82,
+        },
+      ],
+    });
+
+    renderReferencePage();
+    await screen.findAllByRole("button", { name: "Like" });
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Like" })[1]);
+
+    await waitFor(() => {
+      expect(mockedRerankReferenceRunCandidates).toHaveBeenCalledWith("run-current", {
+        positive_candidate_ids: ["cand-b"],
+        negative_candidate_ids: [],
+        mode: "both",
+      });
+    });
+
+    await screen.findByText("1.670");
+    expect(screen.getByText(/Likes:/)).toBeTruthy();
   });
 
   it("shows promoted-state across runs when candidate identity already exists in the library", async () => {

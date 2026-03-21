@@ -18,6 +18,8 @@ from app.models import (
     ReferenceAssetCreateFromSlice,
     ReferenceCandidateSummary,
     ReferenceRunCreate,
+    ReferenceRunRerankRequest,
+    ReferencePickerRun,
     ReferenceRunStatus,
     ReferenceVariant,
     ReviewStatus,
@@ -37,6 +39,14 @@ from app.repository import SQLiteRepository, SliceSaveValidationError
 def read_wav_duration_seconds(path: Path) -> float:
     with wave.open(str(path), "rb") as wav_file:
         return wav_file.getnframes() / wav_file.getframerate()
+
+
+def read_reference_embeddings(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text())
+
+
+def read_reference_manifest(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text())
 
 
 def build_legacy_clip(project_id: str, clip_id: str, source_file_id: str, order_index: int) -> dict[str, object]:
@@ -698,6 +708,140 @@ class RepositoryMediaTests(TestCase):
             [candidate.candidate_id for candidate in first_candidates],
             [candidate.candidate_id for candidate in second_candidates],
         )
+
+    def test_reference_run_writes_embedding_artifact_for_candidates(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        self.repository.process_reference_run(run.id)
+
+        candidates = self.repository.list_reference_run_candidates(run.id, limit=8)
+        self.assertGreater(len(candidates), 0)
+        self.assertTrue(all(candidate.embedding_index is not None for candidate in candidates))
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            run_row = session.get(ReferencePickerRun, run.id)
+            self.assertIsNotNone(run_row)
+            embeddings_path = self.repository._reference_run_embeddings_path(Path(run_row.artifact_root))
+            manifest_path = Path(run_row.artifact_root) / "manifest.json"
+
+        self.assertTrue(embeddings_path.exists())
+        payload = read_reference_embeddings(embeddings_path)
+        self.assertEqual(payload["extractor"]["name"], "acoustic_signature_v1")
+        self.assertEqual(payload["extractor"]["version"], 1)
+        entries = payload["entries"]
+        self.assertEqual(len(entries), len(candidates))
+        self.assertEqual(payload["extractor"]["dimension"], len(entries[0]["vector"]))
+        self.assertTrue(all(len(entry["vector"]) == payload["extractor"]["dimension"] for entry in entries))
+        self.assertEqual(
+            [entry["candidate_id"] for entry in entries],
+            [candidate.candidate_id for candidate in candidates],
+        )
+
+        manifest = read_reference_manifest(manifest_path)
+        self.assertEqual(manifest["embedding_extractor"], "acoustic_signature_v1")
+        self.assertEqual(manifest["embedding_extractor_version"], 1)
+
+    def test_reference_run_rerank_returns_separate_intent_scores_without_mutating_baseline_scores(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        self.repository.process_reference_run(run.id)
+        candidates = self.repository.list_reference_run_candidates(run.id, limit=8)
+
+        self.assertGreaterEqual(len(candidates), 2)
+        positive = candidates[0]
+        negative = candidates[1]
+
+        reranked = self.repository.rerank_reference_run_candidates(
+            run.id,
+            ReferenceRunRerankRequest(
+                positive_candidate_ids=[positive.candidate_id],
+                negative_candidate_ids=[negative.candidate_id],
+                mode="both",
+            ),
+        )
+
+        self.assertEqual(reranked.run_id, run.id)
+        self.assertEqual(reranked.positive_candidate_ids, [positive.candidate_id])
+        self.assertEqual(reranked.negative_candidate_ids, [negative.candidate_id])
+        self.assertEqual(len(reranked.candidates), len(candidates))
+        self.assertEqual(reranked.candidates[0].candidate_id, positive.candidate_id)
+
+        result_by_id = {candidate.candidate_id: candidate for candidate in reranked.candidates}
+        positive_result = result_by_id[positive.candidate_id]
+        negative_result = result_by_id[negative.candidate_id]
+
+        self.assertAlmostEqual(positive_result.base_score, positive.default_scores["both"], places=6)
+        self.assertAlmostEqual(negative_result.base_score, negative.default_scores["both"], places=6)
+        self.assertGreater(positive_result.intent_score, 0.0)
+        self.assertLess(negative_result.intent_score, positive_result.intent_score)
+        self.assertGreater(positive_result.rerank_score, positive_result.base_score)
+        self.assertEqual(positive.default_scores["both"], result_by_id[positive.candidate_id].default_scores["both"])
+
+    def test_reference_run_rerank_rejects_overlapping_positive_and_negative_anchors(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        with self.assertRaisesRegex(ValueError, "both positive and negative"):
+            self.repository.rerank_reference_run_candidates(
+                run.id,
+                ReferenceRunRerankRequest(
+                    positive_candidate_ids=[candidate.candidate_id],
+                    negative_candidate_ids=[candidate.candidate_id],
+                    mode="both",
+                ),
+            )
+
+    def test_reference_run_rerank_rejects_anchor_ids_outside_the_run(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+
+        with self.assertRaisesRegex(ValueError, "does not belong to the run"):
+            self.repository.rerank_reference_run_candidates(
+                run.id,
+                ReferenceRunRerankRequest(
+                    positive_candidate_ids=["cand-missing"],
+                    negative_candidate_ids=[],
+                    mode="both",
+                ),
+            )
+
+    def test_reference_run_rerank_fails_if_embedding_artifact_is_corrupt(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            run_row = session.get(ReferencePickerRun, run.id)
+            self.assertIsNotNone(run_row)
+            embeddings_path = self.repository._reference_run_embeddings_path(Path(run_row.artifact_root))
+
+        payload = read_reference_embeddings(embeddings_path)
+        payload["entries"][0]["vector"] = payload["entries"][0]["vector"][:-1]
+        embeddings_path.write_text(json.dumps(payload))
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        with self.assertRaisesRegex(ValueError, "dimension mismatch"):
+            self.repository.rerank_reference_run_candidates(
+                run.id,
+                ReferenceRunRerankRequest(
+                    positive_candidate_ids=[candidate.candidate_id],
+                    negative_candidate_ids=[],
+                    mode="both",
+                ),
+            )
 
     def test_reference_run_uses_speech_first_scaffold_instead_of_whole_recording_sweep(self) -> None:
         recording_path = self.repository.media_root / "imports" / "src-speechy.wav"
