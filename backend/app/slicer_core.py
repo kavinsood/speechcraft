@@ -213,4 +213,35 @@ def _midpoint_of_longest_run(indices: np.ndarray) -> int:
     return (best_start + best_end) // 2
 
 
-__all__ = ["find_energy_trough", "pack_aligned_words"]
+def mock_forced_align(text: str, duration_s: float) -> list[dict[str, float | str]]:
+    """
+    Temporary stand-in for real forced alignment.
+
+    Words are evenly distributed across the provided duration.
+    """
+
+    normalized_text = text.strip()
+    if not normalized_text:
+        return []
+    if duration_s <= 0:
+        raise ValueError("duration_s must be positive")
+
+    words = normalized_text.split()
+    segment_duration = duration_s / len(words)
+    aligned_words: list[dict[str, float | str]] = []
+
+    for index, word in enumerate(words):
+        start = index * segment_duration
+        end = duration_s if index == len(words) - 1 else (index + 1) * segment_duration
+        aligned_words.append(
+            {
+                "word": word,
+                "start": round(start, 6),
+                "end": round(end, 6),
+            }
+        )
+
+    return aligned_words
+
+
+__all__ = ["find_energy_trough", "mock_forced_align", "pack_aligned_words"]

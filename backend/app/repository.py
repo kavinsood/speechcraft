@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, SQLModel, create_engine, delete, select
 
@@ -66,6 +67,7 @@ from .models import (
     WaveformPeaks,
     utc_now,
 )
+from .slicer_core import mock_forced_align, pack_aligned_words
 
 DATA_VERSION_EXTERNAL_VARIANT_REHOME = 1
 DATA_VERSION_SLICE_REVISION_HISTORY = 2
@@ -1972,6 +1974,19 @@ class SQLiteRepository:
                 target_wav.writeframes(frames)
         return output.getvalue()
 
+    def _wav_bytes_to_mono_samples(self, audio_bytes: bytes) -> tuple[np.ndarray, int]:
+        channels, sample_width, sample_rate, frame_count, raw = self._read_pcm_wav(audio_bytes)
+        if sample_width != 2:
+            raise ValueError("Phase 1 only supports normalized 16-bit PCM WAV assets")
+        if frame_count <= 0:
+            return np.zeros(0, dtype=np.float64), sample_rate
+
+        pcm = np.frombuffer(raw, dtype="<i2").astype(np.float64)
+        if channels > 1:
+            pcm = pcm.reshape(frame_count, channels).mean(axis=1)
+        samples = pcm / 32768.0
+        return samples, sample_rate
+
     def _wav_metadata(self, audio_bytes: bytes) -> tuple[int, int, int]:
         channels, _sample_width, sample_rate, frames, _raw = self._read_pcm_wav(audio_bytes)
         return sample_rate, channels, frames
@@ -2326,9 +2341,6 @@ class SQLiteRepository:
             raise ValueError("Forced align and pack job is missing its source recording")
         recording = self._get_source_recording(session, job.source_recording_id)
         payload = job.input_payload or {}
-        transcript_text = str(payload.get("transcript_text", "")).strip()
-        if not transcript_text:
-            raise ValueError("Forced align and pack job requires transcript_text")
         requested_window_ids = payload.get("review_window_ids")
         if requested_window_ids:
             windows = session.exec(
@@ -2347,12 +2359,65 @@ class SQLiteRepository:
             ).all()
         if not windows:
             raise ValueError("Forced align and pack job requires at least one review window")
+        windows = list(sorted(windows, key=lambda window: (window.order_index, window.created_at)))
 
-        # Phase 1/2 only: the async substrate is live, but the actual aligner/packing loop
-        # will be added separately once the CTC aligner worker is integrated.
-        raise NotImplementedError(
-            "forced_align_and_pack worker is not implemented yet; review windows and job polling are ready"
+        master_transcript = " ".join(window.rough_transcript.strip() for window in windows if window.rough_transcript.strip())
+        explicit_transcript = str(payload.get("transcript_text", "")).strip()
+        if explicit_transcript:
+            master_transcript = explicit_transcript
+        if not master_transcript:
+            raise ValueError("Forced align and pack job requires transcript_text")
+
+        absolute_start = windows[0].start_seconds
+        absolute_end = windows[-1].end_seconds
+        audio_bytes = self._extract_source_window_wav_bytes(recording, absolute_start, absolute_end)
+        audio_samples, sample_rate = self._wav_bytes_to_mono_samples(audio_bytes)
+        if sample_rate <= 0:
+            raise ValueError("Forced align and pack job produced invalid sample rate")
+
+        relative_duration = max(absolute_end - absolute_start, 0.0)
+        alignment_units = mock_forced_align(master_transcript, relative_duration)
+        packed_slices = list(pack_aligned_words(alignment_units, audio_samples, sample_rate))
+
+        existing_slices = self._get_batch_slices(session, recording.batch_id)
+        next_order_index = (
+            max(int(self._slice_metadata(slice_row).get("order_index", 0)) for slice_row in existing_slices) + 1
+            if existing_slices
+            else 0
         )
+        created_slice_ids: list[str] = []
+
+        for packed_slice in packed_slices:
+            slice_row = self._create_slice_from_source_span(
+                session,
+                recording,
+                slice_id=self._new_id("slice"),
+                start_seconds=absolute_start + float(packed_slice["start_s"]),
+                end_seconds=absolute_start + float(packed_slice["end_s"]),
+                transcript_text=str(packed_slice["transcript_text"]),
+                order_index=next_order_index,
+                alignment_data={
+                    "source": "mock_forced_align",
+                    "relative_start_seconds": float(packed_slice["start_s"]),
+                    "relative_end_seconds": float(packed_slice["end_s"]),
+                },
+            )
+            created_slice_ids.append(slice_row.id)
+            next_order_index += 1
+
+        job.status = JobStatus.COMPLETED
+        job.output_payload = {
+            "created_slice_count": len(created_slice_ids),
+            "created_slice_ids": created_slice_ids,
+            "window_span": {
+                "start_seconds": absolute_start,
+                "end_seconds": absolute_end,
+            },
+        }
+        job.error_message = None
+        job.completed_at = utc_now()
+        session.add(job)
+        session.commit()
 
     def _job_status_from_legacy(self, status: str) -> JobStatus:
         mapping = {

@@ -602,9 +602,11 @@ class RepositoryMediaTests(TestCase):
         self.assertTrue(media_path.exists())
         self.assertAlmostEqual(read_wav_duration_seconds(media_path), 3.28, places=2)
 
-    def test_forced_align_and_pack_job_is_async_and_reports_placeholder_failure(self) -> None:
+    def test_forced_align_and_pack_job_is_async_and_creates_canonical_slices(self) -> None:
         windows = self.repository.list_review_windows("src-001")
         self.assertEqual(len(windows), 1)
+        before_slices = self.repository.get_project_slices("phase1-demo")
+        before_source_slices = [slice_row for slice_row in before_slices if slice_row.source_recording_id == "src-001"]
 
         job = self.repository.enqueue_forced_align_and_pack(
             "src-001",
@@ -624,7 +626,20 @@ class RepositoryMediaTests(TestCase):
                 break
             time.sleep(0.05)
 
-        self.assertEqual(latest.status, "failed")
-        self.assertIsNotNone(latest.error_message)
-        self.assertIn("not implemented yet", latest.error_message)
+        self.assertEqual(latest.status, "completed")
+        self.assertIsNone(latest.error_message)
+        self.assertIsNotNone(latest.output_payload)
+        self.assertEqual(latest.output_payload["created_slice_count"], 1)
+        created_slice_ids = latest.output_payload["created_slice_ids"]
+        self.assertEqual(len(created_slice_ids), 1)
         self.assertEqual(self.repository.list_source_recording_jobs("src-001")[0].id, job.id)
+
+        after_slices = self.repository.get_project_slices("phase1-demo")
+        after_source_slices = [slice_row for slice_row in after_slices if slice_row.source_recording_id == "src-001"]
+        self.assertEqual(len(after_source_slices), len(before_source_slices) + 1)
+
+        created_slice = self.repository.get_slice_detail(created_slice_ids[0])
+        self.assertEqual(created_slice.transcript.original_text, "The workstation should make this painless.")
+        self.assertEqual(created_slice.source_recording.id, "src-001")
+        self.assertAlmostEqual(created_slice.model_metadata["original_start_time"], 12.4, places=2)
+        self.assertAlmostEqual(created_slice.model_metadata["original_end_time"], 15.68, places=2)
