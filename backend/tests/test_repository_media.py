@@ -1,4 +1,5 @@
 import json
+import math
 import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +14,11 @@ from app.models import (
     AudioVariantRunRequest,
     EditCommit,
     ReferenceAsset,
+    ReferenceAssetCreateFromCandidate,
     ReferenceAssetCreateFromSlice,
+    ReferenceCandidateSummary,
+    ReferenceRunCreate,
+    ReferenceRunStatus,
     ReferenceVariant,
     ReviewStatus,
     SliceEdlUpdate,
@@ -23,6 +28,7 @@ from app.models import (
     SliceTagUpdate,
     SliceTranscriptUpdate,
     SourceRecording,
+    SourceRecordingCreate,
     TagPayload,
 )
 from app.repository import SQLiteRepository, SliceSaveValidationError
@@ -64,6 +70,34 @@ def build_legacy_clip(project_id: str, clip_id: str, source_file_id: str, order_
         "updated_at": timestamp,
         "working_asset_id": f"working-{clip_id}",
     }
+
+
+def write_silence_then_tone_wav(
+    path: Path,
+    sample_rate: int,
+    leading_silence_seconds: float,
+    tone_seconds: float,
+    trailing_silence_seconds: float,
+) -> int:
+    amplitude = int(32767 * 0.28)
+    frequency = 220.0
+    total_frames = 0
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        for _ in range(int(sample_rate * leading_silence_seconds)):
+            wav_file.writeframes((0).to_bytes(2, "little", signed=True))
+            total_frames += 1
+        tone_frames = int(sample_rate * tone_seconds)
+        for frame_index in range(tone_frames):
+            sample = int(amplitude * math.sin((2 * math.pi * frequency * frame_index) / sample_rate))
+            wav_file.writeframes(sample.to_bytes(2, "little", signed=True))
+            total_frames += 1
+        for _ in range(int(sample_rate * trailing_silence_seconds)):
+            wav_file.writeframes((0).to_bytes(2, "little", signed=True))
+            total_frames += 1
+    return total_frames
 
 
 class RepositoryMediaTests(TestCase):
@@ -617,6 +651,118 @@ class RepositoryMediaTests(TestCase):
         self.assertNotEqual(reference_audio_path.read_bytes(), raw_variant_path.read_bytes())
         self.assertIsNone(saved.active_variant.source_start_seconds)
         self.assertIsNone(saved.active_variant.source_end_seconds)
+
+    def test_reference_run_processes_candidates_and_materializes_preview_lazily(self) -> None:
+        created = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=12),
+        )
+        self.assertEqual(created.status, ReferenceRunStatus.QUEUED)
+
+        completed = self.repository.process_reference_run(created.id)
+        self.assertEqual(completed.status, ReferenceRunStatus.COMPLETED)
+        self.assertGreater(completed.candidate_count, 0)
+
+        candidates = self.repository.list_reference_run_candidates(created.id, limit=12)
+        self.assertGreater(len(candidates), 0)
+        first_candidate = candidates[0]
+        self.assertEqual(first_candidate.run_id, created.id)
+        self.assertEqual(first_candidate.source_media_kind, "source_recording")
+        self.assertGreater(first_candidate.source_end_seconds, first_candidate.source_start_seconds)
+
+        preview_path = self.repository.get_reference_candidate_media_path(created.id, first_candidate.candidate_id)
+        self.assertTrue(preview_path.exists())
+        preview_duration = read_wav_duration_seconds(preview_path)
+        self.assertAlmostEqual(preview_duration, first_candidate.duration_seconds, places=2)
+
+        preview_path_again = self.repository.get_reference_candidate_media_path(created.id, first_candidate.candidate_id)
+        self.assertEqual(preview_path_again, preview_path)
+
+    def test_reference_run_candidate_ids_are_stable_for_same_config(self) -> None:
+        first_run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        second_run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+
+        self.repository.process_reference_run(first_run.id)
+        self.repository.process_reference_run(second_run.id)
+
+        first_candidates = self.repository.list_reference_run_candidates(first_run.id, limit=8)
+        second_candidates = self.repository.list_reference_run_candidates(second_run.id, limit=8)
+
+        self.assertEqual(
+            [candidate.candidate_id for candidate in first_candidates],
+            [candidate.candidate_id for candidate in second_candidates],
+        )
+
+    def test_reference_run_uses_speech_first_scaffold_instead_of_whole_recording_sweep(self) -> None:
+        recording_path = self.repository.media_root / "imports" / "src-speechy.wav"
+        recording_path.parent.mkdir(parents=True, exist_ok=True)
+        sample_rate = 16000
+        num_samples = write_silence_then_tone_wav(
+            recording_path,
+            sample_rate=sample_rate,
+            leading_silence_seconds=1.0,
+            tone_seconds=1.4,
+            trailing_silence_seconds=1.1,
+        )
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-speechy",
+                batch_id="phase1-demo",
+                file_path=str(recording_path),
+                sample_rate=sample_rate,
+                num_channels=1,
+                num_samples=num_samples,
+            )
+        )
+
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-speechy"], mode="both", candidate_count_cap=12),
+        )
+        self.repository.process_reference_run(run.id)
+        candidates = self.repository.list_reference_run_candidates(run.id, limit=12)
+
+        self.assertGreater(len(candidates), 0)
+        self.assertTrue(all(candidate.source_start_seconds >= 0.75 for candidate in candidates))
+        self.assertTrue(all(candidate.source_end_seconds <= 2.7 for candidate in candidates))
+
+    def test_promote_reference_candidate_creates_durable_reference_asset(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidate.candidate_id,
+                mood_label="picker",
+            )
+        )
+
+        self.assertEqual(promoted.created_from_run_id, run.id)
+        self.assertEqual(promoted.created_from_candidate_id, candidate.candidate_id)
+        self.assertEqual(promoted.mood_label, "picker")
+        self.assertEqual(promoted.active_variant.source_recording_id, candidate.source_recording_id)
+        self.assertAlmostEqual(promoted.active_variant.source_start_seconds, candidate.source_start_seconds, places=3)
+        self.assertAlmostEqual(promoted.active_variant.source_end_seconds, candidate.source_end_seconds, places=3)
+
+        reference_audio_path = self.repository.get_reference_variant_media_path(promoted.active_variant.id)
+        self.assertTrue(reference_audio_path.exists())
+        self.assertAlmostEqual(read_wav_duration_seconds(reference_audio_path), candidate.duration_seconds, places=2)
+
+        preview_path = self.repository.get_reference_candidate_media_path(run.id, candidate.candidate_id)
+        preview_bytes = preview_path.read_bytes()
+        reference_bytes = reference_audio_path.read_bytes()
+        self.assertEqual(reference_bytes, preview_bytes)
 
     def test_reference_picker_migration_rehomes_legacy_reference_assets(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
