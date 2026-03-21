@@ -371,6 +371,8 @@ export async function saveCurrentSliceAsReference(payload: {
 export async function promoteReferenceCandidate(payload: {
   run_id: string;
   candidate_id: string;
+  source_start_seconds?: number | null;
+  source_end_seconds?: number | null;
   name?: string | null;
   mood_label?: string | null;
 }): Promise<ReferenceAssetDetail> {

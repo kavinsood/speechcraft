@@ -1347,6 +1347,11 @@ button:disabled {
   border: 1px solid rgba(71, 102, 79, 0.15);
 }
 
+.reference-candidate-card.selected {
+  border-color: rgba(47, 108, 143, 0.38);
+  box-shadow: 0 0 0 1px rgba(47, 108, 143, 0.16);
+}
+
 .reference-candidate-card p {
   margin: 0;
   color: #304047;
@@ -1392,6 +1397,48 @@ button:disabled {
   border: 1px solid rgba(71, 102, 79, 0.18);
   color: #29523b;
   font-size: 0.83rem;
+}
+
+.reference-candidate-detail {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.reference-candidate-detail-copy {
+  margin: 0;
+  color: #304047;
+  font-size: 0.88rem;
+}
+
+.reference-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.reference-trim-field {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: #41525a;
+}
+
+.reference-trim-field input {
+  width: 100%;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(71, 102, 79, 0.18);
+  background: rgba(255, 255, 255, 0.92);
+  color: #243239;
+  padding: 0.65rem 0.75rem;
+}
+
+.reference-trim-summary,
+.reference-trim-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1rem;
+  font-size: 0.82rem;
+  color: #41525a;
 }
 
 .reference-flag-chip {

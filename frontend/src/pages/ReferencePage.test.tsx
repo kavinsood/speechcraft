@@ -27,6 +27,49 @@ vi.mock("../api", () => ({
   },
 }));
 
+vi.mock("../reference/reference-trim-helpers", () => ({
+  computeReferenceTrimSuggestion: vi.fn(),
+  clampTrimOffsets: vi.fn((startOffsetSeconds: number, endOffsetSeconds: number, previewDurationSeconds: number) => ({
+    startOffsetSeconds: Math.max(0, Math.min(startOffsetSeconds, previewDurationSeconds)),
+    endOffsetSeconds: Math.max(
+      Math.max(0, Math.min(startOffsetSeconds, previewDurationSeconds)) + 0.12,
+      Math.min(endOffsetSeconds, previewDurationSeconds),
+    ),
+    previewDurationSeconds,
+    heuristic: "mock",
+  })),
+  validateManualTrimOffsets: vi.fn((startOffsetSeconds: number, endOffsetSeconds: number, previewDurationSeconds: number) => {
+    if (
+      !Number.isFinite(startOffsetSeconds)
+      || !Number.isFinite(endOffsetSeconds)
+      || !Number.isFinite(previewDurationSeconds)
+    ) {
+      return { trim: null, error: "Enter valid numeric trim bounds." };
+    }
+    if (startOffsetSeconds < 0 || startOffsetSeconds > previewDurationSeconds) {
+      return { trim: null, error: "Trim start must stay inside the candidate." };
+    }
+    if (endOffsetSeconds < 0 || endOffsetSeconds > previewDurationSeconds) {
+      return { trim: null, error: "Trim end must stay inside the candidate." };
+    }
+    if (endOffsetSeconds <= startOffsetSeconds) {
+      return { trim: null, error: "Trim end must be later than trim start." };
+    }
+    if (endOffsetSeconds - startOffsetSeconds < 0.12) {
+      return { trim: null, error: "Trim must keep at least 0.12s of audio." };
+    }
+    return {
+      trim: {
+        startOffsetSeconds,
+        endOffsetSeconds,
+        previewDurationSeconds,
+        heuristic: "manual",
+      },
+      error: null,
+    };
+  }),
+}));
+
 import {
   fetchProjectReferenceAssets,
   fetchProjectReferenceRuns,
@@ -34,8 +77,10 @@ import {
   fetchReferenceAsset,
   fetchReferenceRun,
   fetchReferenceRunCandidates,
+  promoteReferenceCandidate,
   rerankReferenceRunCandidates,
 } from "../api";
+import { computeReferenceTrimSuggestion } from "../reference/reference-trim-helpers";
 
 const mockedFetchProjectSourceRecordings = vi.mocked(fetchProjectSourceRecordings);
 const mockedFetchProjectReferenceRuns = vi.mocked(fetchProjectReferenceRuns);
@@ -43,7 +88,9 @@ const mockedFetchProjectReferenceAssets = vi.mocked(fetchProjectReferenceAssets)
 const mockedFetchReferenceAsset = vi.mocked(fetchReferenceAsset);
 const mockedFetchReferenceRun = vi.mocked(fetchReferenceRun);
 const mockedFetchReferenceRunCandidates = vi.mocked(fetchReferenceRunCandidates);
+const mockedPromoteReferenceCandidate = vi.mocked(promoteReferenceCandidate);
 const mockedRerankReferenceRunCandidates = vi.mocked(rerankReferenceRunCandidates);
+const mockedComputeReferenceTrimSuggestion = vi.mocked(computeReferenceTrimSuggestion);
 
 function makeRecording(id: string) {
   return {
@@ -112,6 +159,12 @@ async function flushMicrotasks() {
 beforeEach(() => {
   vi.clearAllMocks();
   window.history.replaceState({}, "", "/reference");
+  mockedComputeReferenceTrimSuggestion.mockResolvedValue({
+    startOffsetSeconds: 0.4,
+    endOffsetSeconds: 3.6,
+    previewDurationSeconds: 4.5,
+    heuristic: "rms-boundary",
+  });
 });
 
 afterEach(() => {
@@ -291,12 +344,154 @@ describe("ReferencePage", () => {
 
     renderReferencePage();
 
-    await screen.findByText(/Already saved as/i);
-    expect(screen.getByRole("button", { name: "Open Existing" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Promote Again" })).toBeTruthy();
+    await screen.findByText(/Saved from this candidate/i);
+    expect(screen.getAllByRole("button", { name: "Open Existing" }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "Save Another Trim" }).length).toBeGreaterThan(0);
 
     await waitFor(() => {
       expect(mockedFetchReferenceRunCandidates).toHaveBeenCalledWith("run-current", { limit: 100 });
     });
+  });
+
+  it("promotes a selected candidate using full candidate bounds until suggestion is explicitly applied", async () => {
+    mockedFetchProjectSourceRecordings.mockResolvedValue([makeRecording("src-1")]);
+    mockedFetchProjectReferenceRuns.mockResolvedValue([makeRun("run-current", "completed")]);
+    mockedFetchProjectReferenceAssets.mockResolvedValue([]);
+    mockedFetchReferenceRun.mockResolvedValue(makeRun("run-current", "completed"));
+    mockedFetchReferenceRunCandidates.mockResolvedValue([makeCandidate("run-current", "cand-a")]);
+    mockedPromoteReferenceCandidate.mockResolvedValue({
+      id: "asset-1",
+      project_id: "project-1",
+      name: "Trimmed reference",
+      status: "active" as const,
+      transcript_text: "Reference candidate line",
+      speaker_name: "speaker_a",
+      language: "en",
+      mood_label: null,
+      active_variant_id: "reference-variant-1",
+      created_from_run_id: "run-current",
+      created_from_candidate_id: "cand-a",
+      source_slice_id: null,
+      source_audio_variant_id: null,
+      source_edit_commit_id: null,
+      created_at: "2026-03-21T00:00:00Z",
+      updated_at: "2026-03-21T00:00:00Z",
+      active_variant: {
+        id: "reference-variant-1",
+        reference_asset_id: "asset-1",
+        source_kind: "source_recording" as const,
+        source_recording_id: "src-1",
+        source_slice_id: null,
+        source_audio_variant_id: null,
+        source_reference_variant_id: null,
+        source_start_seconds: 1.4,
+        source_end_seconds: 4.6,
+        is_original: true,
+        generator_model: "reference-picker",
+        sample_rate: 48000,
+        num_samples: 153600,
+        deleted: false,
+        created_at: "2026-03-21T00:00:00Z",
+      },
+      notes: null,
+      favorite_rank: null,
+      model_metadata: null,
+      variants: [],
+    });
+
+    renderReferencePage();
+
+    await screen.findByRole("button", { name: "Promote Trim" });
+    fireEvent.click(screen.getByRole("button", { name: "Promote Trim" }));
+
+    await waitFor(() => {
+      expect(mockedPromoteReferenceCandidate).toHaveBeenCalledWith({
+        run_id: "run-current",
+        candidate_id: "cand-a",
+        source_start_seconds: 1.0,
+        source_end_seconds: 5.5,
+      });
+    });
+  });
+
+  it("applies the suggestion only when the operator clicks Use suggestion", async () => {
+    mockedFetchProjectSourceRecordings.mockResolvedValue([makeRecording("src-1")]);
+    mockedFetchProjectReferenceRuns.mockResolvedValue([makeRun("run-current", "completed")]);
+    mockedFetchProjectReferenceAssets.mockResolvedValue([]);
+    mockedFetchReferenceRun.mockResolvedValue(makeRun("run-current", "completed"));
+    mockedFetchReferenceRunCandidates.mockResolvedValue([makeCandidate("run-current", "cand-a")]);
+    mockedPromoteReferenceCandidate.mockResolvedValue({
+      id: "asset-1",
+      project_id: "project-1",
+      name: "Trimmed reference",
+      status: "active" as const,
+      transcript_text: "Reference candidate line",
+      speaker_name: "speaker_a",
+      language: "en",
+      mood_label: null,
+      active_variant_id: "reference-variant-1",
+      created_from_run_id: "run-current",
+      created_from_candidate_id: "cand-a",
+      source_slice_id: null,
+      source_audio_variant_id: null,
+      source_edit_commit_id: null,
+      created_at: "2026-03-21T00:00:00Z",
+      updated_at: "2026-03-21T00:00:00Z",
+      active_variant: {
+        id: "reference-variant-1",
+        reference_asset_id: "asset-1",
+        source_kind: "source_recording" as const,
+        source_recording_id: "src-1",
+        source_slice_id: null,
+        source_audio_variant_id: null,
+        source_reference_variant_id: null,
+        source_start_seconds: 1.4,
+        source_end_seconds: 4.6,
+        is_original: true,
+        generator_model: "reference-picker",
+        sample_rate: 48000,
+        num_samples: 153600,
+        deleted: false,
+        created_at: "2026-03-21T00:00:00Z",
+      },
+      notes: null,
+      favorite_rank: null,
+      model_metadata: null,
+      variants: [],
+    });
+
+    renderReferencePage();
+
+    await screen.findByRole("button", { name: "Use suggestion" });
+    fireEvent.click(screen.getByRole("button", { name: "Use suggestion" }));
+    fireEvent.click(screen.getByRole("button", { name: "Promote Trim" }));
+
+    await waitFor(() => {
+      expect(mockedPromoteReferenceCandidate).toHaveBeenCalledWith({
+        run_id: "run-current",
+        candidate_id: "cand-a",
+        source_start_seconds: 1.4,
+        source_end_seconds: 4.6,
+      });
+    });
+  });
+
+  it("disables promotion when manual trim input becomes invalid", async () => {
+    mockedFetchProjectSourceRecordings.mockResolvedValue([makeRecording("src-1")]);
+    mockedFetchProjectReferenceRuns.mockResolvedValue([makeRun("run-current", "completed")]);
+    mockedFetchProjectReferenceAssets.mockResolvedValue([]);
+    mockedFetchReferenceRun.mockResolvedValue(makeRun("run-current", "completed"));
+    mockedFetchReferenceRunCandidates.mockResolvedValue([makeCandidate("run-current", "cand-a")]);
+
+    renderReferencePage();
+
+    const startInput = await screen.findByLabelText("Trim start inside candidate");
+    const promoteButton = screen.getByRole("button", { name: "Promote Trim" }) as HTMLButtonElement;
+
+    fireEvent.change(startInput, { target: { value: "" } });
+
+    expect(screen.getByText("Enter valid numeric trim bounds.")).toBeTruthy();
+    expect(promoteButton.disabled).toBe(true);
+    expect(mockedPromoteReferenceCandidate).not.toHaveBeenCalled();
   });
 });

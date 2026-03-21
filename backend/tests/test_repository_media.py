@@ -908,6 +908,126 @@ class RepositoryMediaTests(TestCase):
         reference_bytes = reference_audio_path.read_bytes()
         self.assertEqual(reference_bytes, preview_bytes)
 
+    def test_promote_reference_candidate_accepts_trimmed_subspan_inside_candidate_bounds(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+        trimmed_start = round(candidate.source_start_seconds + 0.25, 3)
+        trimmed_end = round(candidate.source_end_seconds - 0.35, 3)
+
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidate.candidate_id,
+                source_start_seconds=trimmed_start,
+                source_end_seconds=trimmed_end,
+                mood_label="trimmed",
+            )
+        )
+
+        self.assertEqual(promoted.created_from_candidate_id, candidate.candidate_id)
+        self.assertAlmostEqual(promoted.active_variant.source_start_seconds, trimmed_start, places=3)
+        self.assertAlmostEqual(promoted.active_variant.source_end_seconds, trimmed_end, places=3)
+        self.assertEqual(promoted.model_metadata["trim_applied"], True)
+        self.assertAlmostEqual(
+            read_wav_duration_seconds(self.repository.get_reference_variant_media_path(promoted.active_variant.id)),
+            trimmed_end - trimmed_start,
+            places=2,
+        )
+
+    def test_promote_reference_candidate_rejects_trim_outside_candidate_bounds(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        with self.assertRaisesRegex(ValueError, "candidate's canonical bounds"):
+            self.repository.create_reference_asset_from_candidate(
+                ReferenceAssetCreateFromCandidate(
+                    run_id=run.id,
+                    candidate_id=candidate.candidate_id,
+                    source_start_seconds=round(candidate.source_start_seconds - 0.1, 3),
+                    source_end_seconds=round(candidate.source_end_seconds - 0.1, 3),
+                )
+            )
+
+    def test_promote_reference_candidate_rejects_missing_one_trim_bound(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        with self.assertRaisesRegex(ValueError, "requires both source_start_seconds and source_end_seconds"):
+            self.repository.create_reference_asset_from_candidate(
+                ReferenceAssetCreateFromCandidate(
+                    run_id=run.id,
+                    candidate_id=candidate.candidate_id,
+                    source_start_seconds=round(candidate.source_start_seconds + 0.1, 3),
+                )
+            )
+
+    def test_promote_reference_candidate_rejects_non_finite_trim_bounds(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            self.repository.create_reference_asset_from_candidate(
+                ReferenceAssetCreateFromCandidate(
+                    run_id=run.id,
+                    candidate_id=candidate.candidate_id,
+                    source_start_seconds=float("nan"),
+                    source_end_seconds=candidate.source_end_seconds,
+                )
+            )
+
+    def test_promote_reference_candidate_rejects_non_positive_trim_duration(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        with self.assertRaisesRegex(ValueError, "positive duration"):
+            self.repository.create_reference_asset_from_candidate(
+                ReferenceAssetCreateFromCandidate(
+                    run_id=run.id,
+                    candidate_id=candidate.candidate_id,
+                    source_start_seconds=candidate.source_start_seconds + 0.5,
+                    source_end_seconds=candidate.source_start_seconds + 0.5,
+                )
+            )
+
+    def test_promote_reference_candidate_marks_trim_applied_false_for_exact_candidate_bounds(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidate.candidate_id,
+                source_start_seconds=candidate.source_start_seconds,
+                source_end_seconds=candidate.source_end_seconds,
+            )
+        )
+
+        self.assertEqual(promoted.model_metadata["trim_applied"], False)
+
     def test_reference_picker_migration_rehomes_legacy_reference_assets(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
         detail = self.repository.get_slice_detail(initial.id)

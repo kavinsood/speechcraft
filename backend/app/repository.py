@@ -1283,10 +1283,17 @@ class SQLiteRepository:
             if source_recording.batch_id != run.project_id:
                 raise ValueError("Candidate source recording does not belong to the run project")
 
+            source_start_seconds, source_end_seconds = self._resolve_reference_candidate_promotion_bounds(
+                candidate,
+                source_recording,
+                payload.source_start_seconds,
+                payload.source_end_seconds,
+            )
+
             rendered_audio_bytes = self._crop_source_recording_audio_bytes(
                 source_recording,
-                candidate.source_start_seconds,
-                candidate.source_end_seconds,
+                source_start_seconds,
+                source_end_seconds,
             )
             sample_rate, channels, num_samples = self._wav_metadata(rendered_audio_bytes)
             reference_variant_id = self._new_id("reference-variant")
@@ -1311,8 +1318,14 @@ class SQLiteRepository:
                 model_metadata={
                     "origin": "reference-picker-candidate",
                     "source_media_kind": candidate.source_media_kind.value,
+                    "candidate_source_start_seconds": candidate.source_start_seconds,
+                    "candidate_source_end_seconds": candidate.source_end_seconds,
                     "default_scores": candidate.default_scores,
                     "risk_flags": candidate.risk_flags,
+                    "trim_applied": not (
+                        math.isclose(source_start_seconds, candidate.source_start_seconds, abs_tol=1e-6)
+                        and math.isclose(source_end_seconds, candidate.source_end_seconds, abs_tol=1e-6)
+                    ),
                 },
                 created_at=now,
                 updated_at=now,
@@ -1322,8 +1335,8 @@ class SQLiteRepository:
                 reference_asset_id=asset.id,
                 source_kind=ReferenceSourceKind.SOURCE_RECORDING,
                 source_recording_id=source_recording.id,
-                source_start_seconds=candidate.source_start_seconds,
-                source_end_seconds=candidate.source_end_seconds,
+                source_start_seconds=source_start_seconds,
+                source_end_seconds=source_end_seconds,
                 file_path=storage_key,
                 is_original=True,
                 generator_model="reference-picker",
@@ -1332,6 +1345,8 @@ class SQLiteRepository:
                 model_metadata={
                     "run_id": run.id,
                     "candidate_id": candidate.candidate_id,
+                    "candidate_source_start_seconds": candidate.source_start_seconds,
+                    "candidate_source_end_seconds": candidate.source_end_seconds,
                 },
             )
             self._validate_reference_variant_provenance(session, asset, variant)
@@ -3304,6 +3319,53 @@ class SQLiteRepository:
                 }
             ],
         )
+
+    def _resolve_reference_candidate_promotion_bounds(
+        self,
+        candidate: ReferenceCandidateSummary,
+        recording: SourceRecording,
+        requested_start_seconds: float | None,
+        requested_end_seconds: float | None,
+    ) -> tuple[float, float]:
+        candidate_start = float(candidate.source_start_seconds)
+        candidate_end = float(candidate.source_end_seconds)
+        if requested_start_seconds is None and requested_end_seconds is None:
+            return candidate_start, candidate_end
+        if requested_start_seconds is None or requested_end_seconds is None:
+            raise ValueError(
+                "Trim-aware candidate promotion requires both source_start_seconds and source_end_seconds"
+            )
+
+        start_seconds = float(requested_start_seconds)
+        end_seconds = float(requested_end_seconds)
+        if not math.isfinite(start_seconds) or not math.isfinite(end_seconds):
+            raise ValueError("Trim bounds must be finite")
+        if end_seconds <= start_seconds:
+            raise ValueError("Trim bounds must have positive duration")
+        epsilon = 1e-6
+        if start_seconds < 0:
+            if math.isclose(start_seconds, 0.0, abs_tol=epsilon):
+                start_seconds = 0.0
+            else:
+                raise ValueError("Trim bounds must stay inside the source recording duration")
+        if end_seconds > recording.duration_s:
+            if math.isclose(end_seconds, recording.duration_s, abs_tol=epsilon):
+                end_seconds = recording.duration_s
+            else:
+                raise ValueError("Trim bounds must stay inside the source recording duration")
+        if start_seconds > recording.duration_s or end_seconds < 0:
+            raise ValueError("Trim bounds must stay inside the source recording duration")
+        if start_seconds < candidate_start:
+            if math.isclose(start_seconds, candidate_start, abs_tol=epsilon):
+                start_seconds = candidate_start
+            else:
+                raise ValueError("Trim bounds must stay inside the candidate's canonical bounds")
+        if end_seconds > candidate_end:
+            if math.isclose(end_seconds, candidate_end, abs_tol=epsilon):
+                end_seconds = candidate_end
+            else:
+                raise ValueError("Trim bounds must stay inside the candidate's canonical bounds")
+        return start_seconds, end_seconds
 
     def _render_slice_audio_bytes(self, session: Session, slice_row: Slice) -> bytes:
         active_variant = slice_row.active_variant

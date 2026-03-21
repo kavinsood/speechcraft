@@ -56,6 +56,7 @@ export default function ReferencePage({
   const [baselineCandidates, setBaselineCandidates] = useState<ReferenceCandidate[]>([]);
   const [candidates, setCandidates] = useState<CandidateListEntry[]>([]);
   const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
   const [isCreatingRun, setIsCreatingRun] = useState(false);
   const [isReranking, setIsReranking] = useState(false);
   const [promotingCandidateId, setPromotingCandidateId] = useState<string | null>(null);
@@ -83,6 +84,7 @@ export default function ReferencePage({
       setSelectedRun(null);
       setBaselineCandidates([]);
       setCandidates([]);
+      setSelectedCandidateId(null);
       setPositiveCandidateIds([]);
       setNegativeCandidateIds([]);
       setReferenceAssets([]);
@@ -139,6 +141,7 @@ export default function ReferencePage({
       setSelectedRun(null);
       setBaselineCandidates([]);
       setCandidates([]);
+      setSelectedCandidateId(null);
       setPositiveCandidateIds([]);
       setNegativeCandidateIds([]);
       setReferenceAssets([]);
@@ -210,6 +213,7 @@ export default function ReferencePage({
       setSelectedRun(null);
       setBaselineCandidates([]);
       setCandidates([]);
+      setSelectedCandidateId(null);
       setPositiveCandidateIds([]);
       setNegativeCandidateIds([]);
       setCandidateError(null);
@@ -239,6 +243,11 @@ export default function ReferencePage({
           }
           setBaselineCandidates(nextCandidates);
           setCandidates(nextCandidates);
+          setSelectedCandidateId((current) =>
+            current && nextCandidates.some((candidate) => candidate.candidate_id === current)
+              ? current
+              : (nextCandidates[0]?.candidate_id ?? null),
+          );
           setPositiveCandidateIds([]);
           setNegativeCandidateIds([]);
           setCandidateError(null);
@@ -249,6 +258,7 @@ export default function ReferencePage({
         } else {
           setBaselineCandidates([]);
           setCandidates([]);
+          setSelectedCandidateId(null);
           setPositiveCandidateIds([]);
           setNegativeCandidateIds([]);
           if (run.status === "failed") {
@@ -266,6 +276,7 @@ export default function ReferencePage({
         setSelectedRun(null);
         setBaselineCandidates([]);
         setCandidates([]);
+        setSelectedCandidateId(null);
         setPositiveCandidateIds([]);
         setNegativeCandidateIds([]);
         setCandidateError(getReferenceErrorMessage(error, "The selected run could not be loaded."));
@@ -297,6 +308,11 @@ export default function ReferencePage({
 
     if (positiveCandidateIds.length === 0 && negativeCandidateIds.length === 0) {
       setCandidates(baselineCandidates);
+      setSelectedCandidateId((current) =>
+        current && baselineCandidates.some((candidate) => candidate.candidate_id === current)
+          ? current
+          : (baselineCandidates[0]?.candidate_id ?? null),
+      );
       setIsReranking(false);
       return;
     }
@@ -317,6 +333,11 @@ export default function ReferencePage({
             return;
           }
           setCandidates(response.candidates);
+          setSelectedCandidateId((current) =>
+            current && response.candidates.some((candidate) => candidate.candidate_id === current)
+              ? current
+              : (response.candidates[0]?.candidate_id ?? null),
+          );
           setCandidateError(null);
         } catch (error) {
           if (cancelled || latestRerankRequestRef.current !== requestId) {
@@ -345,10 +366,13 @@ export default function ReferencePage({
   ]);
 
   const promotedCandidatesById = useMemo(() => {
-    const promoted = new Map<string, ReferenceAssetSummary>();
+    const promoted = new Map<string, ReferenceAssetSummary[]>();
     for (const asset of referenceAssets) {
       if (asset.created_from_candidate_id) {
-        promoted.set(asset.created_from_candidate_id, asset);
+        const current = promoted.get(asset.created_from_candidate_id) ?? [];
+        current.push(asset);
+        current.sort((left, right) => right.created_at.localeCompare(left.created_at));
+        promoted.set(asset.created_from_candidate_id, current);
       }
     }
     return promoted;
@@ -375,7 +399,7 @@ export default function ReferencePage({
     }
   }
 
-  async function handlePromoteCandidate(candidate: ReferenceCandidate) {
+  async function handlePromoteCandidate(candidate: ReferenceCandidate, startSeconds: number, endSeconds: number) {
     if (!activeProject?.id) {
       return;
     }
@@ -385,6 +409,8 @@ export default function ReferencePage({
       const asset = await promoteReferenceCandidate({
         run_id: candidate.run_id,
         candidate_id: candidate.candidate_id,
+        source_start_seconds: startSeconds,
+        source_end_seconds: endSeconds,
       });
       await refreshReferenceAssets(activeProject.id, asset.id);
     } catch (error) {
@@ -455,12 +481,16 @@ export default function ReferencePage({
             isReranking={isReranking}
             positiveCandidateIds={positiveCandidateIds}
             negativeCandidateIds={negativeCandidateIds}
+            selectedCandidateId={selectedCandidateId}
             promotingCandidateId={promotingCandidateId}
             promotedCandidatesById={promotedCandidatesById}
             onTogglePositiveCandidate={togglePositiveCandidate}
             onToggleNegativeCandidate={toggleNegativeCandidate}
+            onSelectCandidate={setSelectedCandidateId}
             onResetRerankAnchors={resetRerankAnchors}
-            onPromoteCandidate={(candidate) => void handlePromoteCandidate(candidate)}
+            onPromoteCandidate={(candidate, startSeconds, endSeconds) =>
+              void handlePromoteCandidate(candidate, startSeconds, endSeconds)
+            }
             onOpenExistingAsset={setSelectedAssetId}
           />
 

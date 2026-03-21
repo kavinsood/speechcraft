@@ -1,6 +1,7 @@
 import { buildReferenceCandidateAudioUrl } from "../api";
 import type { ReferenceAssetSummary, ReferenceCandidate, ReferenceRerankCandidate, ReferenceRun } from "../types";
 import { formatReferenceDuration } from "./reference-helpers";
+import ReferenceCandidateDetail from "./ReferenceCandidateDetail";
 
 type CandidateListEntry = ReferenceCandidate | ReferenceRerankCandidate;
 
@@ -11,12 +12,14 @@ type ReferenceCandidatePaneProps = {
   isReranking: boolean;
   positiveCandidateIds: string[];
   negativeCandidateIds: string[];
+  selectedCandidateId: string | null;
   promotingCandidateId: string | null;
-  promotedCandidatesById: Map<string, ReferenceAssetSummary>;
+  promotedCandidatesById: Map<string, ReferenceAssetSummary[]>;
   onTogglePositiveCandidate: (candidateId: string) => void;
   onToggleNegativeCandidate: (candidateId: string) => void;
+  onSelectCandidate: (candidateId: string) => void;
   onResetRerankAnchors: () => void;
-  onPromoteCandidate: (candidate: ReferenceCandidate) => void;
+  onPromoteCandidate: (candidate: ReferenceCandidate, startSeconds: number, endSeconds: number) => void;
   onOpenExistingAsset: (assetId: string) => void;
 };
 
@@ -27,14 +30,22 @@ export default function ReferenceCandidatePane({
   isReranking,
   positiveCandidateIds,
   negativeCandidateIds,
+  selectedCandidateId,
   promotingCandidateId,
   promotedCandidatesById,
   onTogglePositiveCandidate,
   onToggleNegativeCandidate,
+  onSelectCandidate,
   onResetRerankAnchors,
   onPromoteCandidate,
   onOpenExistingAsset,
 }: ReferenceCandidatePaneProps) {
+  const selectedCandidate =
+    selectedCandidateId ? candidates.find((candidate) => candidate.candidate_id === selectedCandidateId) ?? null : null;
+  const selectedCandidateExistingAssets = selectedCandidate
+    ? promotedCandidatesById.get(selectedCandidate.candidate_id) ?? []
+    : [];
+
   return (
     <main className="stage-main">
       <section className="panel stage-placeholder-hero">
@@ -101,18 +112,30 @@ export default function ReferenceCandidatePane({
         ) : null}
 
         {selectedRun?.status === "completed" && candidates.length > 0 ? (
-          <div className="reference-candidate-list">
+          <>
+            <ReferenceCandidateDetail
+              candidate={selectedCandidate}
+              existingAssets={selectedCandidateExistingAssets}
+              isPromoting={selectedCandidate ? promotingCandidateId === selectedCandidate.candidate_id : false}
+              onPromoteCandidate={onPromoteCandidate}
+              onOpenExistingAsset={onOpenExistingAsset}
+            />
+            <div className="reference-candidate-list">
             {candidates.map((candidate) => {
               const audioUrl = buildReferenceCandidateAudioUrl(candidate.run_id, candidate.candidate_id);
               const isReranked = "rerank_score" in candidate;
               const overallScore = isReranked
                 ? candidate.rerank_score
                 : (candidate.default_scores.both ?? candidate.default_scores.overall ?? 0);
-              const existingAsset = promotedCandidatesById.get(candidate.candidate_id) ?? null;
+              const existingAssets = promotedCandidatesById.get(candidate.candidate_id) ?? [];
+              const existingAsset = existingAssets[0] ?? null;
               const isPositive = positiveCandidateIds.includes(candidate.candidate_id);
               const isNegative = negativeCandidateIds.includes(candidate.candidate_id);
               return (
-                <article key={candidate.candidate_id} className="reference-candidate-card">
+                <article
+                  key={candidate.candidate_id}
+                  className={`reference-candidate-card${selectedCandidateId === candidate.candidate_id ? " selected" : ""}`}
+                >
                   <div className="commit-row">
                     <strong>{candidate.transcript_text || candidate.candidate_id}</strong>
                     <span>{overallScore.toFixed(3)}</span>
@@ -144,7 +167,7 @@ export default function ReferenceCandidatePane({
                   ) : null}
                   {existingAsset ? (
                     <div className="reference-promoted-banner">
-                      Already saved as <strong>{existingAsset.name}</strong>.
+                      Saved from this candidate {existingAssets.length} time{existingAssets.length === 1 ? "" : "s"}.
                     </div>
                   ) : null}
                   <audio controls preload="none" src={audioUrl}>
@@ -168,35 +191,34 @@ export default function ReferenceCandidatePane({
                     {existingAsset ? (
                       <>
                         <button
-                          className="primary-button"
                           type="button"
                           onClick={() => onOpenExistingAsset(existingAsset.id)}
                         >
                           Open Existing
                         </button>
                         <button
+                          className="primary-button"
                           type="button"
-                          disabled={promotingCandidateId === candidate.candidate_id}
-                          onClick={() => onPromoteCandidate(candidate)}
+                          onClick={() => onSelectCandidate(candidate.candidate_id)}
                         >
-                          {promotingCandidateId === candidate.candidate_id ? "Promoting..." : "Promote Again"}
+                          Save Another Trim
                         </button>
                       </>
                     ) : (
                       <button
                         className="primary-button"
                         type="button"
-                        disabled={promotingCandidateId === candidate.candidate_id}
-                        onClick={() => onPromoteCandidate(candidate)}
+                        onClick={() => onSelectCandidate(candidate.candidate_id)}
                       >
-                        {promotingCandidateId === candidate.candidate_id ? "Promoting..." : "Promote As Reference"}
+                        {selectedCandidateId === candidate.candidate_id ? "Trim Selected" : "Open Trim"}
                       </button>
                     )}
                   </div>
                 </article>
               );
             })}
-          </div>
+            </div>
+          </>
         ) : null}
       </section>
     </main>

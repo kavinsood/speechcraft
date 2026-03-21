@@ -594,6 +594,8 @@ class ReferenceCandidateSummary(SQLModel):
 class ReferenceAssetCreateFromCandidate(SQLModel):
     run_id: str
     candidate_id: str
+    source_start_seconds: float | None = None
+    source_end_seconds: float | None = None
     name: str | None = None
     mood_label: str | None = None
 

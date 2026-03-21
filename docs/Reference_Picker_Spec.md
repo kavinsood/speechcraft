@@ -86,6 +86,7 @@ As of `2026-03-21`, the branch has crossed the first real picker threshold.
 - ranked candidate browse exists on the `reference` page
 - current-run rerank exists with positive / negative candidate anchors
 - rerank keeps baseline `default_scores` intact and returns separate intent-shaped score fields
+- rerank artifacts are self-described and keyed by `candidate_id` rather than relying on anonymous vector order
 - candidate preview media is materialized lazily and cached under the run artifact root
 - candidate promotion to `ReferenceAsset` exists using canonical candidate bounds as-is
 - candidate preview cache writes are atomic rather than direct final-path writes
@@ -107,6 +108,7 @@ As of `2026-03-21`, the branch has crossed the first real picker threshold.
   - rerank interaction coverage
 - rerank requests are debounced on the frontend so rapid toggle bursts do not spam the backend
 - run artifacts now store a self-described `acoustic_signature_v1` feature set keyed by `candidate_id`
+- frontend interaction tests now cover the current rerank loop in addition to the earlier `reference` page state-machine cases
 
 ### Partially Complete
 
@@ -114,6 +116,9 @@ As of `2026-03-21`, the branch has crossed the first real picker threshold.
 - picker runs use an async-shaped local thread model, but not a claim-based durable worker contract
 - frontend state is cleaner than before, but the page still coordinates most picker state centrally
 - current rerank uses a deterministic acoustic-signature feature vector, not yet a stronger speaker/style embedding
+- Phase 1C is only partially complete:
+  - rerank exists as a modest acoustic-signature substrate
+  - trim refinement and trim-aware promotion are still ahead
 
 ### Not Started
 
@@ -128,17 +133,18 @@ Rough estimate against this document:
 - about `70%` of the real Phase 1 ship target is done
 - about `40%` of the full multi-phase spec is done
 
-These are deliberately conservative. The full picker path now exists, but rerank, trim, and richer discovery are still ahead.
+These are deliberately conservative. The full picker path now exists, but trim, richer discovery, and stronger modeling are still ahead.
 
 ### Next Implementation Slice
 
-The next slice to build is Phase 1C, not another broad infrastructure pass.
+The next slice to build is the trim half of Phase 1C, not another broad infrastructure pass.
 
 The next branch milestone should be:
 
+- a selected-candidate work surface in the center pane
 - browser-side trim suggestion on candidate preview audio
 - trim-aware candidate promotion using absolute source-relative bounds
-- frontend interaction coverage for rerank and trim behavior
+- frontend interaction coverage for trim behavior
 
 This intentionally still defers:
 
@@ -150,18 +156,19 @@ This intentionally still defers:
 
 Why:
 
-- the product now has a real run -> candidate -> preview -> promote path
-- the biggest remaining user-facing gap is intent shaping and trim refinement
+- the product now has a real run -> candidate -> preview -> promote path plus first-pass rerank
+- the biggest remaining user-facing gap is trim refinement
 - those features should now land on top of a hardened real picker surface, not a temporary shell
-- rerank is not real without stored embeddings, so embeddings are part of Phase 1C itself, not a side dependency
 - the current rerank substrate is intentionally modest (`acoustic_signature_v1`) and should not be mistaken for the final long-term reference-intent representation
+- the first trim suggestion will be a conservative boundary-cleanup heuristic, not a style-purity detector
 
 ### Verification Completed So Far
 
 - backend: `./.venv/bin/python -m unittest -v tests.test_repository_media`
+- frontend: `npm test`
 - frontend: `npm run build`
 
-The full repo test matrix and frontend interaction tests have not been run yet.
+The full repo test matrix has still not been run yet.
 
 ## Goals
 
@@ -249,7 +256,6 @@ Important clarification:
 
 Phase 1B still does not include:
 
-- positive / negative rerank
 - browser-side auto-trim
 - cluster browse
 - reference processing expansion
@@ -267,6 +273,8 @@ Phase 1C also locks the following rules:
 - rerank returns separate intent-shaped score fields such as `intent_score` and `rerank_score`
 - trim-aware promotion from candidate may only save the candidate as-is or a trimmed subspan of that candidate
 - backend validation must reject trim bounds that extend outside the candidate's canonical bounds
+- trim suggestion is a boundary-cleanup aid for dead space and loose edges, not a semantic style-purity detector
+- preview-relative trim offsets are UI-local only; promotion must convert them back into absolute source-relative bounds before calling the backend
 - the center pane remains the temporary candidate work surface for selection, rerank, and trim
 - the right pane remains the durable saved-library surface
 
@@ -1042,7 +1050,7 @@ Required invariants:
 There is a smaller schema alternative:
 
 - keep `ReferenceAsset`
-- add `start_seconds` and `end_seconds`
+- add `source_start_seconds` and `source_end_seconds`
 - drop uniqueness on `audio_variant_id`
 
 This is not recommended as the complete feature shape because it breaks down once raw-source promotion and processed reference variants appear.
@@ -1124,6 +1132,10 @@ Phase 1C recommendation:
 
 - start with candidate-anchor rerank only
 - add saved-reference anchors only after asset embeddings exist for new and legacy library entries
+- add a selected-candidate detail surface in the center pane for trim work
+- compute a conservative browser-side RMS suggestion over the preview buffer
+- allow manual start / end override before promotion
+- send only absolute source-relative trim bounds to the backend
 
 ## Reference Asset Endpoints
 
