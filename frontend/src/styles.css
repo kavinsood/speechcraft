@@ -1357,10 +1357,32 @@ button:disabled {
   width: 100%;
 }
 
+.reference-rerank-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  font-size: 0.82rem;
+  color: #41525a;
+}
+
+.reference-rerank-summary strong {
+  color: #19313c;
+}
+
 .reference-candidate-flags {
   display: flex;
   flex-wrap: wrap;
   gap: 0.45rem;
+}
+
+.reference-rerank-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  font-size: 0.78rem;
+  color: #41525a;
 }
 
 .reference-promoted-banner {

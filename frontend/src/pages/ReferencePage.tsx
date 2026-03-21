@@ -8,12 +8,14 @@ import {
   fetchReferenceRun,
   fetchReferenceRunCandidates,
   promoteReferenceCandidate,
+  rerankReferenceRunCandidates,
 } from "../api";
 import type {
   Project,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
   ReferenceCandidate,
+  ReferenceRerankCandidate,
   ReferenceRun,
   SourceRecording,
 } from "../types";
@@ -35,6 +37,8 @@ type ReferencePageProps = {
 };
 
 type PageStatus = "loading" | "ready" | "error";
+type CandidateListEntry = ReferenceCandidate | ReferenceRerankCandidate;
+const RERANK_DEBOUNCE_MS = 180;
 
 export default function ReferencePage({
   activeProject,
@@ -49,15 +53,20 @@ export default function ReferencePage({
   const [referenceRuns, setReferenceRuns] = useState<ReferenceRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedRun, setSelectedRun] = useState<ReferenceRun | null>(null);
-  const [candidates, setCandidates] = useState<ReferenceCandidate[]>([]);
+  const [baselineCandidates, setBaselineCandidates] = useState<ReferenceCandidate[]>([]);
+  const [candidates, setCandidates] = useState<CandidateListEntry[]>([]);
   const [candidateError, setCandidateError] = useState<string | null>(null);
   const [isCreatingRun, setIsCreatingRun] = useState(false);
+  const [isReranking, setIsReranking] = useState(false);
   const [promotingCandidateId, setPromotingCandidateId] = useState<string | null>(null);
+  const [positiveCandidateIds, setPositiveCandidateIds] = useState<string[]>([]);
+  const [negativeCandidateIds, setNegativeCandidateIds] = useState<string[]>([]);
   const [referenceAssets, setReferenceAssets] = useState<ReferenceAssetSummary[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [selectedAsset, setSelectedAsset] = useState<ReferenceAssetDetail | null>(null);
   const latestLoadRequestRef = useRef(0);
   const latestDetailRequestRef = useRef(0);
+  const latestRerankRequestRef = useRef(0);
 
   async function loadPage(projectId: string | null | undefined) {
     const requestId = latestLoadRequestRef.current + 1;
@@ -72,7 +81,10 @@ export default function ReferencePage({
       setReferenceRuns([]);
       setSelectedRunId(null);
       setSelectedRun(null);
+      setBaselineCandidates([]);
       setCandidates([]);
+      setPositiveCandidateIds([]);
+      setNegativeCandidateIds([]);
       setReferenceAssets([]);
       setSelectedAssetId(null);
       setSelectedAsset(null);
@@ -125,7 +137,10 @@ export default function ReferencePage({
       setReferenceRuns([]);
       setSelectedRunId(null);
       setSelectedRun(null);
+      setBaselineCandidates([]);
       setCandidates([]);
+      setPositiveCandidateIds([]);
+      setNegativeCandidateIds([]);
       setReferenceAssets([]);
       setSelectedAssetId(null);
       setSelectedAsset(null);
@@ -193,7 +208,10 @@ export default function ReferencePage({
   useEffect(() => {
     if (!selectedRunId) {
       setSelectedRun(null);
+      setBaselineCandidates([]);
       setCandidates([]);
+      setPositiveCandidateIds([]);
+      setNegativeCandidateIds([]);
       setCandidateError(null);
       return;
     }
@@ -219,14 +237,20 @@ export default function ReferencePage({
           if (cancelled) {
             return;
           }
+          setBaselineCandidates(nextCandidates);
           setCandidates(nextCandidates);
+          setPositiveCandidateIds([]);
+          setNegativeCandidateIds([]);
           setCandidateError(null);
           if (intervalId !== null) {
             window.clearInterval(intervalId);
             intervalId = null;
           }
         } else {
+          setBaselineCandidates([]);
           setCandidates([]);
+          setPositiveCandidateIds([]);
+          setNegativeCandidateIds([]);
           if (run.status === "failed") {
             setCandidateError(run.error_message || "The run failed.");
             if (intervalId !== null) {
@@ -240,7 +264,10 @@ export default function ReferencePage({
           return;
         }
         setSelectedRun(null);
+        setBaselineCandidates([]);
         setCandidates([]);
+        setPositiveCandidateIds([]);
+        setNegativeCandidateIds([]);
         setCandidateError(getReferenceErrorMessage(error, "The selected run could not be loaded."));
         if (intervalId !== null) {
           window.clearInterval(intervalId);
@@ -261,6 +288,61 @@ export default function ReferencePage({
       }
     };
   }, [selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRun || selectedRun.status !== "completed") {
+      setIsReranking(false);
+      return;
+    }
+
+    if (positiveCandidateIds.length === 0 && negativeCandidateIds.length === 0) {
+      setCandidates(baselineCandidates);
+      setIsReranking(false);
+      return;
+    }
+
+    let cancelled = false;
+    const requestId = latestRerankRequestRef.current + 1;
+    latestRerankRequestRef.current = requestId;
+    setIsReranking(true);
+    const timeoutId = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await rerankReferenceRunCandidates(selectedRun.id, {
+            positive_candidate_ids: positiveCandidateIds,
+            negative_candidate_ids: negativeCandidateIds,
+            mode: selectedRun.mode,
+          });
+          if (cancelled || latestRerankRequestRef.current !== requestId) {
+            return;
+          }
+          setCandidates(response.candidates);
+          setCandidateError(null);
+        } catch (error) {
+          if (cancelled || latestRerankRequestRef.current !== requestId) {
+            return;
+          }
+          setCandidateError(getReferenceErrorMessage(error, "The rerank request failed."));
+        } finally {
+          if (!cancelled && latestRerankRequestRef.current === requestId) {
+            setIsReranking(false);
+          }
+        }
+      })();
+    }, RERANK_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    baselineCandidates,
+    negativeCandidateIds,
+    positiveCandidateIds,
+    selectedRun?.id,
+    selectedRun?.mode,
+    selectedRun?.status,
+  ]);
 
   const promotedCandidatesById = useMemo(() => {
     const promoted = new Map<string, ReferenceAssetSummary>();
@@ -314,6 +396,25 @@ export default function ReferencePage({
     }
   }
 
+  function togglePositiveCandidate(candidateId: string) {
+    setPositiveCandidateIds((current) =>
+      current.includes(candidateId) ? current.filter((item) => item !== candidateId) : [...current, candidateId],
+    );
+    setNegativeCandidateIds((current) => current.filter((item) => item !== candidateId));
+  }
+
+  function toggleNegativeCandidate(candidateId: string) {
+    setNegativeCandidateIds((current) =>
+      current.includes(candidateId) ? current.filter((item) => item !== candidateId) : [...current, candidateId],
+    );
+    setPositiveCandidateIds((current) => current.filter((item) => item !== candidateId));
+  }
+
+  function resetRerankAnchors() {
+    setPositiveCandidateIds([]);
+    setNegativeCandidateIds([]);
+  }
+
   function toggleRecording(recordingId: string) {
     setSelectedRecordingIds((current) =>
       current.includes(recordingId)
@@ -351,8 +452,14 @@ export default function ReferencePage({
             selectedRun={selectedRun}
             candidates={candidates}
             candidateError={candidateError}
+            isReranking={isReranking}
+            positiveCandidateIds={positiveCandidateIds}
+            negativeCandidateIds={negativeCandidateIds}
             promotingCandidateId={promotingCandidateId}
             promotedCandidatesById={promotedCandidatesById}
+            onTogglePositiveCandidate={togglePositiveCandidate}
+            onToggleNegativeCandidate={toggleNegativeCandidate}
+            onResetRerankAnchors={resetRerankAnchors}
             onPromoteCandidate={(candidate) => void handlePromoteCandidate(candidate)}
             onOpenExistingAsset={setSelectedAssetId}
           />

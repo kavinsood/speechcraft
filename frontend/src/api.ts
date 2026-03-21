@@ -3,9 +3,10 @@ import type {
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
-  ReferenceCandidate,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
+  ReferenceCandidate,
+  ReferenceRunRerankResponse,
   ReferenceRun,
   ReviewStatus,
   Slice,
@@ -153,6 +154,24 @@ export async function fetchReferenceRunCandidates(
   }
   const response = await fetch(url.toString());
   return await parseJson<ReferenceCandidate[]>(response);
+}
+
+export async function rerankReferenceRunCandidates(
+  runId: string,
+  payload: {
+    positive_candidate_ids: string[];
+    negative_candidate_ids: string[];
+    mode?: string | null;
+  },
+): Promise<ReferenceRunRerankResponse> {
+  const response = await fetch(`${API_BASE}/api/reference-runs/${runId}/rerank`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceRunRerankResponse>(response);
 }
 
 export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAssetDetail> {

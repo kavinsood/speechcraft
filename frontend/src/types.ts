@@ -205,6 +205,7 @@ export type ReferenceCandidate = {
   source_media_kind: ReferenceSourceKind;
   source_recording_id?: string | null;
   source_variant_id?: string | null;
+  embedding_index?: number | null;
   source_start_seconds: number;
   source_end_seconds: number;
   duration_seconds: number;
@@ -213,4 +214,19 @@ export type ReferenceCandidate = {
   language?: string | null;
   risk_flags: string[];
   default_scores: Record<string, number>;
+};
+
+export type ReferenceRerankCandidate = ReferenceCandidate & {
+  mode: string;
+  base_score: number;
+  intent_score: number;
+  rerank_score: number;
+};
+
+export type ReferenceRunRerankResponse = {
+  run_id: string;
+  mode: string;
+  positive_candidate_ids: string[];
+  negative_candidate_ids: string[];
+  candidates: ReferenceRerankCandidate[];
 };

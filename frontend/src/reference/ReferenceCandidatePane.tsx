@@ -1,13 +1,21 @@
 import { buildReferenceCandidateAudioUrl } from "../api";
-import type { ReferenceAssetSummary, ReferenceCandidate, ReferenceRun } from "../types";
+import type { ReferenceAssetSummary, ReferenceCandidate, ReferenceRerankCandidate, ReferenceRun } from "../types";
 import { formatReferenceDuration } from "./reference-helpers";
+
+type CandidateListEntry = ReferenceCandidate | ReferenceRerankCandidate;
 
 type ReferenceCandidatePaneProps = {
   selectedRun: ReferenceRun | null;
-  candidates: ReferenceCandidate[];
+  candidates: CandidateListEntry[];
   candidateError: string | null;
+  isReranking: boolean;
+  positiveCandidateIds: string[];
+  negativeCandidateIds: string[];
   promotingCandidateId: string | null;
   promotedCandidatesById: Map<string, ReferenceAssetSummary>;
+  onTogglePositiveCandidate: (candidateId: string) => void;
+  onToggleNegativeCandidate: (candidateId: string) => void;
+  onResetRerankAnchors: () => void;
   onPromoteCandidate: (candidate: ReferenceCandidate) => void;
   onOpenExistingAsset: (assetId: string) => void;
 };
@@ -16,8 +24,14 @@ export default function ReferenceCandidatePane({
   selectedRun,
   candidates,
   candidateError,
+  isReranking,
+  positiveCandidateIds,
+  negativeCandidateIds,
   promotingCandidateId,
   promotedCandidatesById,
+  onTogglePositiveCandidate,
+  onToggleNegativeCandidate,
+  onResetRerankAnchors,
   onPromoteCandidate,
   onOpenExistingAsset,
 }: ReferenceCandidatePaneProps) {
@@ -25,10 +39,10 @@ export default function ReferenceCandidatePane({
     <main className="stage-main">
       <section className="panel stage-placeholder-hero">
         <p className="eyebrow">Reference workstation</p>
-        <h3>Run, browse, preview, promote.</h3>
+        <h3>Run, browse, rerank, preview, promote.</h3>
         <p>
           This slice proves the real picker spine: source-backed runs, deterministic candidates,
-          lazy preview audio, and promote-as-is into the shared reference library.
+          intent shaping with likes and dislikes, lazy preview audio, and promotion into the shared reference library.
         </p>
       </section>
 
@@ -38,6 +52,23 @@ export default function ReferenceCandidatePane({
             <p className="eyebrow">Candidate output</p>
             <h3>{selectedRun ? `Run ${selectedRun.id}` : "No run selected"}</h3>
           </div>
+          {selectedRun?.status === "completed" ? (
+            <div className="reference-rerank-summary">
+              <span>
+                Likes: <strong>{positiveCandidateIds.length}</strong>
+              </span>
+              <span>
+                Dislikes: <strong>{negativeCandidateIds.length}</strong>
+              </span>
+              <button
+                type="button"
+                disabled={positiveCandidateIds.length === 0 && negativeCandidateIds.length === 0}
+                onClick={onResetRerankAnchors}
+              >
+                Reset rerank
+              </button>
+            </div>
+          ) : null}
         </div>
 
         {!selectedRun ? (
@@ -61,6 +92,9 @@ export default function ReferenceCandidatePane({
         ) : null}
 
         {candidateError ? <div className="empty-state">{candidateError}</div> : null}
+        {selectedRun?.status === "completed" && isReranking ? (
+          <div className="empty-state">Reranking candidates with the current likes and dislikes...</div>
+        ) : null}
 
         {selectedRun?.status === "completed" && candidates.length === 0 ? (
           <div className="empty-state">This run completed without any usable candidates.</div>
@@ -70,8 +104,13 @@ export default function ReferenceCandidatePane({
           <div className="reference-candidate-list">
             {candidates.map((candidate) => {
               const audioUrl = buildReferenceCandidateAudioUrl(candidate.run_id, candidate.candidate_id);
-              const overallScore = candidate.default_scores.both ?? candidate.default_scores.overall ?? 0;
+              const isReranked = "rerank_score" in candidate;
+              const overallScore = isReranked
+                ? candidate.rerank_score
+                : (candidate.default_scores.both ?? candidate.default_scores.overall ?? 0);
               const existingAsset = promotedCandidatesById.get(candidate.candidate_id) ?? null;
+              const isPositive = positiveCandidateIds.includes(candidate.candidate_id);
+              const isNegative = negativeCandidateIds.includes(candidate.candidate_id);
               return (
                 <article key={candidate.candidate_id} className="reference-candidate-card">
                   <div className="commit-row">
@@ -96,6 +135,13 @@ export default function ReferenceCandidatePane({
                       ))}
                     </div>
                   ) : null}
+                  {isReranked ? (
+                    <div className="reference-rerank-metrics">
+                      <span>base {candidate.base_score.toFixed(3)}</span>
+                      <span>intent {candidate.intent_score >= 0 ? "+" : ""}{candidate.intent_score.toFixed(3)}</span>
+                      <span>mode {candidate.mode}</span>
+                    </div>
+                  ) : null}
                   {existingAsset ? (
                     <div className="reference-promoted-banner">
                       Already saved as <strong>{existingAsset.name}</strong>.
@@ -105,6 +151,20 @@ export default function ReferenceCandidatePane({
                     <track kind="captions" />
                   </audio>
                   <div className="button-row">
+                    <button
+                      type="button"
+                      className={isPositive ? "primary-button" : ""}
+                      onClick={() => onTogglePositiveCandidate(candidate.candidate_id)}
+                    >
+                      {isPositive ? "Liked" : "Like"}
+                    </button>
+                    <button
+                      type="button"
+                      className={isNegative ? "primary-button" : ""}
+                      onClick={() => onToggleNegativeCandidate(candidate.candidate_id)}
+                    >
+                      {isNegative ? "Disliked" : "Dislike"}
+                    </button>
                     {existingAsset ? (
                       <>
                         <button
