@@ -2,11 +2,20 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import Enum as SQLEnum
 from sqlmodel import Column, Field, JSON, Relationship, SQLModel
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def sql_enum(enum_cls: type[Enum]) -> SQLEnum:
+    return SQLEnum(
+        enum_cls,
+        values_callable=lambda members: [member.value for member in members],
+        native_enum=False,
+    )
 
 
 # ==========================================
@@ -23,6 +32,7 @@ class JobKind(str, Enum):
     IMPORT = "import"
     PREPROCESS = "preprocess"
     SLICE = "slice"
+    FORCED_ALIGN_AND_PACK = "forced_align_and_pack"
     INFERENCE = "inference"
     EXPORT = "export"
 
@@ -75,11 +85,45 @@ class SourceRecording(SQLModel, table=True):
     processing_recipe: str | None = None  # e.g., 'uvr_v5' if derived
 
     batch: ImportBatch = Relationship(back_populates="recordings")
+    review_windows: list["ReviewWindow"] = Relationship(back_populates="source_recording", cascade_delete=True)
+    processing_jobs: list["ProcessingJob"] = Relationship(back_populates="source_recording", cascade_delete=True)
     slices: list["Slice"] = Relationship(back_populates="source_recording", cascade_delete=True)
 
     @property
     def duration_s(self) -> float:
         return self.num_samples / self.sample_rate if self.sample_rate else 0.0
+
+
+class ReviewWindow(SQLModel, table=True):
+    """Coarse review-only source spans. These are not canonical slices."""
+
+    id: str = Field(primary_key=True)
+    source_recording_id: str = Field(foreign_key="sourcerecording.id")
+    start_seconds: float
+    end_seconds: float
+    rough_transcript: str = ""
+    order_index: int = 0
+    window_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=utc_now)
+
+    source_recording: SourceRecording = Relationship(back_populates="review_windows")
+
+
+class ProcessingJob(SQLModel, table=True):
+    """Background processing state shared across slicer and reference workflows."""
+
+    id: str = Field(primary_key=True)
+    kind: JobKind = Field(sa_column=Column(sql_enum(JobKind), index=True))
+    status: JobStatus = Field(default=JobStatus.PENDING, sa_column=Column(sql_enum(JobStatus), index=True))
+    source_recording_id: str | None = Field(default=None, foreign_key="sourcerecording.id")
+    input_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    output_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    source_recording: SourceRecording | None = Relationship(back_populates="processing_jobs")
 
 
 # ==========================================
@@ -149,7 +193,7 @@ class EditCommit(SQLModel, table=True):
 
     edl_operations: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     transcript_text: str = ""
-    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED)
+    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED, sa_column=Column(sql_enum(ReviewStatus)))
     tags_payload: list[dict[str, str]] = Field(default_factory=list, sa_column=Column(JSON))
     active_variant_id_snapshot: str | None = None
     message: str | None = None
@@ -171,7 +215,7 @@ class Slice(SQLModel, table=True):
     # POINTER 2: Which math to apply to it?
     active_commit_id: str | None = Field(default=None, foreign_key="editcommit.id")
 
-    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED)
+    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED, sa_column=Column(sql_enum(ReviewStatus)))
 
     # Escape hatch for weird model-specific config
     model_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
@@ -244,6 +288,30 @@ class SourceRecordingView(SQLModel):
     processing_recipe: str | None = None
 
 
+class ReviewWindowView(SQLModel):
+    id: str
+    source_recording_id: str
+    start_seconds: float
+    end_seconds: float
+    rough_transcript: str = ""
+    order_index: int = 0
+    window_metadata: dict[str, Any] | None = None
+    created_at: datetime
+
+
+class ProcessingJobView(SQLModel):
+    id: str
+    kind: JobKind
+    status: JobStatus
+    source_recording_id: str | None = None
+    input_payload: dict[str, Any] | None = None
+    output_payload: dict[str, Any] | None = None
+    error_message: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
 class SliceRevision(SQLModel):
     id: str
     slice_id: str
@@ -297,7 +365,7 @@ class ExportRun(SQLModel, table=True):
 
     id: str = Field(primary_key=True)
     batch_id: str = Field(foreign_key="importbatch.id")
-    status: JobStatus = Field(default=JobStatus.PENDING)
+    status: JobStatus = Field(default=JobStatus.PENDING, sa_column=Column(sql_enum(JobStatus)))
     output_root: str
     manifest_path: str
     accepted_clip_count: int = 0
@@ -407,24 +475,21 @@ class RecordingDerivativeCreate(SQLModel):
 
 
 class SlicerChunkInput(SQLModel):
-    id: str
-    file_path: str
-    sample_rate: int
-    num_samples: int
-    original_start_time: float
-    original_end_time: float
-    transcript_text: str
-    transcript_source: str = "whisper"
-    transcript_confidence: float | None = None
-    speaker_name: str = "speaker_a"
-    language: str = "en"
+    start_seconds: float
+    end_seconds: float
+    rough_transcript: str = ""
     order_index: int
-    tags: list[TagPayload] = Field(default_factory=list)
     model_metadata: dict[str, Any] | None = None
 
 
 class SlicerHandoffRequest(SQLModel):
-    chunks: list[SlicerChunkInput]
+    windows: list[SlicerChunkInput]
+
+
+class ForcedAlignAndPackRequest(SQLModel):
+    transcript_text: str
+    review_window_ids: list[str] | None = None
+    minimum_duration_seconds: float = 6.0
 
 
 class AudioVariantCreate(SQLModel):

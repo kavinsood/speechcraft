@@ -1,4 +1,5 @@
 import json
+import time
 import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,14 +13,18 @@ from app.models import (
     AudioVariantCreate,
     AudioVariantRunRequest,
     EditCommit,
+    ForcedAlignAndPackRequest,
     ReviewStatus,
+    Slice,
     SliceEdlUpdate,
     SliceSaveRequest,
     SliceSplitRequest,
     SliceStatusUpdate,
     SliceTagUpdate,
     SliceTranscriptUpdate,
+    SlicerHandoffRequest,
     SourceRecording,
+    SourceRecordingCreate,
     TagPayload,
 )
 from app.repository import SQLiteRepository, SliceSaveValidationError
@@ -545,3 +550,81 @@ class RepositoryMediaTests(TestCase):
         self.assertEqual(saved.active_commit_id, latest_commit.id)
         self.assertEqual(latest_commit.message, "Saved slice milestone")
         self.assertTrue(latest_commit.is_milestone)
+
+    def test_slicer_handoff_registers_review_windows_without_creating_canonical_slices(self) -> None:
+        source_path = self.repository.media_root / "sources" / "src-review-window.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(self.repository._render_synthetic_wave_bytes(48000, 1, 8.0, "src-review-window"))
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-review-window",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=384000,
+            )
+        )
+
+        before_slice_count = len(self.repository.get_project_slices("phase1-demo"))
+        windows = self.repository.register_slicer_chunks(
+            "src-review-window",
+            SlicerHandoffRequest(
+                windows=[
+                    {
+                        "start_seconds": 0.0,
+                        "end_seconds": 2.0,
+                        "rough_transcript": "First rough window.",
+                        "order_index": 0,
+                    },
+                    {
+                        "start_seconds": 2.0,
+                        "end_seconds": 5.0,
+                        "rough_transcript": "Second rough window.",
+                        "order_index": 1,
+                    },
+                ]
+            ),
+        )
+
+        self.assertEqual(len(windows), 2)
+        self.assertEqual([window.rough_transcript for window in windows], ["First rough window.", "Second rough window."])
+        self.assertEqual(len(self.repository.list_review_windows("src-review-window")), 2)
+        self.assertEqual(len(self.repository.get_project_slices("phase1-demo")), before_slice_count)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            slice_count = len(session.exec(select(Slice).where(Slice.source_recording_id == "src-review-window")).all())
+        self.assertEqual(slice_count, 0)
+
+    def test_source_recording_window_media_path_materializes_audio_from_master_recording(self) -> None:
+        media_path = self.repository.get_source_recording_window_media_path("src-001", 12.4, 15.68)
+
+        self.assertTrue(media_path.exists())
+        self.assertAlmostEqual(read_wav_duration_seconds(media_path), 3.28, places=2)
+
+    def test_forced_align_and_pack_job_is_async_and_reports_placeholder_failure(self) -> None:
+        windows = self.repository.list_review_windows("src-001")
+        self.assertEqual(len(windows), 1)
+
+        job = self.repository.enqueue_forced_align_and_pack(
+            "src-001",
+            ForcedAlignAndPackRequest(
+                transcript_text="The workstation should make this painless.",
+                review_window_ids=[windows[0].id],
+            ),
+        )
+
+        self.assertEqual(job.status, "pending")
+
+        deadline = time.time() + 5.0
+        latest = job
+        while time.time() < deadline:
+            latest = self.repository.get_processing_job(job.id)
+            if latest.status in {"completed", "failed"}:
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(latest.status, "failed")
+        self.assertIsNotNone(latest.error_message)
+        self.assertIn("not implemented yet", latest.error_message)
+        self.assertEqual(self.repository.list_source_recording_jobs("src-001")[0].id, job.id)

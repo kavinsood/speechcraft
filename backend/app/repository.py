@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,13 +27,19 @@ from .models import (
     EditCommit,
     ExportRun,
     ExportPreview,
+    ForcedAlignAndPackRequest,
     ImportBatch,
     ImportBatchCreate,
+    JobKind,
     JobStatus,
     MediaCleanupResult,
+    ProcessingJob,
+    ProcessingJobView,
     ProjectSummary,
     ReferenceAsset,
     ReferenceAssetCreate,
+    ReviewWindow,
+    ReviewWindowView,
     ReviewStatus,
     SliceRevision,
     SliceSaveRequest,
@@ -113,6 +120,7 @@ class SQLiteRepository:
             connect_args={"check_same_thread": False},
         )
         SQLModel.metadata.create_all(self.engine)
+        self._migrate_enum_storage()
         self._migrate_editcommit_schema()
         self._seed_if_needed()
         self._run_data_migrations()
@@ -127,6 +135,16 @@ class SQLiteRepository:
         with self._session() as session:
             return self._project_summary(session, self._get_batch(session, project_id))
 
+    def list_review_windows(self, recording_id: str) -> list[ReviewWindowView]:
+        with self._session() as session:
+            self._get_source_recording(session, recording_id)
+            windows = session.exec(
+                select(ReviewWindow)
+                .where(ReviewWindow.source_recording_id == recording_id)
+                .order_by(ReviewWindow.order_index, ReviewWindow.created_at)
+            ).all()
+            return [self._review_window_view(window) for window in windows]
+
     def get_project_slices(self, project_id: str) -> list[SliceSummary]:
         with self._session() as session:
             self._get_batch(session, project_id)
@@ -135,6 +153,20 @@ class SQLiteRepository:
     def get_slice_detail(self, slice_id: str) -> SliceDetail:
         with self._session() as session:
             return self._get_slice_detail(session, slice_id)
+
+    def get_processing_job(self, job_id: str) -> ProcessingJobView:
+        with self._session() as session:
+            return self._processing_job_view(self._get_processing_job(session, job_id))
+
+    def list_source_recording_jobs(self, recording_id: str) -> list[ProcessingJobView]:
+        with self._session() as session:
+            self._get_source_recording(session, recording_id)
+            jobs = session.exec(
+                select(ProcessingJob)
+                .where(ProcessingJob.source_recording_id == recording_id)
+                .order_by(ProcessingJob.created_at.desc())
+            ).all()
+            return [self._processing_job_view(job) for job in jobs]
 
     def list_export_runs(self, project_id: str) -> list[ExportRun]:
         with self._session() as session:
@@ -674,6 +706,16 @@ class SQLiteRepository:
             slice_row = self._get_loaded_slice(session, slice_id)
             return self._materialize_slice_media_path(session, slice_row)
 
+    def get_source_recording_window_media_path(
+        self,
+        recording_id: str,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> Path:
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            return self._materialize_review_window_media_path(recording, start_seconds, end_seconds)
+
     def get_variant_media_path(self, variant_id: str) -> Path:
         with self._session() as session:
             variant = session.exec(
@@ -722,72 +764,61 @@ class SQLiteRepository:
             session.refresh(recording)
             return recording
 
-    def register_slicer_chunks(self, recording_id: str, payload: SlicerHandoffRequest) -> list[SliceDetail]:
+    def register_slicer_chunks(self, recording_id: str, payload: SlicerHandoffRequest) -> list[ReviewWindowView]:
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
-            created_ids: list[str] = []
-            for chunk in payload.chunks:
-                self._validate_audio_asset(Path(chunk.file_path), chunk.sample_rate, recording.num_channels, chunk.num_samples)
-                variant_id = self._new_id("variant")
-                managed_variant_path = self._ingest_variant_asset(Path(chunk.file_path), variant_id)
-                transcript_id = self._new_id("transcript")
-                metadata = {
-                    "order_index": chunk.order_index,
-                    "source_file_id": recording.id,
-                    "working_asset_id": variant_id,
-                    "original_start_time": chunk.original_start_time,
-                    "original_end_time": chunk.original_end_time,
-                    "speaker_name": chunk.speaker_name,
-                    "language": chunk.language,
-                    "is_superseded": False,
-                    "updated_at": utc_now().isoformat(),
-                    **(chunk.model_metadata or {}),
-                }
-                slice_row = Slice(
-                    id=chunk.id,
+            session.exec(delete(ReviewWindow).where(ReviewWindow.source_recording_id == recording.id))
+            created_windows: list[ReviewWindow] = []
+            for chunk in payload.windows:
+                self._validate_review_window_bounds(recording, chunk.start_seconds, chunk.end_seconds)
+                window = ReviewWindow(
+                    id=self._new_id("review-window"),
                     source_recording_id=recording.id,
-                    active_variant_id=variant_id,
-                    active_commit_id=None,
-                    status=ReviewStatus.UNRESOLVED,
-                    model_metadata=metadata,
+                    start_seconds=chunk.start_seconds,
+                    end_seconds=chunk.end_seconds,
+                    rough_transcript=chunk.rough_transcript,
+                    order_index=chunk.order_index,
+                    window_metadata=chunk.model_metadata,
                 )
-                variant = AudioVariant(
-                    id=variant_id,
-                    slice_id=slice_row.id,
-                    file_path=str(managed_variant_path),
-                    is_original=True,
-                    generator_model="slicer",
-                    sample_rate=chunk.sample_rate,
-                    num_samples=chunk.num_samples,
-                )
-                transcript = Transcript(
-                    id=transcript_id,
-                    slice_id=slice_row.id,
-                    original_text=chunk.transcript_text,
-                    alignment_data={
-                        "source": chunk.transcript_source,
-                        "confidence": chunk.transcript_confidence,
-                    },
-                )
-                session.add(slice_row)
-                session.add(variant)
-                session.add(transcript)
-                session.flush()
-                self._replace_slice_tags(session, slice_row, chunk.tags)
-                session.flush()
-                self._append_slice_revision(
-                    session,
-                    slice_row,
-                    edl_operations=[],
-                    message="Imported slice baseline",
-                )
-                created_ids.append(slice_row.id)
+                session.add(window)
+                created_windows.append(window)
             session.commit()
-            session.expire_all()
-            details = [self._get_slice_detail(session, slice_id) for slice_id in created_ids]
-        for created_id in created_ids:
-            self._warm_slice_artifacts_for_id(created_id)
-        return details
+            return [self._review_window_view(window) for window in created_windows]
+
+    def enqueue_forced_align_and_pack(
+        self,
+        recording_id: str,
+        payload: ForcedAlignAndPackRequest,
+    ) -> ProcessingJobView:
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            if payload.review_window_ids is not None:
+                matching_windows = session.exec(
+                    select(ReviewWindow).where(
+                        ReviewWindow.source_recording_id == recording.id,
+                        ReviewWindow.id.in_(payload.review_window_ids),
+                    )
+                ).all()
+                if len(matching_windows) != len(payload.review_window_ids):
+                    raise ValueError("One or more review windows do not belong to the source recording")
+            job = ProcessingJob(
+                id=self._new_id("job"),
+                kind=JobKind.FORCED_ALIGN_AND_PACK,
+                status=JobStatus.PENDING,
+                source_recording_id=recording.id,
+                input_payload=payload.model_dump(mode="json"),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            job_view = self._processing_job_view(job)
+        threading.Thread(
+            target=self._run_processing_job,
+            args=(job_view.id,),
+            daemon=True,
+            name=f"speechcraft-job-{job_view.id}",
+        ).start()
+        return job_view
 
     def create_audio_variant(self, slice_id: str, payload: AudioVariantCreate) -> SliceDetail:
         with self._session() as session:
@@ -951,6 +982,39 @@ class SQLiteRepository:
                 connection.exec_driver_sql(
                     "ALTER TABLE editcommit ADD COLUMN is_milestone INTEGER NOT NULL DEFAULT 0"
                 )
+
+    def _migrate_enum_storage(self) -> None:
+        replacements = {
+            "slice": {"status": {status.name: status.value for status in ReviewStatus}},
+            "editcommit": {"status": {status.name: status.value for status in ReviewStatus}},
+            "exportrun": {"status": {status.name: status.value for status in JobStatus}},
+            "processingjob": {
+                "status": {status.name: status.value for status in JobStatus},
+                "kind": {kind.name: kind.value for kind in JobKind},
+            },
+        }
+        with self.engine.begin() as connection:
+            tables = {
+                row[0]
+                for row in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            for table_name, columns in replacements.items():
+                if table_name not in tables:
+                    continue
+                existing_columns = {
+                    row[1]
+                    for row in connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+                }
+                for column_name, mapping in columns.items():
+                    if column_name not in existing_columns:
+                        continue
+                    for legacy_value, normalized_value in mapping.items():
+                        connection.exec_driver_sql(
+                            f"UPDATE {table_name} SET {column_name} = ? WHERE {column_name} = ?",
+                            (normalized_value, legacy_value),
+                        )
 
     def _migrate_legacy_slice_revision_history(self) -> None:
         with self._session() as session:
@@ -1165,11 +1229,8 @@ class SQLiteRepository:
         batch = ImportBatch(id="phase1-demo", name="Phase 1 Demo Project")
         session.add(batch)
         source_path = self.media_root / "sources" / "src-001.wav"
-        chunk_path = self.media_root / "seed" / "clip-001.wav"
         source_path.parent.mkdir(parents=True, exist_ok=True)
-        chunk_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_bytes(self._render_synthetic_wave_bytes(48000, 1, 20.0, "src-001"))
-        chunk_path.write_bytes(self._render_synthetic_wave_bytes(48000, 1, 157440 / 48000, "clip-001"))
         recording = SourceRecording(
             id="src-001",
             batch_id=batch.id,
@@ -1183,20 +1244,28 @@ class SQLiteRepository:
         self.register_slicer_chunks(
             recording.id,
             SlicerHandoffRequest(
-                chunks=[
+                windows=[
                     {
-                        "id": "clip-001",
-                        "file_path": str(chunk_path),
-                        "sample_rate": 48000,
-                        "num_samples": 157440,
-                        "original_start_time": 12.4,
-                        "original_end_time": 15.68,
-                        "transcript_text": "The workstation should make this painless.",
+                        "start_seconds": 12.4,
+                        "end_seconds": 15.68,
+                        "rough_transcript": "The workstation should make this painless.",
                         "order_index": 10,
                     }
                 ]
             ),
         )
+        with self._session() as seed_session:
+            seeded_recording = self._get_source_recording(seed_session, recording.id)
+            self._create_slice_from_source_span(
+                seed_session,
+                seeded_recording,
+                slice_id="clip-001",
+                start_seconds=12.4,
+                end_seconds=15.68,
+                transcript_text="The workstation should make this painless.",
+                order_index=10,
+            )
+            seed_session.commit()
 
     def _get_batch(self, session: Session, batch_id: str) -> ImportBatch:
         batch = session.get(ImportBatch, batch_id)
@@ -1237,11 +1306,106 @@ class SQLiteRepository:
             raise KeyError(recording_id)
         return recording
 
+    def _get_review_window(self, session: Session, review_window_id: str) -> ReviewWindow:
+        window = session.get(ReviewWindow, review_window_id)
+        if window is None:
+            raise KeyError(review_window_id)
+        return window
+
+    def _get_processing_job(self, session: Session, job_id: str) -> ProcessingJob:
+        job = session.get(ProcessingJob, job_id)
+        if job is None:
+            raise KeyError(job_id)
+        return job
+
     def _get_transcript(self, session: Session, slice_id: str) -> Transcript:
         transcript = session.exec(select(Transcript).where(Transcript.slice_id == slice_id)).first()
         if transcript is None:
             raise KeyError(slice_id)
         return transcript
+
+    def _validate_review_window_bounds(
+        self,
+        recording: SourceRecording,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> None:
+        if start_seconds < 0:
+            raise ValueError("Review window start must be non-negative")
+        if end_seconds <= start_seconds:
+            raise ValueError("Review window end must be greater than the start")
+        if end_seconds > recording.duration_s:
+            raise ValueError("Review window end exceeds the source recording duration")
+
+    def _create_slice_from_source_span(
+        self,
+        session: Session,
+        recording: SourceRecording,
+        *,
+        slice_id: str,
+        start_seconds: float,
+        end_seconds: float,
+        transcript_text: str,
+        order_index: int,
+        speaker_name: str = "speaker_a",
+        language: str = "en",
+        alignment_data: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+    ) -> Slice:
+        self._validate_review_window_bounds(recording, start_seconds, end_seconds)
+        variant_id = self._new_id("variant")
+        variant_path = self._managed_variant_path(variant_id)
+        variant_path.parent.mkdir(parents=True, exist_ok=True)
+        variant_bytes = self._extract_source_window_wav_bytes(recording, start_seconds, end_seconds)
+        variant_path.write_bytes(variant_bytes)
+        sample_rate, _channels, num_samples = self._wav_metadata(variant_bytes)
+        now = created_at or utc_now()
+        slice_row = Slice(
+            id=slice_id,
+            source_recording_id=recording.id,
+            active_variant_id=variant_id,
+            active_commit_id=None,
+            status=ReviewStatus.UNRESOLVED,
+            model_metadata={
+                "order_index": order_index,
+                "source_file_id": recording.id,
+                "working_asset_id": variant_id,
+                "original_start_time": start_seconds,
+                "original_end_time": end_seconds,
+                "speaker_name": speaker_name,
+                "language": language,
+                "is_superseded": False,
+                "updated_at": now.isoformat(),
+            },
+            created_at=now,
+        )
+        variant = AudioVariant(
+            id=variant_id,
+            slice_id=slice_row.id,
+            file_path=str(variant_path),
+            is_original=True,
+            generator_model="slicer",
+            sample_rate=sample_rate,
+            num_samples=num_samples,
+        )
+        transcript = Transcript(
+            id=self._new_id("transcript"),
+            slice_id=slice_row.id,
+            original_text=transcript_text,
+            alignment_data=alignment_data,
+        )
+        session.add(slice_row)
+        session.add(variant)
+        session.add(transcript)
+        session.flush()
+        self._append_slice_revision(
+            session,
+            slice_row,
+            edl_operations=[],
+            message="Imported slice baseline",
+            created_at=now,
+        )
+        return slice_row
 
     def _get_batch_slices(self, session: Session, batch_id: str) -> list[Slice]:
         return [
@@ -1519,6 +1683,32 @@ class SQLiteRepository:
             processing_recipe=recording.processing_recipe,
         )
 
+    def _review_window_view(self, window: ReviewWindow) -> ReviewWindowView:
+        return ReviewWindowView(
+            id=window.id,
+            source_recording_id=window.source_recording_id,
+            start_seconds=window.start_seconds,
+            end_seconds=window.end_seconds,
+            rough_transcript=window.rough_transcript,
+            order_index=window.order_index,
+            window_metadata=window.window_metadata,
+            created_at=self._as_utc(window.created_at),
+        )
+
+    def _processing_job_view(self, job: ProcessingJob) -> ProcessingJobView:
+        return ProcessingJobView(
+            id=job.id,
+            kind=job.kind,
+            status=job.status,
+            source_recording_id=job.source_recording_id,
+            input_payload=job.input_payload,
+            output_payload=job.output_payload,
+            error_message=job.error_message,
+            created_at=self._as_utc(job.created_at),
+            started_at=self._as_utc(job.started_at) if job.started_at is not None else None,
+            completed_at=self._as_utc(job.completed_at) if job.completed_at is not None else None,
+        )
+
     def _revision_view(self, commit: EditCommit) -> SliceRevision:
         return SliceRevision(
             id=commit.id,
@@ -1754,6 +1944,34 @@ class SQLiteRepository:
             wav_file.writeframes(frames)
         return output.getvalue()
 
+    def _extract_source_window_wav_bytes(
+        self,
+        recording: SourceRecording,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> bytes:
+        self._validate_review_window_bounds(recording, start_seconds, end_seconds)
+        source_path = Path(recording.file_path).expanduser().resolve(strict=False)
+        self._validate_audio_asset(
+            source_path,
+            recording.sample_rate,
+            recording.num_channels,
+            recording.num_samples,
+        )
+        start_frame = max(int(round(start_seconds * recording.sample_rate)), 0)
+        end_frame = min(int(round(end_seconds * recording.sample_rate)), recording.num_samples)
+        frame_count = max(end_frame - start_frame, 1)
+        output = io.BytesIO()
+        with wave.open(str(source_path), "rb") as source_wav:
+            source_wav.setpos(start_frame)
+            frames = source_wav.readframes(frame_count)
+            with wave.open(output, "wb") as target_wav:
+                target_wav.setnchannels(source_wav.getnchannels())
+                target_wav.setsampwidth(source_wav.getsampwidth())
+                target_wav.setframerate(source_wav.getframerate())
+                target_wav.writeframes(frames)
+        return output.getvalue()
+
     def _wav_metadata(self, audio_bytes: bytes) -> tuple[int, int, int]:
         channels, _sample_width, sample_rate, frames, _raw = self._read_pcm_wav(audio_bytes)
         return sample_rate, channels, frames
@@ -1868,6 +2086,37 @@ class SQLiteRepository:
 
     def _managed_variant_path(self, variant_id: str) -> Path:
         return self._managed_media_path("variants", variant_id)
+
+    def _review_window_cache_path(
+        self,
+        recording_id: str,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> Path:
+        fingerprint_input = json.dumps(
+            {
+                "recording_id": recording_id,
+                "start_seconds": round(start_seconds, 4),
+                "end_seconds": round(end_seconds, 4),
+            },
+            sort_keys=True,
+        )
+        identifier = hashlib.sha1(fingerprint_input.encode("utf-8")).hexdigest()[:16]
+        return self._managed_media_path("review-windows", f"{recording_id}-{identifier}")
+
+    def _materialize_review_window_media_path(
+        self,
+        recording: SourceRecording,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> Path:
+        target_path = self._review_window_cache_path(recording.id, start_seconds, end_seconds)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if not target_path.exists():
+            target_path.write_bytes(
+                self._extract_source_window_wav_bytes(recording, start_seconds, end_seconds)
+            )
+        return target_path
 
     def _prune_derived_media_cache(self) -> int:
         with self._session() as session:
@@ -2046,6 +2295,64 @@ class SQLiteRepository:
                 metadata["order_index"] = order_index + amount
                 slice_row.model_metadata = metadata
                 session.add(slice_row)
+
+    def _run_processing_job(self, job_id: str) -> None:
+        with self._session() as session:
+            job = self._get_processing_job(session, job_id)
+            job.status = JobStatus.RUNNING
+            job.started_at = utc_now()
+            job.error_message = None
+            session.add(job)
+            session.commit()
+
+        try:
+            with self._session() as session:
+                job = self._get_processing_job(session, job_id)
+                if job.kind == JobKind.FORCED_ALIGN_AND_PACK:
+                    self._run_forced_align_and_pack_job(session, job)
+                else:
+                    raise ValueError(f"Unsupported processing job kind: {job.kind}")
+        except Exception as exc:
+            with self._session() as session:
+                job = self._get_processing_job(session, job_id)
+                job.status = JobStatus.FAILED
+                job.error_message = str(exc)
+                job.completed_at = utc_now()
+                session.add(job)
+                session.commit()
+
+    def _run_forced_align_and_pack_job(self, session: Session, job: ProcessingJob) -> None:
+        if job.source_recording_id is None:
+            raise ValueError("Forced align and pack job is missing its source recording")
+        recording = self._get_source_recording(session, job.source_recording_id)
+        payload = job.input_payload or {}
+        transcript_text = str(payload.get("transcript_text", "")).strip()
+        if not transcript_text:
+            raise ValueError("Forced align and pack job requires transcript_text")
+        requested_window_ids = payload.get("review_window_ids")
+        if requested_window_ids:
+            windows = session.exec(
+                select(ReviewWindow)
+                .where(
+                    ReviewWindow.source_recording_id == recording.id,
+                    ReviewWindow.id.in_(requested_window_ids),
+                )
+                .order_by(ReviewWindow.order_index, ReviewWindow.created_at)
+            ).all()
+        else:
+            windows = session.exec(
+                select(ReviewWindow)
+                .where(ReviewWindow.source_recording_id == recording.id)
+                .order_by(ReviewWindow.order_index, ReviewWindow.created_at)
+            ).all()
+        if not windows:
+            raise ValueError("Forced align and pack job requires at least one review window")
+
+        # Phase 1/2 only: the async substrate is live, but the actual aligner/packing loop
+        # will be added separately once the CTC aligner worker is integrated.
+        raise NotImplementedError(
+            "forced_align_and_pack worker is not implemented yet; review windows and job polling are ready"
+        )
 
     def _job_status_from_legacy(self, status: str) -> JobStatus:
         mapping = {

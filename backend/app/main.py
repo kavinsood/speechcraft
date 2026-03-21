@@ -12,12 +12,15 @@ from .models import (
     AudioVariantRunRequest,
     ExportPreview,
     ExportRun,
+    ForcedAlignAndPackRequest,
     ImportBatchCreate,
     MediaCleanupResult,
+    ProcessingJobView,
     ProjectSummary,
     RecordingDerivativeCreate,
     ReferenceAsset,
     ReferenceAssetCreate,
+    ReviewWindowView,
     SliceSaveRequest,
     SliceDetail,
     SliceSummary,
@@ -291,6 +294,23 @@ def get_slice_media(slice_id: str) -> FileResponse:
     return FileResponse(path=path, media_type="audio/wav")
 
 
+@app.get("/media/source-recordings/{recording_id}/window.wav")
+def get_source_recording_window_media(
+    recording_id: str,
+    start_seconds: float,
+    end_seconds: float,
+) -> FileResponse:
+    try:
+        path = repository.get_source_recording_window_media_path(recording_id, start_seconds, end_seconds)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
 @app.post("/api/import-batches", response_model=ProjectSummary)
 def create_import_batch(payload: ImportBatchCreate) -> ProjectSummary:
     return repository.create_import_batch(payload)
@@ -319,10 +339,51 @@ def create_preprocessed_recording(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/source-recordings/{recording_id}/slice-handoff", response_model=list[SliceDetail])
-def register_slicer_chunks(recording_id: str, payload: SlicerHandoffRequest) -> list[SliceDetail]:
+@app.get("/api/source-recordings/{recording_id}/review-windows", response_model=list[ReviewWindowView])
+def list_review_windows(recording_id: str) -> list[ReviewWindowView]:
+    try:
+        return repository.list_review_windows(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+
+
+@app.post("/api/source-recordings/{recording_id}/slice-handoff", response_model=list[ReviewWindowView])
+def register_slicer_chunks(recording_id: str, payload: SlicerHandoffRequest) -> list[ReviewWindowView]:
     try:
         return repository.register_slicer_chunks(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/source-recordings/{recording_id}/jobs", response_model=list[ProcessingJobView])
+def list_source_recording_jobs(recording_id: str) -> list[ProcessingJobView]:
+    try:
+        return repository.list_source_recording_jobs(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+
+
+@app.get("/api/jobs/{job_id}", response_model=ProcessingJobView)
+def get_processing_job(job_id: str) -> ProcessingJobView:
+    try:
+        return repository.get_processing_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Processing job not found") from exc
+
+
+@app.post(
+    "/api/source-recordings/{recording_id}/forced-align-and-pack",
+    response_model=ProcessingJobView,
+    status_code=202,
+)
+def enqueue_forced_align_and_pack(
+    recording_id: str,
+    payload: ForcedAlignAndPackRequest,
+) -> ProcessingJobView:
+    try:
+        return repository.enqueue_forced_align_and_pack(recording_id, payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Source recording not found") from exc
     except ValueError as exc:
