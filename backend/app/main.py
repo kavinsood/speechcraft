@@ -16,9 +16,13 @@ from .models import (
     MediaCleanupResult,
     ProjectSummary,
     RecordingDerivativeCreate,
+    ReferenceAssetCreateFromCandidate,
     ReferenceAssetCreateFromSlice,
     ReferenceAssetDetail,
     ReferenceAssetSummary,
+    ReferenceCandidateSummary,
+    ReferenceRunCreate,
+    ReferenceRunView,
     SliceSaveRequest,
     SliceDetail,
     SliceSummary,
@@ -362,6 +366,49 @@ def get_reference_asset(asset_id: str) -> ReferenceAssetDetail:
         raise HTTPException(status_code=409, detail=f"Reference asset integrity error: {exc}") from exc
 
 
+@app.get("/api/projects/{project_id}/reference-runs", response_model=list[ReferenceRunView])
+def list_project_reference_runs(project_id: str) -> list[ReferenceRunView]:
+    try:
+        return repository.list_reference_runs(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/reference-runs", response_model=ReferenceRunView)
+def create_reference_run(project_id: str, payload: ReferenceRunCreate) -> ReferenceRunView:
+    try:
+        run = repository.create_reference_run(project_id, payload)
+        repository.start_reference_run_worker(run.id)
+        return run
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/reference-runs/{run_id}", response_model=ReferenceRunView)
+def get_reference_run(run_id: str) -> ReferenceRunView:
+    try:
+        return repository.get_reference_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Reference run not found") from exc
+
+
+@app.get("/api/reference-runs/{run_id}/candidates", response_model=list[ReferenceCandidateSummary])
+def list_reference_run_candidates(
+    run_id: str,
+    offset: int = 0,
+    limit: int = 50,
+    query: str | None = None,
+) -> list[ReferenceCandidateSummary]:
+    try:
+        return repository.list_reference_run_candidates(run_id, offset=offset, limit=limit, query=query)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Reference run not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/reference-assets/from-slice", response_model=ReferenceAssetDetail)
 def create_reference_asset_from_slice(
     payload: ReferenceAssetCreateFromSlice,
@@ -372,6 +419,31 @@ def create_reference_asset_from_slice(
         raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/reference-assets/from-candidate", response_model=ReferenceAssetDetail)
+def create_reference_asset_from_candidate(
+    payload: ReferenceAssetCreateFromCandidate,
+) -> ReferenceAssetDetail:
+    try:
+        return repository.create_reference_asset_from_candidate(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/media/reference-candidates/{run_id}/{candidate_id}.wav")
+def get_reference_candidate_media(run_id: str, candidate_id: str) -> FileResponse:
+    try:
+        path = repository.get_reference_candidate_media_path(run_id, candidate_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
 
 
 @app.post("/api/source-recordings/{recording_id}/slice-handoff", response_model=list[SliceDetail])

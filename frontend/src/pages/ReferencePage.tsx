@@ -1,17 +1,30 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ApiError,
-  buildReferenceVariantAudioUrl,
+  createReferenceRun,
   fetchProjectReferenceAssets,
+  fetchProjectReferenceRuns,
   fetchProjectSourceRecordings,
   fetchReferenceAsset,
+  fetchReferenceRun,
+  fetchReferenceRunCandidates,
+  promoteReferenceCandidate,
 } from "../api";
 import type {
   Project,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
+  ReferenceCandidate,
+  ReferenceRun,
   SourceRecording,
 } from "../types";
+import ReferenceCandidatePane from "../reference/ReferenceCandidatePane";
+import ReferenceLibraryPane from "../reference/ReferenceLibraryPane";
+import ReferenceRunSidebar from "../reference/ReferenceRunSidebar";
+import {
+  getReferenceErrorMessage,
+  readSelectedAssetIdFromLocation,
+  replaceSelectedAssetInLocation,
+} from "../reference/reference-helpers";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
 
 type ReferencePageProps = {
@@ -23,30 +36,6 @@ type ReferencePageProps = {
 
 type PageStatus = "loading" | "ready" | "error";
 
-function getErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof ApiError) {
-    return error.message;
-  }
-
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-
-  return fallback;
-}
-
-function formatDuration(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    return "0.0s";
-  }
-  return `${seconds.toFixed(seconds >= 10 ? 1 : 2)}s`;
-}
-
-function readSelectedAssetIdFromLocation(): string | null {
-  const assetId = new URLSearchParams(window.location.search).get("asset")?.trim() ?? null;
-  return assetId && assetId.length > 0 ? assetId : null;
-}
-
 export default function ReferencePage({
   activeProject,
   projectLoadStatus,
@@ -56,6 +45,14 @@ export default function ReferencePage({
   const [pageStatus, setPageStatus] = useState<PageStatus>("loading");
   const [pageError, setPageError] = useState<string | null>(null);
   const [sourceRecordings, setSourceRecordings] = useState<SourceRecording[]>([]);
+  const [selectedRecordingIds, setSelectedRecordingIds] = useState<string[]>([]);
+  const [referenceRuns, setReferenceRuns] = useState<ReferenceRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedRun, setSelectedRun] = useState<ReferenceRun | null>(null);
+  const [candidates, setCandidates] = useState<ReferenceCandidate[]>([]);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [isCreatingRun, setIsCreatingRun] = useState(false);
+  const [promotingCandidateId, setPromotingCandidateId] = useState<string | null>(null);
   const [referenceAssets, setReferenceAssets] = useState<ReferenceAssetSummary[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [selectedAsset, setSelectedAsset] = useState<ReferenceAssetDetail | null>(null);
@@ -67,9 +64,15 @@ export default function ReferencePage({
     latestLoadRequestRef.current = requestId;
     setPageStatus("loading");
     setPageError(null);
+    setCandidateError(null);
 
     if (!projectId) {
       setSourceRecordings([]);
+      setSelectedRecordingIds([]);
+      setReferenceRuns([]);
+      setSelectedRunId(null);
+      setSelectedRun(null);
+      setCandidates([]);
       setReferenceAssets([]);
       setSelectedAssetId(null);
       setSelectedAsset(null);
@@ -78,8 +81,9 @@ export default function ReferencePage({
     }
 
     try {
-      const [nextRecordings, nextAssets] = await Promise.all([
+      const [nextRecordings, nextRuns, nextAssets] = await Promise.all([
         fetchProjectSourceRecordings(projectId),
+        fetchProjectReferenceRuns(projectId),
         fetchProjectReferenceAssets(projectId),
       ]);
 
@@ -89,6 +93,20 @@ export default function ReferencePage({
 
       const assetIdFromLocation = readSelectedAssetIdFromLocation();
       setSourceRecordings(nextRecordings);
+      setSelectedRecordingIds((current) => {
+        const filtered = current.filter((recordingId) => nextRecordings.some((recording) => recording.id === recordingId));
+        if (filtered.length > 0) {
+          return filtered;
+        }
+        if (nextRecordings.length === 1) {
+          return [nextRecordings[0].id];
+        }
+        return [];
+      });
+      setReferenceRuns(nextRuns);
+      setSelectedRunId((current) =>
+        current && nextRuns.some((run) => run.id === current) ? current : (nextRuns[0]?.id ?? null),
+      );
       setReferenceAssets(nextAssets);
       setSelectedAssetId((current) =>
         current && nextAssets.some((asset) => asset.id === current)
@@ -104,14 +122,29 @@ export default function ReferencePage({
       }
 
       setSourceRecordings([]);
+      setReferenceRuns([]);
+      setSelectedRunId(null);
+      setSelectedRun(null);
+      setCandidates([]);
       setReferenceAssets([]);
       setSelectedAssetId(null);
       setSelectedAsset(null);
       setPageStatus("error");
       setPageError(
-        getErrorMessage(error, "The reference workstation failed to load. Check the backend and try again."),
+        getReferenceErrorMessage(error, "The reference workstation failed to load. Check the backend and try again."),
       );
     }
+  }
+
+  async function refreshReferenceAssets(projectId: string, preferredAssetId?: string | null) {
+    const nextAssets = await fetchProjectReferenceAssets(projectId);
+    setReferenceAssets(nextAssets);
+    setSelectedAssetId((current) => {
+      if (preferredAssetId && nextAssets.some((asset) => asset.id === preferredAssetId)) {
+        return preferredAssetId;
+      }
+      return current && nextAssets.some((asset) => asset.id === current) ? current : (nextAssets[0]?.id ?? null);
+    });
   }
 
   useEffect(() => {
@@ -135,9 +168,11 @@ export default function ReferencePage({
 
     if (!selectedAssetId) {
       setSelectedAsset(null);
+      replaceSelectedAssetInLocation(null);
       return;
     }
 
+    replaceSelectedAssetInLocation(selectedAssetId);
     void (async () => {
       try {
         const detail = await fetchReferenceAsset(selectedAssetId);
@@ -150,28 +185,142 @@ export default function ReferencePage({
           return;
         }
         setSelectedAsset(null);
-        setPageError(getErrorMessage(error, "The selected reference could not be loaded."));
+        setPageError(getReferenceErrorMessage(error, "The selected reference could not be loaded."));
       }
     })();
   }, [selectedAssetId]);
 
   useEffect(() => {
-    const url = new URL(window.location.href);
-    if (selectedAssetId) {
-      url.searchParams.set("asset", selectedAssetId);
-    } else {
-      url.searchParams.delete("asset");
+    if (!selectedRunId) {
+      setSelectedRun(null);
+      setCandidates([]);
+      setCandidateError(null);
+      return;
     }
-    window.history.replaceState({}, "", url);
-  }, [selectedAssetId]);
 
-  const activeVariant = selectedAsset?.active_variant ?? null;
-  const activeVariantAudioUrl = useMemo(() => {
-    if (!activeVariant) {
-      return null;
+    let cancelled = false;
+    let intervalId: number | null = null;
+
+    async function loadRunOnce(runId: string) {
+      try {
+        const run = await fetchReferenceRun(runId);
+        if (cancelled) {
+          return;
+        }
+        setSelectedRun(run);
+        setReferenceRuns((current) =>
+          current.some((item) => item.id === run.id)
+            ? current.map((item) => (item.id === run.id ? run : item))
+            : [run, ...current],
+        );
+
+        if (run.status === "completed") {
+          const nextCandidates = await fetchReferenceRunCandidates(run.id, { limit: 100 });
+          if (cancelled) {
+            return;
+          }
+          setCandidates(nextCandidates);
+          setCandidateError(null);
+          if (intervalId !== null) {
+            window.clearInterval(intervalId);
+            intervalId = null;
+          }
+        } else {
+          setCandidates([]);
+          if (run.status === "failed") {
+            setCandidateError(run.error_message || "The run failed.");
+            if (intervalId !== null) {
+              window.clearInterval(intervalId);
+              intervalId = null;
+            }
+          }
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setSelectedRun(null);
+        setCandidates([]);
+        setCandidateError(getReferenceErrorMessage(error, "The selected run could not be loaded."));
+        if (intervalId !== null) {
+          window.clearInterval(intervalId);
+          intervalId = null;
+        }
+      }
     }
-    return buildReferenceVariantAudioUrl(activeVariant.id);
-  }, [activeVariant]);
+
+    void loadRunOnce(selectedRunId);
+    intervalId = window.setInterval(() => {
+      void loadRunOnce(selectedRunId);
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
+    };
+  }, [selectedRunId]);
+
+  const promotedCandidatesById = useMemo(() => {
+    const promoted = new Map<string, ReferenceAssetSummary>();
+    for (const asset of referenceAssets) {
+      if (asset.created_from_candidate_id) {
+        promoted.set(asset.created_from_candidate_id, asset);
+      }
+    }
+    return promoted;
+  }, [referenceAssets]);
+
+  async function handleCreateRun() {
+    if (!activeProject?.id || selectedRecordingIds.length === 0) {
+      return;
+    }
+    setIsCreatingRun(true);
+    setCandidateError(null);
+    try {
+      const run = await createReferenceRun(activeProject.id, {
+        recording_ids: selectedRecordingIds,
+        mode: "both",
+        candidate_count_cap: 60,
+      });
+      setReferenceRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      setSelectedRunId(run.id);
+    } catch (error) {
+      setCandidateError(getReferenceErrorMessage(error, "The candidate run could not be started."));
+    } finally {
+      setIsCreatingRun(false);
+    }
+  }
+
+  async function handlePromoteCandidate(candidate: ReferenceCandidate) {
+    if (!activeProject?.id) {
+      return;
+    }
+    setPromotingCandidateId(candidate.candidate_id);
+    setCandidateError(null);
+    try {
+      const asset = await promoteReferenceCandidate({
+        run_id: candidate.run_id,
+        candidate_id: candidate.candidate_id,
+      });
+      await refreshReferenceAssets(activeProject.id, asset.id);
+    } catch (error) {
+      setCandidateError(
+        getReferenceErrorMessage(error, "The candidate could not be promoted to the reference library."),
+      );
+    } finally {
+      setPromotingCandidateId(null);
+    }
+  }
+
+  function toggleRecording(recordingId: string) {
+    setSelectedRecordingIds((current) =>
+      current.includes(recordingId)
+        ? current.filter((item) => item !== recordingId)
+        : [...current, recordingId],
+    );
+  }
 
   return (
     <section className="step-page">
@@ -184,147 +333,37 @@ export default function ReferencePage({
         />
       ) : (
         <div className="stage-layout">
-          <aside className="stage-sidebar panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Project sources</p>
-                <h3>Candidate input</h3>
-              </div>
-            </div>
+          <ReferenceRunSidebar
+            pageStatus={pageStatus}
+            pageError={pageError}
+            sourceRecordings={sourceRecordings}
+            selectedRecordingIds={selectedRecordingIds}
+            referenceRuns={referenceRuns}
+            selectedRunId={selectedRunId}
+            isCreatingRun={isCreatingRun}
+            onRetryLoad={() => void loadPage(activeProject?.id)}
+            onToggleRecording={toggleRecording}
+            onCreateRun={() => void handleCreateRun()}
+            onSelectRun={setSelectedRunId}
+          />
 
-            {pageStatus === "loading" ? <div className="empty-state">Loading source recordings...</div> : null}
-            {pageStatus === "error" ? (
-              <WorkspaceStatePanel
-                title="Sources unavailable"
-                message={pageError ?? "The source recording list could not be loaded."}
-                actionLabel="Retry load"
-                onAction={() => void loadPage(activeProject?.id)}
-              />
-            ) : null}
-            {pageStatus === "ready" && sourceRecordings.length === 0 ? (
-              <div className="empty-state">This project does not have any source recordings yet.</div>
-            ) : null}
-            {pageStatus === "ready" && sourceRecordings.length > 0 ? (
-              <ul className="stage-list">
-                {sourceRecordings.map((recording) => (
-                  <li key={recording.id}>
-                    <strong>{recording.id}</strong>
-                    <span>
-                      {formatDuration(recording.duration_seconds)} • {recording.sample_rate / 1000} kHz
-                      {recording.processing_recipe ? ` • ${recording.processing_recipe}` : " • original"}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </aside>
+          <ReferenceCandidatePane
+            selectedRun={selectedRun}
+            candidates={candidates}
+            candidateError={candidateError}
+            promotingCandidateId={promotingCandidateId}
+            promotedCandidatesById={promotedCandidatesById}
+            onPromoteCandidate={(candidate) => void handlePromoteCandidate(candidate)}
+            onOpenExistingAsset={setSelectedAssetId}
+          />
 
-          <main className="stage-main">
-            <section className="panel stage-placeholder-hero">
-              <p className="eyebrow">Reference workstation</p>
-              <h3>Phase 1 foundation is live.</h3>
-              <p>
-                The real schema, project source list, and shared reference library are wired. Candidate
-                runs, reranking, and trim-first promotion are the next layer on top of this page.
-              </p>
-            </section>
-
-            <section className="panel transcript-panel">
-              <div className="panel-header">
-                <div>
-                  <p className="eyebrow">Selected asset</p>
-                  <h3>{selectedAsset?.name ?? "Reference preview"}</h3>
-                </div>
-              </div>
-
-              {pageStatus === "loading" ? <div className="empty-state">Loading references...</div> : null}
-              {pageStatus === "ready" && !selectedAsset ? (
-                <div className="empty-state">
-                  Save the current slice state as a reference from the label workstation to start filling this library.
-                </div>
-              ) : null}
-              {selectedAsset ? (
-                <div className="commit-list">
-                  <div className="commit-card selected">
-                    <div className="commit-row">
-                      <strong>{selectedAsset.name}</strong>
-                      <span>{selectedAsset.status}</span>
-                    </div>
-                    <p>{selectedAsset.transcript_text || "No transcript stored on this reference yet."}</p>
-                    <span className="commit-time">
-                      {selectedAsset.speaker_name || "speaker n/a"}
-                      {selectedAsset.language ? ` • ${selectedAsset.language}` : ""}
-                      {activeVariant ? ` • ${formatDuration(activeVariant.num_samples / Math.max(activeVariant.sample_rate, 1))}` : ""}
-                    </span>
-                  </div>
-
-                  {activeVariantAudioUrl ? (
-                    <audio controls preload="none" src={activeVariantAudioUrl}>
-                      <track kind="captions" />
-                    </audio>
-                  ) : null}
-
-                  <div className="stats-table">
-                    <div className="stats-row">
-                      <span>Asset id</span>
-                      <span />
-                      <span>{selectedAsset.id}</span>
-                    </div>
-                    <div className="stats-row">
-                      <span>Variants</span>
-                      <span />
-                      <span>{selectedAsset.variants.length}</span>
-                    </div>
-                    <div className="stats-row">
-                      <span>Created</span>
-                      <span />
-                      <span>{new Date(selectedAsset.created_at).toLocaleString()}</span>
-                    </div>
-                  </div>
-                </div>
-              ) : null}
-            </section>
-          </main>
-
-          <aside className="stage-sidebar panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Reference library</p>
-                <h3>Saved assets</h3>
-              </div>
-            </div>
-
-            {pageStatus === "ready" && referenceAssets.length === 0 ? (
-              <div className="empty-state">No saved references yet.</div>
-            ) : null}
-
-            {referenceAssets.length > 0 ? (
-              <div className="commit-list">
-                {referenceAssets.map((asset) => (
-                  <button
-                    key={asset.id}
-                    type="button"
-                    className={`commit-card ${asset.id === selectedAssetId ? "selected" : ""}`}
-                    onClick={() => setSelectedAssetId(asset.id)}
-                  >
-                    <div className="commit-row">
-                      <strong>{asset.name}</strong>
-                      <span>{asset.status}</span>
-                    </div>
-                    <p>{asset.transcript_text || "No transcript preview"}</p>
-                    <span className="commit-time">
-                      {asset.speaker_name || "speaker n/a"}
-                      {asset.active_variant
-                        ? ` • ${formatDuration(
-                            asset.active_variant.num_samples / Math.max(asset.active_variant.sample_rate, 1),
-                          )}`
-                        : ""}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </aside>
+          <ReferenceLibraryPane
+            pageStatus={pageStatus}
+            referenceAssets={referenceAssets}
+            selectedAssetId={selectedAssetId}
+            selectedAsset={selectedAsset}
+            onSelectAsset={setSelectedAssetId}
+          />
         </div>
       )}
     </section>

@@ -3,8 +3,10 @@ import type {
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
+  ReferenceCandidate,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
+  ReferenceRun,
   ReviewStatus,
   Slice,
   SliceSummary,
@@ -66,6 +68,10 @@ export function buildReferenceVariantAudioUrl(variantId: string): string {
   return `${API_BASE}/media/reference-variants/${variantId}.wav`;
 }
 
+export function buildReferenceCandidateAudioUrl(runId: string, candidateId: string): string {
+  return `${API_BASE}/media/reference-candidates/${runId}/${candidateId}.wav`;
+}
+
 export async function fetchHealthStrict(): Promise<{ status: string }> {
   const response = await fetch(`${API_BASE}/healthz`);
   return await parseJson<{ status: string }>(response);
@@ -96,6 +102,57 @@ export async function fetchProjectReferenceAssets(
 ): Promise<ReferenceAssetSummary[]> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-assets`);
   return await parseJson<ReferenceAssetSummary[]>(response);
+}
+
+export async function fetchProjectReferenceRuns(projectId: string): Promise<ReferenceRun[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-runs`);
+  return await parseJson<ReferenceRun[]>(response);
+}
+
+export async function createReferenceRun(
+  projectId: string,
+  payload: {
+    recording_ids: string[];
+    mode?: "zero_shot" | "finetune" | "both";
+    target_durations?: number[] | null;
+    candidate_count_cap?: number;
+  },
+): Promise<ReferenceRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceRun>(response);
+}
+
+export async function fetchReferenceRun(runId: string): Promise<ReferenceRun> {
+  const response = await fetch(`${API_BASE}/api/reference-runs/${runId}`);
+  return await parseJson<ReferenceRun>(response);
+}
+
+export async function fetchReferenceRunCandidates(
+  runId: string,
+  options?: {
+    offset?: number;
+    limit?: number;
+    query?: string;
+  },
+): Promise<ReferenceCandidate[]> {
+  const url = new URL(`${API_BASE}/api/reference-runs/${runId}/candidates`);
+  if (options?.offset !== undefined) {
+    url.searchParams.set("offset", String(options.offset));
+  }
+  if (options?.limit !== undefined) {
+    url.searchParams.set("limit", String(options.limit));
+  }
+  if (options?.query) {
+    url.searchParams.set("query", options.query);
+  }
+  const response = await fetch(url.toString());
+  return await parseJson<ReferenceCandidate[]>(response);
 }
 
 export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAssetDetail> {
@@ -283,6 +340,22 @@ export async function saveCurrentSliceAsReference(payload: {
   mood_label?: string | null;
 }): Promise<ReferenceAssetDetail> {
   const response = await fetch(`${API_BASE}/api/reference-assets/from-slice`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceAssetDetail>(response);
+}
+
+export async function promoteReferenceCandidate(payload: {
+  run_id: string;
+  candidate_id: string;
+  name?: string | null;
+  mood_label?: string | null;
+}): Promise<ReferenceAssetDetail> {
+  const response = await fetch(`${API_BASE}/api/reference-assets/from-candidate`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

@@ -183,3 +183,34 @@ export type ReferenceAssetDetail = ReferenceAssetSummary & {
   model_metadata?: Record<string, unknown> | null;
   variants: ReferenceVariant[];
 };
+
+export type ReferenceRunStatus = "queued" | "running" | "completed" | "failed";
+
+export type ReferenceRun = {
+  id: string;
+  project_id: string;
+  status: ReferenceRunStatus;
+  mode: "zero_shot" | "finetune" | "both" | string;
+  config?: Record<string, unknown> | null;
+  candidate_count: number;
+  error_message?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+};
+
+export type ReferenceCandidate = {
+  candidate_id: string;
+  run_id: string;
+  source_media_kind: ReferenceSourceKind;
+  source_recording_id?: string | null;
+  source_variant_id?: string | null;
+  source_start_seconds: number;
+  source_end_seconds: number;
+  duration_seconds: number;
+  transcript_text?: string | null;
+  speaker_name?: string | null;
+  language?: string | null;
+  risk_flags: string[];
+  default_scores: Record<string, number>;
+};

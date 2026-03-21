@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import audioop
 import hashlib
 import io
 import json
@@ -7,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -33,9 +35,13 @@ from .models import (
     ProjectSummary,
     ReferenceAsset,
     ReferenceAssetCreateFromSlice,
+    ReferenceAssetCreateFromCandidate,
     ReferenceAssetDetail,
     ReferenceAssetStatus,
     ReferenceAssetSummary,
+    ReferenceCandidateSummary,
+    ReferenceRunCreate,
+    ReferenceRunView,
     ReferencePickerRun,
     ReferenceSourceKind,
     ReferenceVariant,
@@ -146,6 +152,160 @@ class SQLiteRepository:
                 .order_by(SourceRecording.parent_recording_id.is_not(None), SourceRecording.id)
             ).all()
             return [self._source_recording_view(recording) for recording in recordings]
+
+    def list_reference_runs(self, project_id: str) -> list[ReferenceRunView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            runs = session.exec(
+                select(ReferencePickerRun)
+                .where(ReferencePickerRun.project_id == project_id)
+                .order_by(ReferencePickerRun.created_at.desc())
+            ).all()
+            return [self._reference_run_view(run) for run in runs]
+
+    def get_reference_run(self, run_id: str) -> ReferenceRunView:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, run_id)
+            if run is None:
+                raise KeyError(run_id)
+            return self._reference_run_view(run)
+
+    def create_reference_run(self, project_id: str, payload: ReferenceRunCreate) -> ReferenceRunView:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            recording_ids = self._normalize_reference_run_recording_ids(payload.recording_ids)
+            if not recording_ids:
+                raise ValueError("Reference runs require at least one source recording")
+            recordings = [self._get_source_recording(session, recording_id) for recording_id in recording_ids]
+            for recording in recordings:
+                if recording.batch_id != project_id:
+                    raise ValueError("Reference run recordings must belong to the selected project")
+
+            run_id = self._new_id("reference-run")
+            artifact_root = self._reference_run_artifact_root(run_id)
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            config = {
+                "recording_ids": recording_ids,
+                "mode": self._normalize_reference_run_mode(payload.mode),
+                "target_durations": self._normalize_reference_target_durations(
+                    payload.target_durations,
+                    payload.mode,
+                ),
+                "candidate_count_cap": max(8, min(int(payload.candidate_count_cap or 60), 200)),
+                "overlap_stride_ratio": 0.5,
+            }
+            run = ReferencePickerRun(
+                id=run_id,
+                project_id=project_id,
+                status=ReferenceRunStatus.QUEUED,
+                mode=config["mode"],
+                config=config,
+                artifact_root=str(artifact_root),
+                candidate_count=0,
+            )
+            session.add(run)
+            session.commit()
+            return self._reference_run_view(run)
+
+    def start_reference_run_worker(self, run_id: str) -> None:
+        worker = threading.Thread(
+            target=self.process_reference_run,
+            args=(run_id,),
+            name=f"reference-run-{run_id}",
+            daemon=True,
+        )
+        worker.start()
+
+    def process_reference_run(self, run_id: str) -> ReferenceRunView:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status == ReferenceRunStatus.COMPLETED:
+                return self._reference_run_view(run)
+            if run.status == ReferenceRunStatus.RUNNING:
+                run.error_message = None
+            else:
+                run.status = ReferenceRunStatus.RUNNING
+                run.started_at = utc_now()
+                run.error_message = None
+            session.add(run)
+            session.commit()
+            project_id = run.project_id
+            config = dict(run.config or {})
+            artifact_root = Path(run.artifact_root)
+
+        try:
+            candidates = self._build_reference_run_candidates(run_id, project_id, config)
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            (artifact_root / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True))
+            self._write_reference_candidates_artifact(artifact_root, candidates)
+            manifest_payload = {
+                "run_id": run_id,
+                "project_id": project_id,
+                "candidate_count": len(candidates),
+                "generated_at": utc_now().isoformat(),
+            }
+            (artifact_root / "manifest.json").write_text(json.dumps(manifest_payload, indent=2, sort_keys=True))
+
+            with self._session() as session:
+                run = session.get(ReferencePickerRun, run_id)
+                if run is None:
+                    raise KeyError(run_id)
+                run.status = ReferenceRunStatus.COMPLETED
+                run.candidate_count = len(candidates)
+                run.completed_at = utc_now()
+                run.error_message = None
+                session.add(run)
+                session.commit()
+                return self._reference_run_view(run)
+        except Exception as exc:
+            with self._session() as session:
+                run = session.get(ReferencePickerRun, run_id)
+                if run is None:
+                    raise
+                run.status = ReferenceRunStatus.FAILED
+                run.error_message = str(exc)
+                run.completed_at = utc_now()
+                session.add(run)
+                session.commit()
+                return self._reference_run_view(run)
+
+    def list_reference_run_candidates(
+        self,
+        run_id: str,
+        offset: int = 0,
+        limit: int = 50,
+        query: str | None = None,
+    ) -> list[ReferenceCandidateSummary]:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status != ReferenceRunStatus.COMPLETED:
+                return []
+        candidates = self._read_reference_run_candidates(Path(run.artifact_root))
+        needle = (query or "").strip().lower()
+        if needle:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if needle in (candidate.transcript_text or "").lower()
+                or needle in (candidate.speaker_name or "").lower()
+                or needle in (candidate.language or "").lower()
+            ]
+        start = max(offset, 0)
+        end = start + max(min(limit, 200), 1)
+        return candidates[start:end]
+
+    def get_reference_candidate_media_path(self, run_id: str, candidate_id: str) -> Path:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, run_id)
+            if run is None:
+                raise KeyError(run_id)
+        artifact_root = Path(run.artifact_root)
+        candidate = self._get_reference_candidate(artifact_root, candidate_id)
+        return self._ensure_reference_candidate_preview(artifact_root, candidate)
 
     def get_project_slices(self, project_id: str) -> list[SliceSummary]:
         with self._session() as session:
@@ -998,6 +1158,88 @@ class SQLiteRepository:
                 model_metadata={
                     "origin": "label-rendered-slice",
                     "source_edit_commit_id": slice_row.active_commit_id,
+                },
+            )
+            self._validate_reference_variant_provenance(session, asset, variant)
+            session.add(asset)
+            session.add(variant)
+            session.flush()
+            asset.active_variant_id = variant.id
+            session.add(asset)
+            self._validate_reference_asset_integrity(session, asset, [variant])
+            session.commit()
+            return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset.id))
+
+    def create_reference_asset_from_candidate(
+        self,
+        payload: ReferenceAssetCreateFromCandidate,
+    ) -> ReferenceAssetDetail:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, payload.run_id)
+            if run is None:
+                raise KeyError(payload.run_id)
+            if run.status != ReferenceRunStatus.COMPLETED:
+                raise ValueError("Reference run must be completed before promotion")
+
+            candidate = self._get_reference_candidate(Path(run.artifact_root), payload.candidate_id)
+            if candidate.source_media_kind != ReferenceSourceKind.SOURCE_RECORDING:
+                raise ValueError("Phase 1 only supports promotion from source-recording candidates")
+            if candidate.source_recording_id is None:
+                raise ValueError("Candidate is missing its source recording")
+
+            source_recording = self._get_source_recording(session, candidate.source_recording_id)
+            if source_recording.batch_id != run.project_id:
+                raise ValueError("Candidate source recording does not belong to the run project")
+
+            rendered_audio_bytes = self._crop_source_recording_audio_bytes(
+                source_recording,
+                candidate.source_start_seconds,
+                candidate.source_end_seconds,
+            )
+            sample_rate, channels, num_samples = self._wav_metadata(rendered_audio_bytes)
+            reference_variant_id = self._new_id("reference-variant")
+            storage_key = self._reference_variant_storage_key(reference_variant_id)
+            managed_path = self._managed_reference_variant_path(reference_variant_id)
+            managed_path.parent.mkdir(parents=True, exist_ok=True)
+            managed_path.write_bytes(rendered_audio_bytes)
+            self._validate_audio_asset(managed_path, sample_rate, channels, num_samples)
+
+            now = utc_now()
+            asset = ReferenceAsset(
+                id=self._new_id("reference"),
+                project_id=run.project_id,
+                name=payload.name or self._default_reference_asset_name_from_candidate(candidate),
+                status=ReferenceAssetStatus.ACTIVE,
+                transcript_text=(candidate.transcript_text or "").strip() or None,
+                speaker_name=(candidate.speaker_name or "").strip() or None,
+                language=(candidate.language or "").strip() or None,
+                mood_label=payload.mood_label,
+                created_from_run_id=run.id,
+                created_from_candidate_id=candidate.candidate_id,
+                model_metadata={
+                    "origin": "reference-picker-candidate",
+                    "source_media_kind": candidate.source_media_kind.value,
+                    "default_scores": candidate.default_scores,
+                    "risk_flags": candidate.risk_flags,
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            variant = ReferenceVariant(
+                id=reference_variant_id,
+                reference_asset_id=asset.id,
+                source_kind=ReferenceSourceKind.SOURCE_RECORDING,
+                source_recording_id=source_recording.id,
+                source_start_seconds=candidate.source_start_seconds,
+                source_end_seconds=candidate.source_end_seconds,
+                file_path=storage_key,
+                is_original=True,
+                generator_model="reference-picker",
+                sample_rate=sample_rate,
+                num_samples=num_samples,
+                model_metadata={
+                    "run_id": run.id,
+                    "candidate_id": candidate.candidate_id,
                 },
             )
             self._validate_reference_variant_provenance(session, asset, variant)
@@ -1972,6 +2214,482 @@ class SQLiteRepository:
             variants=[self._reference_variant_view(variant) for variant in variants if variant is not None],
         )
 
+    def _reference_run_view(self, run: ReferencePickerRun) -> ReferenceRunView:
+        return ReferenceRunView(
+            id=run.id,
+            project_id=run.project_id,
+            status=run.status,
+            mode=run.mode,
+            config=run.config,
+            candidate_count=run.candidate_count,
+            error_message=run.error_message,
+            created_at=self._as_utc(run.created_at),
+            started_at=self._as_utc(run.started_at) if run.started_at is not None else None,
+            completed_at=self._as_utc(run.completed_at) if run.completed_at is not None else None,
+        )
+
+    def _normalize_reference_run_recording_ids(self, recording_ids: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for recording_id in recording_ids:
+            cleaned = recording_id.strip()
+            if cleaned and cleaned not in normalized:
+                normalized.append(cleaned)
+        return normalized
+
+    def _normalize_reference_run_mode(self, raw_mode: str | None) -> str:
+        normalized = (raw_mode or "both").strip().lower()
+        if normalized not in {"zero_shot", "finetune", "both"}:
+            return "both"
+        return normalized
+
+    def _normalize_reference_target_durations(
+        self,
+        raw_durations: list[float] | None,
+        raw_mode: str | None,
+    ) -> list[float]:
+        if raw_durations:
+            normalized = sorted(
+                {
+                    round(float(duration), 2)
+                    for duration in raw_durations
+                    if duration is not None and math.isfinite(float(duration)) and float(duration) >= 1.0
+                }
+            )
+            if normalized:
+                return normalized
+        mode = self._normalize_reference_run_mode(raw_mode)
+        if mode == "zero_shot":
+            return [3.0, 4.5, 6.0]
+        if mode == "finetune":
+            return [2.5, 4.0, 5.0]
+        return [3.0, 4.5, 6.0]
+
+    def _reference_runs_root(self) -> Path:
+        return (self.db_path.parent / "reference-picker" / "runs").resolve()
+
+    def _reference_run_artifact_root(self, run_id: str) -> Path:
+        safe_run_id = self._validate_managed_media_id(run_id)
+        return (self._reference_runs_root() / safe_run_id).resolve()
+
+    def _reference_run_candidates_path(self, artifact_root: Path) -> Path:
+        return artifact_root / "candidates.jsonl"
+
+    def _reference_candidate_preview_path(self, artifact_root: Path, candidate_id: str) -> Path:
+        safe_candidate_id = self._validate_managed_media_id(candidate_id)
+        return artifact_root / "preview-cache" / f"{safe_candidate_id}.wav"
+
+    def _write_reference_candidates_artifact(
+        self,
+        artifact_root: Path,
+        candidates: list[ReferenceCandidateSummary],
+    ) -> None:
+        path = self._reference_run_candidates_path(artifact_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [candidate.model_dump_json() for candidate in candidates]
+        path.write_text("\n".join(lines))
+
+    def _read_reference_run_candidates(self, artifact_root: Path) -> list[ReferenceCandidateSummary]:
+        path = self._reference_run_candidates_path(artifact_root)
+        if not path.exists():
+            return []
+        candidates: list[ReferenceCandidateSummary] = []
+        for raw_line in path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            candidates.append(ReferenceCandidateSummary.model_validate_json(line))
+        return candidates
+
+    def _get_reference_candidate(self, artifact_root: Path, candidate_id: str) -> ReferenceCandidateSummary:
+        for candidate in self._read_reference_run_candidates(artifact_root):
+            if candidate.candidate_id == candidate_id:
+                return candidate
+        raise KeyError(candidate_id)
+
+    def _build_reference_run_candidates(
+        self,
+        run_id: str,
+        project_id: str,
+        config: dict[str, Any],
+    ) -> list[ReferenceCandidateSummary]:
+        recording_ids = self._normalize_reference_run_recording_ids(list(config.get("recording_ids") or []))
+        durations = self._normalize_reference_target_durations(
+            config.get("target_durations"),
+            str(config.get("mode") or "both"),
+        )
+        candidate_count_cap = max(8, min(int(config.get("candidate_count_cap") or 60), 200))
+        stride_ratio = float(config.get("overlap_stride_ratio") or 0.5)
+        stride_ratio = max(0.2, min(stride_ratio, 0.9))
+
+        with self._session() as session:
+            recordings = [self._get_source_recording(session, recording_id) for recording_id in recording_ids]
+            recording_slices: dict[str, list[Slice]] = {}
+            for recording in recordings:
+                if recording.batch_id != project_id:
+                    raise ValueError("Reference run recordings must belong to the selected project")
+                recording_slices[recording.id] = self._get_recording_slices(session, recording.id)
+
+        raw_candidates: list[ReferenceCandidateSummary] = []
+        for recording in recordings:
+            total_duration = recording.duration_s
+            overlapping_slices = recording_slices.get(recording.id, [])
+            speech_regions = self._reference_candidate_regions(recording)
+            for window_seconds in durations:
+                for start_seconds, end_seconds in self._candidate_time_windows(
+                    speech_regions,
+                    window_seconds,
+                    stride_ratio,
+                ):
+                    if end_seconds - start_seconds < 1.0:
+                        continue
+                    transcript_text, speaker_name, language = self._candidate_context_from_slices(
+                        overlapping_slices,
+                        start_seconds,
+                        end_seconds,
+                    )
+                    risk_flags = self._reference_candidate_risk_flags(
+                        total_duration,
+                        start_seconds,
+                        end_seconds,
+                        transcript_text,
+                    )
+                    default_scores = self._reference_candidate_default_scores(
+                        total_duration,
+                        start_seconds,
+                        end_seconds,
+                        transcript_text,
+                        risk_flags,
+                    )
+                    raw_candidates.append(
+                        ReferenceCandidateSummary(
+                            candidate_id=self._reference_candidate_id(
+                                recording.id,
+                                start_seconds,
+                                end_seconds,
+                                f"{window_seconds:.2f}",
+                            ),
+                            run_id=run_id,
+                            source_media_kind=ReferenceSourceKind.SOURCE_RECORDING,
+                            source_recording_id=recording.id,
+                            source_variant_id=None,
+                            source_start_seconds=round(start_seconds, 3),
+                            source_end_seconds=round(end_seconds, 3),
+                            duration_seconds=round(end_seconds - start_seconds, 3),
+                            transcript_text=transcript_text,
+                            speaker_name=speaker_name,
+                            language=language,
+                            risk_flags=risk_flags,
+                            default_scores=default_scores,
+                        )
+                    )
+
+        deduped = self._dedupe_reference_candidates(raw_candidates)
+        ranked = sorted(
+            deduped,
+            key=lambda candidate: (
+                -float(candidate.default_scores.get("both", 0.0)),
+                candidate.source_recording_id or "",
+                candidate.source_start_seconds,
+            ),
+        )[:candidate_count_cap]
+        return ranked
+
+    def _get_recording_slices(self, session: Session, recording_id: str) -> list[Slice]:
+        slices = session.exec(
+            select(Slice)
+            .where(Slice.source_recording_id == recording_id)
+            .options(
+                selectinload(Slice.source_recording),
+                selectinload(Slice.transcript),
+                selectinload(Slice.tags),
+                selectinload(Slice.active_variant),
+                selectinload(Slice.active_commit),
+            )
+        ).all()
+        return [
+            slice_row
+            for slice_row in slices
+            if not self._slice_metadata(slice_row).get("is_superseded", False)
+        ]
+
+    def _reference_candidate_regions(self, recording: SourceRecording) -> list[tuple[float, float]]:
+        source_path = self._get_source_recording_audio_path(recording)
+        audio_bytes = source_path.read_bytes()
+        detected = self._speech_regions_from_audio_bytes(audio_bytes)
+        if detected:
+            return detected
+        duration_seconds = round(recording.duration_s, 3)
+        if duration_seconds <= 0:
+            return []
+        return [(0.0, duration_seconds)]
+
+    def _candidate_time_windows(
+        self,
+        regions: list[tuple[float, float]],
+        window_seconds: float,
+        stride_ratio: float,
+    ) -> list[tuple[float, float]]:
+        window_seconds = max(float(window_seconds), 0.1)
+        windows: list[tuple[float, float]] = []
+        for region_start, region_end in regions:
+            region_duration = max(region_end - region_start, 0.0)
+            if region_duration <= 0:
+                continue
+            if region_duration <= window_seconds:
+                windows.append((round(region_start, 3), round(region_end, 3)))
+                continue
+            stride_seconds = max(window_seconds * stride_ratio, 0.25)
+            start_seconds = region_start
+            max_start = max(region_end - window_seconds, region_start)
+            while start_seconds < max_start:
+                end_seconds = min(start_seconds + window_seconds, region_end)
+                windows.append((round(start_seconds, 3), round(end_seconds, 3)))
+                start_seconds += stride_seconds
+            windows.append((round(max_start, 3), round(region_end, 3)))
+        unique: list[tuple[float, float]] = []
+        seen: set[tuple[float, float]] = set()
+        for window in windows:
+            if window not in seen:
+                seen.add(window)
+                unique.append(window)
+        return unique
+
+    def _speech_regions_from_audio_bytes(self, audio_bytes: bytes) -> list[tuple[float, float]]:
+        channels, sample_width, sample_rate, frame_count, raw = self._read_pcm_wav(audio_bytes)
+        if frame_count <= 0:
+            return []
+
+        bytes_per_frame = max(channels * sample_width, 1)
+        window_frames = max(int(sample_rate * 0.03), 1)
+        hop_frames = max(int(sample_rate * 0.02), 1)
+        rms_windows: list[tuple[float, float, float]] = []
+        for start_frame in range(0, frame_count, hop_frames):
+            end_frame = min(start_frame + window_frames, frame_count)
+            chunk = raw[start_frame * bytes_per_frame : end_frame * bytes_per_frame]
+            if not chunk:
+                continue
+            rms = audioop.rms(chunk, sample_width) / 32767.0
+            rms_windows.append((start_frame / sample_rate, end_frame / sample_rate, rms))
+
+        if not rms_windows:
+            return []
+
+        rms_values = sorted(window[2] for window in rms_windows)
+        peak = rms_values[-1]
+        if peak <= 0.001:
+            return []
+
+        noise_floor = rms_values[min(int(len(rms_values) * 0.2), len(rms_values) - 1)]
+        median = rms_values[len(rms_values) // 2]
+        threshold = max(noise_floor * 2.2, median * 1.35, peak * 0.18, 0.012)
+
+        merged: list[tuple[float, float]] = []
+        current_start: float | None = None
+        current_end: float | None = None
+        max_gap_seconds = 0.18
+        for start_seconds, end_seconds, rms in rms_windows:
+            if rms >= threshold:
+                if current_start is None:
+                    current_start = start_seconds
+                    current_end = end_seconds
+                elif start_seconds - (current_end or start_seconds) <= max_gap_seconds:
+                    current_end = end_seconds
+                else:
+                    merged.append((current_start, current_end or end_seconds))
+                    current_start = start_seconds
+                    current_end = end_seconds
+            elif current_start is not None and current_end is not None and start_seconds - current_end > max_gap_seconds:
+                merged.append((current_start, current_end))
+                current_start = None
+                current_end = None
+        if current_start is not None and current_end is not None:
+            merged.append((current_start, current_end))
+
+        padded: list[tuple[float, float]] = []
+        total_duration = frame_count / sample_rate
+        for start_seconds, end_seconds in merged:
+            padded_start = max(start_seconds - 0.08, 0.0)
+            padded_end = min(end_seconds + 0.12, total_duration)
+            if padded_end - padded_start >= 0.35:
+                padded.append((round(padded_start, 3), round(padded_end, 3)))
+
+        if not padded:
+            return []
+
+        normalized: list[tuple[float, float]] = []
+        for start_seconds, end_seconds in sorted(padded):
+            if not normalized:
+                normalized.append((start_seconds, end_seconds))
+                continue
+            previous_start, previous_end = normalized[-1]
+            if start_seconds <= previous_end + 0.12:
+                normalized[-1] = (previous_start, max(previous_end, end_seconds))
+            else:
+                normalized.append((start_seconds, end_seconds))
+        return normalized
+
+    def _candidate_context_from_slices(
+        self,
+        slices: list[Slice],
+        start_seconds: float,
+        end_seconds: float,
+    ) -> tuple[str | None, str | None, str | None]:
+        overlapping: list[tuple[float, Slice]] = []
+        for slice_row in slices:
+            metadata = self._slice_metadata(slice_row)
+            slice_start = float(metadata.get("original_start_time", 0.0))
+            slice_end = float(metadata.get("original_end_time", slice_start + self._slice_duration(slice_row)))
+            overlap = min(end_seconds, slice_end) - max(start_seconds, slice_start)
+            if overlap > 0:
+                overlapping.append((overlap, slice_row))
+        if not overlapping:
+            return None, None, None
+        overlapping.sort(key=lambda item: (-item[0], item[1].id))
+        transcript_parts: list[str] = []
+        for _overlap, slice_row in overlapping[:2]:
+            text = self._transcript_text(slice_row.transcript).strip()
+            if text and text not in transcript_parts:
+                transcript_parts.append(text)
+        primary = overlapping[0][1]
+        transcript_text = " ".join(transcript_parts).strip() or None
+        return transcript_text, self._speaker_name(primary), self._language(primary)
+
+    def _reference_candidate_risk_flags(
+        self,
+        total_duration: float,
+        start_seconds: float,
+        end_seconds: float,
+        transcript_text: str | None,
+    ) -> list[str]:
+        flags: list[str] = []
+        if start_seconds <= 0.05:
+            flags.append("starts_at_recording_edge")
+        if end_seconds >= max(total_duration - 0.05, 0.0):
+            flags.append("ends_at_recording_edge")
+        if not transcript_text:
+            flags.append("missing_transcript_context")
+        return flags
+
+    def _reference_candidate_default_scores(
+        self,
+        total_duration: float,
+        start_seconds: float,
+        end_seconds: float,
+        transcript_text: str | None,
+        risk_flags: list[str],
+    ) -> dict[str, float]:
+        duration = max(end_seconds - start_seconds, 0.001)
+        center = start_seconds + duration / 2
+        midpoint = total_duration / 2 if total_duration > 0 else center
+        normalized_center_distance = abs(center - midpoint) / max(total_duration / 2, 1.0)
+        transcript_bonus = 0.16 if transcript_text else 0.0
+        edge_penalty = 0.06 * len([flag for flag in risk_flags if "edge" in flag])
+        context_penalty = 0.08 if "missing_transcript_context" in risk_flags else 0.0
+        duration_bias = 0.1 - abs(duration - 4.5) * 0.02
+        base = 0.7 + transcript_bonus + duration_bias - (normalized_center_distance * 0.1) - edge_penalty - context_penalty
+        zero_shot = round(base - 0.02 * duration, 4)
+        finetune = round(base + 0.015 * duration, 4)
+        both = round((zero_shot + finetune) / 2, 4)
+        overall = round(both, 4)
+        return {
+            "overall": overall,
+            "zero_shot": zero_shot,
+            "finetune": finetune,
+            "both": both,
+        }
+
+    def _reference_candidate_id(
+        self,
+        source_media_id: str,
+        start_seconds: float,
+        end_seconds: float,
+        family_label: str,
+    ) -> str:
+        fingerprint = hashlib.sha1(
+            f"{source_media_id}:{start_seconds:.3f}:{end_seconds:.3f}:{family_label}".encode("utf-8")
+        ).hexdigest()[:16]
+        return f"cand-{fingerprint}"
+
+    def _dedupe_reference_candidates(
+        self,
+        candidates: list[ReferenceCandidateSummary],
+    ) -> list[ReferenceCandidateSummary]:
+        kept: list[ReferenceCandidateSummary] = []
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                -(item.default_scores.get("both", 0.0)),
+                item.source_recording_id or "",
+                item.source_start_seconds,
+            ),
+        ):
+            should_skip = False
+            for existing in kept:
+                if candidate.source_recording_id != existing.source_recording_id:
+                    continue
+                if self._time_overlap_ratio(candidate, existing) >= 0.82:
+                    should_skip = True
+                    break
+            if not should_skip:
+                kept.append(candidate)
+        return kept
+
+    def _time_overlap_ratio(
+        self,
+        first: ReferenceCandidateSummary,
+        second: ReferenceCandidateSummary,
+    ) -> float:
+        overlap = min(first.source_end_seconds, second.source_end_seconds) - max(
+            first.source_start_seconds,
+            second.source_start_seconds,
+        )
+        if overlap <= 0:
+            return 0.0
+        first_duration = max(first.duration_seconds, 0.001)
+        second_duration = max(second.duration_seconds, 0.001)
+        return overlap / min(first_duration, second_duration)
+
+    def _ensure_reference_candidate_preview(
+        self,
+        artifact_root: Path,
+        candidate: ReferenceCandidateSummary,
+    ) -> Path:
+        preview_path = self._reference_candidate_preview_path(artifact_root, candidate.candidate_id)
+        if preview_path.exists():
+            return preview_path
+        if candidate.source_media_kind != ReferenceSourceKind.SOURCE_RECORDING or candidate.source_recording_id is None:
+            raise ValueError("Phase 1 preview only supports source-recording candidates")
+        with self._session() as session:
+            recording = self._get_source_recording(session, candidate.source_recording_id)
+        preview_bytes = self._crop_source_recording_audio_bytes(
+            recording,
+            candidate.source_start_seconds,
+            candidate.source_end_seconds,
+        )
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = preview_path.with_name(f"{preview_path.name}.tmp.{uuid4().hex}")
+        try:
+            temp_path.write_bytes(preview_bytes)
+            os.replace(temp_path, preview_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        return preview_path
+
+    def _default_reference_asset_name_from_candidate(
+        self,
+        candidate: ReferenceCandidateSummary,
+    ) -> str:
+        transcript_text = (candidate.transcript_text or "").strip()
+        if transcript_text:
+            words = transcript_text.split()
+            preview = " ".join(words[:6]).strip()
+            if len(words) > 6:
+                preview = f"{preview}..."
+            return preview
+        speaker = (candidate.speaker_name or "reference").strip() or "reference"
+        return f"{speaker} {candidate.source_start_seconds:.2f}-{candidate.source_end_seconds:.2f}s"
+
     def _revision_view(self, commit: EditCommit) -> SliceRevision:
         return SliceRevision(
             id=commit.id,
@@ -2239,6 +2957,38 @@ class SQLiteRepository:
             raise ValueError(
                 f"Audio asset sample-count mismatch: expected {expected_num_samples}, got {frames}"
             )
+
+    def _get_source_recording_audio_path(self, recording: SourceRecording) -> Path:
+        path = Path(recording.file_path).expanduser().resolve(strict=False)
+        self._validate_audio_asset(path, recording.sample_rate, recording.num_channels, recording.num_samples)
+        return path
+
+    def _crop_source_recording_audio_bytes(
+        self,
+        recording: SourceRecording,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> bytes:
+        duration_seconds = recording.duration_s
+        if not math.isfinite(start_seconds) or not math.isfinite(end_seconds):
+            raise ValueError("Candidate bounds must be finite")
+        start_seconds = max(float(start_seconds), 0.0)
+        end_seconds = min(float(end_seconds), duration_seconds)
+        if end_seconds <= start_seconds:
+            raise ValueError("Candidate bounds must have positive duration")
+        source_path = self._get_source_recording_audio_path(recording)
+        return self._apply_edl_to_wav_bytes(
+            source_path.read_bytes(),
+            [
+                {
+                    "op": "crop",
+                    "range": {
+                        "start_seconds": start_seconds,
+                        "end_seconds": end_seconds,
+                    },
+                }
+            ],
+        )
 
     def _render_slice_audio_bytes(self, session: Session, slice_row: Slice) -> bytes:
         active_variant = slice_row.active_variant

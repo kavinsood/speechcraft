@@ -554,6 +554,49 @@ class ReferenceAssetCreateFromSlice(SQLModel):
     mood_label: str | None = None
 
 
+class ReferenceRunCreate(SQLModel):
+    recording_ids: list[str]
+    mode: str = "both"
+    target_durations: list[float] | None = None
+    candidate_count_cap: int = 60
+
+
+class ReferenceRunView(SQLModel):
+    id: str
+    project_id: str
+    status: ReferenceRunStatus
+    mode: str
+    config: dict[str, Any] | None = None
+    candidate_count: int = 0
+    error_message: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class ReferenceCandidateSummary(SQLModel):
+    candidate_id: str
+    run_id: str
+    source_media_kind: ReferenceSourceKind
+    source_recording_id: str | None = None
+    source_variant_id: str | None = None
+    source_start_seconds: float
+    source_end_seconds: float
+    duration_seconds: float
+    transcript_text: str | None = None
+    speaker_name: str | None = None
+    language: str | None = None
+    risk_flags: list[str] = Field(default_factory=list)
+    default_scores: dict[str, float] = Field(default_factory=dict)
+
+
+class ReferenceAssetCreateFromCandidate(SQLModel):
+    run_id: str
+    candidate_id: str
+    name: str | None = None
+    mood_label: str | None = None
+
+
 class WaveformPeaks(SQLModel):
     clip_id: str
     bins: int
