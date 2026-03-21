@@ -66,7 +66,7 @@ The document should not be read as permission to build every future surface imme
 
 ## Current Implementation Status
 
-As of `2026-03-20`, the branch has crossed the foundation threshold but has not yet started the real candidate-run layer.
+As of `2026-03-21`, the branch has crossed the first real picker threshold.
 
 ### Completed
 
@@ -80,44 +80,78 @@ As of `2026-03-20`, the branch has crossed the foundation threshold but has not 
   - fast save for a new slice state
   - `Open Existing` for an already-saved state
   - `Save Another...` with optional `name` / `mood_label`
+- `ReferencePickerRun` create / list / get exists
+- lightweight async-shaped local worker behavior exists for picker runs
+- source-backed candidate generation exists
+- ranked candidate browse exists on the `reference` page
+- candidate preview media is materialized lazily and cached under the run artifact root
+- candidate promotion to `ReferenceAsset` exists using canonical candidate bounds as-is
+- candidate preview cache writes are atomic rather than direct final-path writes
+- the `reference` page now distinguishes temporary run output from durable saved library assets
+- already-promoted candidate affordances exist on the run surface
+- source selection is explicit by default:
+  - the page auto-selects exactly one recording only when the project has one
+  - otherwise the operator must choose input intentionally
 - legacy thin-reference migration exists
 - unresolved legacy migration rows produce a durable report and can be retried on later startup
 - reference-variant storage uses media-root-relative keys rather than absolute paths
 - repository-side integrity validation exists for reference provenance and active-variant membership
 - repository instantiation is lazy instead of import-time eager
+- `ReferencePage` has been split into real run / candidate / library panes rather than remaining one large render surface
 
 ### Partially Complete
 
-- `ReferencePickerRun` schema exists, but the real run APIs, worker loop, and polling contract do not
-- the `reference` route is a real library shell, but not yet a true candidate picker workstation
+- the candidate miner is now energy-scaffolded rather than whole-recording sliding-window only, but it is not yet truly speech-aware
+- picker runs use an async-shaped local thread model, but not a claim-based durable worker contract
+- frontend state is cleaner than before, but the page still coordinates most picker state centrally
 
 ### Not Started
 
-- run creation / listing / status polling
-- candidate generation over source recordings
-- candidate manifests, embeddings, and preview cache
-- ranked candidate list
 - positive / negative rerank loop
 - browser-side candidate auto-trim
-- candidate promotion from picker-run output
 - cluster / mood discovery lens
 - reference-specific processing surface
+- frontend interaction tests for the `reference` page state machine
 
 ### Completedness Estimate
 
 Rough estimate against this document:
 
-- about `45%` of the real Phase 1 ship target is done
-- about `25%` to `30%` of the full multi-phase spec is done
+- about `70%` of the real Phase 1 ship target is done
+- about `40%` of the full multi-phase spec is done
 
-These are deliberately conservative. The hard foundation is in place, but most of the picker-specific behavior is still ahead.
+These are deliberately conservative. The full picker path now exists, but rerank, trim, and richer discovery are still ahead.
+
+### Next Implementation Slice
+
+The next slice to build is Phase 1C, not another broad infrastructure pass.
+
+The next branch milestone should be:
+
+- positive / negative rerank over the existing candidate pool
+- browser-side trim suggestion on candidate preview audio
+- trim-aware candidate promotion using absolute source-relative bounds
+- lightweight frontend interaction coverage for the `reference` page state machine
+
+This intentionally still defers:
+
+- cluster browse as a primary surface
+- reference-specific processing depth
+- truly speech-aware candidate mining beyond the current energy scaffold
+- generalized background-job infrastructure
+
+Why:
+
+- the product now has a real run -> candidate -> preview -> promote path
+- the biggest remaining user-facing gap is intent shaping and trim refinement
+- those features should now land on top of a hardened real picker surface, not a temporary shell
 
 ### Verification Completed So Far
 
 - backend: `./.venv/bin/python -m unittest -v tests.test_repository_media`
 - frontend: `npm run build`
 
-The full repo test matrix has not been run yet.
+The full repo test matrix and frontend interaction tests have not been run yet.
 
 ## Goals
 
@@ -172,6 +206,51 @@ Phase 1 explicitly does not require:
 - elaborate metric families
 - archive / duplicate / restore flows
 - generalized platform-wide job infrastructure
+
+### Phase 1A: Foundation
+
+Phase 1A is already in place on this branch:
+
+- dedicated `reference` route
+- source recording list endpoint and source-selection UI
+- `ReferenceAsset` + `ReferenceVariant`
+- reference library list and detail
+- save current slice state from label into the reference library
+- duplicate-intent handling for label-driven saves
+- legacy migration and provenance/storage hardening
+
+### Phase 1B: Run, Candidate, Preview, Promote
+
+Phase 1B is now implemented on this branch:
+
+- `ReferencePickerRun` create / list / get
+- lightweight async-shaped worker contract
+- candidate generation from one or more `SourceRecording` rows
+- candidate artifact manifest and preview cache
+- ranked candidate browse on `/reference`
+- preview candidate audio
+- promote candidate as-is into `ReferenceAsset`
+
+Important clarification:
+
+- candidate generation is now energy-scaffolded and source-backed
+- it is no longer a whole-recording sliding-window sweep
+- it is not yet a true speech-aware miner in the stronger product sense
+
+Phase 1B still does not include:
+
+- positive / negative rerank
+- browser-side auto-trim
+- cluster browse
+- reference processing expansion
+
+### Phase 1C: Rerank And Trim
+
+Phase 1C then adds:
+
+- positive / negative rerank
+- browser-side trim suggestion
+- trim-aware promotion from candidate
 
 ### Phase 2: Discovery And Library Depth
 
@@ -589,13 +668,19 @@ The scaffolding stage is allowed to use VAD and similar heuristics, but only to 
 Recommended initial pipeline:
 
 1. normalize analysis copy to mono 16 kHz
-2. run speech activity scaffold
+2. run a speech-activity scaffold or a lighter energy-derived proxy that yields candidate regions
 3. merge short gaps
 4. generate multi-scale overlapping candidate windows
 5. compute metrics
 6. compute embeddings
 7. optionally cluster
 8. write manifest
+
+Current branch reality:
+
+- the current implementation uses an energy-derived region scaffold
+- this is a meaningful improvement over sweeping the entire recording
+- it should still be treated as transitional until it rejects non-speech activity more intelligently
 
 ### Candidate Window Durations
 
