@@ -580,6 +580,7 @@ class ReferenceCandidateSummary(SQLModel):
     source_media_kind: ReferenceSourceKind
     source_recording_id: str | None = None
     source_variant_id: str | None = None
+    embedding_index: int | None = None
     source_start_seconds: float
     source_end_seconds: float
     duration_seconds: float
@@ -595,6 +596,27 @@ class ReferenceAssetCreateFromCandidate(SQLModel):
     candidate_id: str
     name: str | None = None
     mood_label: str | None = None
+
+
+class ReferenceRunRerankRequest(SQLModel):
+    positive_candidate_ids: list[str] = Field(default_factory=list)
+    negative_candidate_ids: list[str] = Field(default_factory=list)
+    mode: str | None = None
+
+
+class ReferenceCandidateRerankResult(ReferenceCandidateSummary):
+    mode: str
+    base_score: float
+    intent_score: float
+    rerank_score: float
+
+
+class ReferenceRunRerankResponse(SQLModel):
+    run_id: str
+    mode: str
+    positive_candidate_ids: list[str] = Field(default_factory=list)
+    negative_candidate_ids: list[str] = Field(default_factory=list)
+    candidates: list[ReferenceCandidateRerankResult] = Field(default_factory=list)
 
 
 class WaveformPeaks(SQLModel):

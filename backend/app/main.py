@@ -22,6 +22,8 @@ from .models import (
     ReferenceAssetSummary,
     ReferenceCandidateSummary,
     ReferenceRunCreate,
+    ReferenceRunRerankRequest,
+    ReferenceRunRerankResponse,
     ReferenceRunView,
     SliceSaveRequest,
     SliceDetail,
@@ -405,6 +407,19 @@ def list_reference_run_candidates(
         return repository.list_reference_run_candidates(run_id, offset=offset, limit=limit, query=query)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Reference run not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/reference-runs/{run_id}/rerank", response_model=ReferenceRunRerankResponse)
+def rerank_reference_run_candidates(
+    run_id: str,
+    payload: ReferenceRunRerankRequest,
+) -> ReferenceRunRerankResponse:
+    try:
+        return repository.rerank_reference_run_candidates(run_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

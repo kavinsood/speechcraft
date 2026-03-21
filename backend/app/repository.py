@@ -39,8 +39,11 @@ from .models import (
     ReferenceAssetDetail,
     ReferenceAssetStatus,
     ReferenceAssetSummary,
+    ReferenceCandidateRerankResult,
     ReferenceCandidateSummary,
     ReferenceRunCreate,
+    ReferenceRunRerankRequest,
+    ReferenceRunRerankResponse,
     ReferenceRunView,
     ReferencePickerRun,
     ReferenceSourceKind,
@@ -237,13 +240,19 @@ class SQLiteRepository:
 
         try:
             candidates = self._build_reference_run_candidates(run_id, project_id, config)
+            embeddings = self._build_reference_run_candidate_embeddings(candidates)
             artifact_root.mkdir(parents=True, exist_ok=True)
             (artifact_root / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True))
             self._write_reference_candidates_artifact(artifact_root, candidates)
+            self._write_reference_run_embeddings_artifact(artifact_root, candidates, embeddings)
             manifest_payload = {
                 "run_id": run_id,
                 "project_id": project_id,
                 "candidate_count": len(candidates),
+                "embedding_count": len(embeddings),
+                "embedding_dimension": len(embeddings[0]) if embeddings else 0,
+                "embedding_extractor": "acoustic_signature_v1",
+                "embedding_extractor_version": 1,
                 "generated_at": utc_now().isoformat(),
             }
             (artifact_root / "manifest.json").write_text(json.dumps(manifest_payload, indent=2, sort_keys=True))
@@ -297,6 +306,89 @@ class SQLiteRepository:
         start = max(offset, 0)
         end = start + max(min(limit, 200), 1)
         return candidates[start:end]
+
+    def rerank_reference_run_candidates(
+        self,
+        run_id: str,
+        payload: ReferenceRunRerankRequest,
+    ) -> ReferenceRunRerankResponse:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status != ReferenceRunStatus.COMPLETED:
+                raise ValueError("Reference run must be completed before reranking")
+            artifact_root = Path(run.artifact_root)
+            mode = self._normalize_reference_run_mode(payload.mode or run.mode)
+
+        candidates = self._read_reference_run_candidates(artifact_root)
+        embeddings_by_candidate_id = self._read_reference_run_embeddings_artifact(artifact_root)
+        if not candidates:
+            return ReferenceRunRerankResponse(
+                run_id=run_id,
+                mode=mode,
+                positive_candidate_ids=[],
+                negative_candidate_ids=[],
+                candidates=[],
+            )
+        if len(embeddings_by_candidate_id) < len(candidates):
+            raise ValueError("Reference run is missing candidate embeddings")
+
+        candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        positive_ids = self._normalize_reference_anchor_ids(payload.positive_candidate_ids, candidate_by_id)
+        negative_ids = self._normalize_reference_anchor_ids(payload.negative_candidate_ids, candidate_by_id)
+        if overlap := sorted(set(positive_ids) & set(negative_ids)):
+            raise ValueError(f"Candidate anchors cannot be both positive and negative: {', '.join(overlap)}")
+
+        normalized_vectors: dict[str, list[float]] = {}
+        for candidate in candidates:
+            raw_vector = embeddings_by_candidate_id.get(candidate.candidate_id)
+            if raw_vector is None and candidate.embedding_index is not None:
+                raw_vector = embeddings_by_candidate_id.get(str(candidate.embedding_index))
+            if raw_vector is None:
+                raise ValueError(f"Reference run is missing an embedding for candidate {candidate.candidate_id}")
+            normalized_vectors[candidate.candidate_id] = self._normalize_embedding_vector(raw_vector)
+
+        positive_mean = self._mean_embedding_vector([normalized_vectors[candidate_id] for candidate_id in positive_ids])
+        negative_mean = self._mean_embedding_vector([normalized_vectors[candidate_id] for candidate_id in negative_ids])
+
+        reranked: list[ReferenceCandidateRerankResult] = []
+        for candidate in candidates:
+            vector = normalized_vectors[candidate.candidate_id]
+            intent_score = 0.0
+            if positive_mean is not None:
+                intent_score += self._cosine_similarity(vector, positive_mean)
+            if negative_mean is not None:
+                intent_score -= self._cosine_similarity(vector, negative_mean)
+            base_score = float(
+                candidate.default_scores.get(mode, candidate.default_scores.get("both", candidate.default_scores.get("overall", 0.0)))
+            )
+            rerank_score = base_score + intent_score
+            reranked.append(
+                ReferenceCandidateRerankResult(
+                    **candidate.model_dump(mode="python"),
+                    mode=mode,
+                    base_score=round(base_score, 6),
+                    intent_score=round(intent_score, 6),
+                    rerank_score=round(rerank_score, 6),
+                )
+            )
+
+        reranked.sort(
+            key=lambda candidate: (
+                -candidate.rerank_score,
+                -candidate.base_score,
+                candidate.source_recording_id or "",
+                candidate.source_start_seconds,
+            )
+        )
+        return ReferenceRunRerankResponse(
+            run_id=run_id,
+            mode=mode,
+            positive_candidate_ids=positive_ids,
+            negative_candidate_ids=negative_ids,
+            candidates=reranked,
+        )
 
     def get_reference_candidate_media_path(self, run_id: str, candidate_id: str) -> Path:
         with self._session() as session:
@@ -2274,6 +2366,9 @@ class SQLiteRepository:
     def _reference_run_candidates_path(self, artifact_root: Path) -> Path:
         return artifact_root / "candidates.jsonl"
 
+    def _reference_run_embeddings_path(self, artifact_root: Path) -> Path:
+        return artifact_root / "embeddings.json"
+
     def _reference_candidate_preview_path(self, artifact_root: Path, candidate_id: str) -> Path:
         safe_candidate_id = self._validate_managed_media_id(candidate_id)
         return artifact_root / "preview-cache" / f"{safe_candidate_id}.wav"
@@ -2300,11 +2395,110 @@ class SQLiteRepository:
             candidates.append(ReferenceCandidateSummary.model_validate_json(line))
         return candidates
 
+    def _write_reference_run_embeddings_artifact(
+        self,
+        artifact_root: Path,
+        candidates: list[ReferenceCandidateSummary],
+        embeddings: list[list[float]],
+    ) -> None:
+        path = self._reference_run_embeddings_path(artifact_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dimension = len(embeddings[0]) if embeddings else 0
+        payload = {
+            "extractor": {
+                "name": "acoustic_signature_v1",
+                "version": 1,
+                "domain": "deterministic_acoustic_feature_vector",
+                "normalized": True,
+                "source_format": "normalized_16bit_pcm_wav",
+                "dimension": dimension,
+                "features": [
+                    "global_rms",
+                    "global_mean_abs",
+                    "global_mean_delta",
+                    "global_zero_crossing_rate",
+                    "global_peak",
+                    "segment_rms_and_zero_crossing_rate_x6",
+                ],
+            },
+            "entries": [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "embedding_index": candidate.embedding_index,
+                    "vector": embedding,
+                }
+                for candidate, embedding in zip(candidates, embeddings, strict=True)
+            ],
+        }
+        path.write_text(json.dumps(payload))
+
+    def _read_reference_run_embeddings_artifact(self, artifact_root: Path) -> dict[str, list[float]]:
+        path = self._reference_run_embeddings_path(artifact_root)
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text())
+        raw_entries = payload.get("entries")
+        if raw_entries is None:
+            # Back-compat for earlier local artifacts before the keyed format.
+            raw_vectors = payload.get("vectors") or []
+            return {
+                str(index): [float(value) for value in list(raw_vector or [])]
+                for index, raw_vector in enumerate(raw_vectors)
+                if raw_vector
+            }
+
+        vectors_by_candidate_id: dict[str, list[float]] = {}
+        expected_dimension = int(payload.get("extractor", {}).get("dimension", 0) or 0)
+        for raw_entry in list(raw_entries):
+            candidate_id = str(raw_entry.get("candidate_id") or "").strip()
+            if not candidate_id:
+                raise ValueError("Embedding artifact entry is missing candidate_id")
+            vector = [float(value) for value in list(raw_entry.get("vector") or [])]
+            if not vector:
+                raise ValueError(f"Embedding artifact entry is missing vector data for {candidate_id}")
+            if expected_dimension and len(vector) != expected_dimension:
+                raise ValueError(f"Embedding artifact vector dimension mismatch for {candidate_id}")
+            vectors_by_candidate_id[candidate_id] = vector
+        return vectors_by_candidate_id
+
     def _get_reference_candidate(self, artifact_root: Path, candidate_id: str) -> ReferenceCandidateSummary:
         for candidate in self._read_reference_run_candidates(artifact_root):
             if candidate.candidate_id == candidate_id:
                 return candidate
         raise KeyError(candidate_id)
+
+    def _build_reference_run_candidate_embeddings(
+        self,
+        candidates: list[ReferenceCandidateSummary],
+    ) -> list[list[float]]:
+        if not candidates:
+            return []
+
+        recording_ids = sorted(
+            {
+                candidate.source_recording_id
+                for candidate in candidates
+                if candidate.source_media_kind == ReferenceSourceKind.SOURCE_RECORDING and candidate.source_recording_id
+            }
+        )
+        with self._session() as session:
+            recordings = {
+                recording_id: self._get_source_recording(session, recording_id)
+                for recording_id in recording_ids
+            }
+
+        embeddings: list[list[float]] = []
+        for candidate in candidates:
+            if candidate.source_media_kind != ReferenceSourceKind.SOURCE_RECORDING or candidate.source_recording_id is None:
+                raise ValueError("Phase 1C only supports source-recording candidate embeddings")
+            recording = recordings[candidate.source_recording_id]
+            audio_bytes = self._crop_source_recording_audio_bytes(
+                recording,
+                candidate.source_start_seconds,
+                candidate.source_end_seconds,
+            )
+            embeddings.append(self._reference_candidate_embedding_from_audio_bytes(audio_bytes))
+        return embeddings
 
     def _build_reference_run_candidates(
         self,
@@ -2392,7 +2586,10 @@ class SQLiteRepository:
                 candidate.source_start_seconds,
             ),
         )[:candidate_count_cap]
-        return ranked
+        return [
+            candidate.model_copy(update={"embedding_index": index})
+            for index, candidate in enumerate(ranked)
+        ]
 
     def _get_recording_slices(self, session: Session, recording_id: str) -> list[Slice]:
         slices = session.exec(
@@ -2527,6 +2724,124 @@ class SQLiteRepository:
             else:
                 normalized.append((start_seconds, end_seconds))
         return normalized
+
+    def _reference_candidate_embedding_from_audio_bytes(self, audio_bytes: bytes) -> list[float]:
+        channels, sample_width, sample_rate, frame_count, raw = self._read_pcm_wav(audio_bytes)
+        if frame_count <= 0:
+            return [0.0] * 17
+
+        mono_raw = raw
+        if channels == 2:
+            mono_raw = audioop.tomono(raw, sample_width, 0.5, 0.5)
+        elif channels > 2:
+            frame_values: list[int] = []
+            bytes_per_frame = channels * sample_width
+            for offset in range(0, len(raw), bytes_per_frame):
+                frame_total = 0
+                for channel_index in range(channels):
+                    start = offset + (channel_index * sample_width)
+                    frame_total += int.from_bytes(raw[start : start + sample_width], "little", signed=True)
+                frame_values.append(int(frame_total / channels))
+            mono_raw = b"".join(value.to_bytes(sample_width, "little", signed=True) for value in frame_values)
+
+        sample_count = len(mono_raw) // sample_width
+        if sample_count <= 0:
+            return [0.0] * 17
+
+        samples = [
+            int.from_bytes(mono_raw[index : index + sample_width], "little", signed=True) / 32767.0
+            for index in range(0, len(mono_raw), sample_width)
+        ]
+        stride = max(sample_count // 6000, 1)
+        reduced = samples[::stride]
+        if not reduced:
+            return [0.0] * 17
+
+        abs_sum = sum(abs(sample) for sample in reduced)
+        square_sum = sum(sample * sample for sample in reduced)
+        delta_sum = sum(abs(current - previous) for previous, current in zip(reduced, reduced[1:]))
+        peak = max(abs(sample) for sample in reduced)
+        zero_crossings = sum(
+            1
+            for previous, current in zip(reduced, reduced[1:])
+            if (previous < 0 <= current) or (previous > 0 >= current)
+        )
+        length = len(reduced)
+        rms = math.sqrt(square_sum / max(length, 1))
+        mean_abs = abs_sum / max(length, 1)
+        mean_delta = delta_sum / max(length - 1, 1)
+        zcr = zero_crossings / max(length - 1, 1)
+
+        segment_features: list[float] = []
+        segment_count = 6
+        for segment_index in range(segment_count):
+            start = int(segment_index * length / segment_count)
+            end = int((segment_index + 1) * length / segment_count)
+            segment = reduced[start:end] or reduced[start : start + 1]
+            if not segment:
+                segment_features.extend([0.0, 0.0])
+                continue
+            segment_square_sum = sum(sample * sample for sample in segment)
+            segment_rms = math.sqrt(segment_square_sum / len(segment))
+            segment_zero_crossings = sum(
+                1
+                for previous, current in zip(segment, segment[1:])
+                if (previous < 0 <= current) or (previous > 0 >= current)
+            )
+            segment_zcr = segment_zero_crossings / max(len(segment) - 1, 1)
+            segment_features.extend([segment_rms, segment_zcr])
+
+        vector = [
+            rms,
+            mean_abs,
+            mean_delta,
+            zcr,
+            peak,
+        ] + segment_features
+        return self._normalize_embedding_vector(vector)
+
+    def _normalize_reference_anchor_ids(
+        self,
+        raw_ids: list[str],
+        candidate_by_id: dict[str, ReferenceCandidateSummary],
+    ) -> list[str]:
+        normalized: list[str] = []
+        for candidate_id in raw_ids:
+            cleaned = candidate_id.strip()
+            if not cleaned:
+                continue
+            if cleaned not in candidate_by_id:
+                raise ValueError(f"Candidate anchor does not belong to the run: {cleaned}")
+            if cleaned not in normalized:
+                normalized.append(cleaned)
+        return normalized
+
+    def _normalize_embedding_vector(self, vector: list[float]) -> list[float]:
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm <= 1e-12:
+            return [0.0 for _ in vector]
+        return [float(value / norm) for value in vector]
+
+    def _mean_embedding_vector(self, vectors: list[list[float]]) -> list[float] | None:
+        if not vectors:
+            return None
+        dimension = len(vectors[0])
+        if dimension == 0:
+            return None
+        total = [0.0] * dimension
+        for vector in vectors:
+            if len(vector) != dimension:
+                raise ValueError("Embedding dimensions do not match")
+            for index, value in enumerate(vector):
+                total[index] += value
+        return self._normalize_embedding_vector([value / len(vectors) for value in total])
+
+    def _cosine_similarity(self, first: list[float], second: list[float] | None) -> float:
+        if second is None or not first or not second:
+            return 0.0
+        if len(first) != len(second):
+            raise ValueError("Embedding dimensions do not match")
+        return float(sum(left * right for left, right in zip(first, second)))
 
     def _candidate_context_from_slices(
         self,
