@@ -47,6 +47,14 @@ class ReferenceAssetStatus(str, Enum):
     ARCHIVED = "archived"
 
 
+class ReferenceEmbeddingStatus(str, Enum):
+    MISSING = "missing"
+    PENDING = "pending"
+    READY = "ready"
+    STALE = "stale"
+    FAILED = "failed"
+
+
 class ReferenceSourceKind(str, Enum):
     SOURCE_RECORDING = "source_recording"
     SLICE_VARIANT = "slice_variant"
@@ -536,6 +544,11 @@ class ReferenceAssetSummary(SQLModel):
     source_slice_id: str | None = None
     source_audio_variant_id: str | None = None
     source_edit_commit_id: str | None = None
+    embedding_status: ReferenceEmbeddingStatus = ReferenceEmbeddingStatus.MISSING
+    embedding_space_id: str | None = None
+    embedding_variant_id: str | None = None
+    embedding_updated_at: datetime | None = None
+    embedding_error_message: str | None = None
     created_at: datetime
     updated_at: datetime
     active_variant: ReferenceVariantView | None = None
@@ -568,6 +581,7 @@ class ReferenceRunView(SQLModel):
     mode: str
     config: dict[str, Any] | None = None
     candidate_count: int = 0
+    embedding_space_id: str | None = None
     error_message: str | None = None
     created_at: datetime
     started_at: datetime | None = None
@@ -581,6 +595,7 @@ class ReferenceCandidateSummary(SQLModel):
     source_recording_id: str | None = None
     source_variant_id: str | None = None
     embedding_index: int | None = None
+    embedding_space_id: str | None = None
     source_start_seconds: float
     source_end_seconds: float
     duration_seconds: float
@@ -603,6 +618,8 @@ class ReferenceAssetCreateFromCandidate(SQLModel):
 class ReferenceRunRerankRequest(SQLModel):
     positive_candidate_ids: list[str] = Field(default_factory=list)
     negative_candidate_ids: list[str] = Field(default_factory=list)
+    positive_reference_asset_ids: list[str] = Field(default_factory=list)
+    negative_reference_asset_ids: list[str] = Field(default_factory=list)
     mode: str | None = None
 
 
@@ -616,9 +633,38 @@ class ReferenceCandidateRerankResult(ReferenceCandidateSummary):
 class ReferenceRunRerankResponse(SQLModel):
     run_id: str
     mode: str
+    embedding_space_id: str
     positive_candidate_ids: list[str] = Field(default_factory=list)
     negative_candidate_ids: list[str] = Field(default_factory=list)
+    positive_reference_asset_ids: list[str] = Field(default_factory=list)
+    negative_reference_asset_ids: list[str] = Field(default_factory=list)
     candidates: list[ReferenceCandidateRerankResult] = Field(default_factory=list)
+
+
+class ReferenceEmbeddingEvaluationProbe(SQLModel):
+    anchor_candidate_id: str
+    expected_neighbor_candidate_ids: list[str] = Field(default_factory=list)
+    top_k: int = 5
+
+
+class ReferenceEmbeddingEvaluationRequest(SQLModel):
+    probes: list[ReferenceEmbeddingEvaluationProbe] = Field(default_factory=list)
+
+
+class ReferenceEmbeddingEvaluationProbeResult(SQLModel):
+    anchor_candidate_id: str
+    top_k: int
+    retrieved_neighbor_candidate_ids: list[str] = Field(default_factory=list)
+    matched_neighbor_candidate_ids: list[str] = Field(default_factory=list)
+    recall_at_k: float = 0.0
+
+
+class ReferenceEmbeddingEvaluationResponse(SQLModel):
+    run_id: str
+    embedding_space_id: str
+    probe_count: int = 0
+    average_recall_at_k: float = 0.0
+    probes: list[ReferenceEmbeddingEvaluationProbeResult] = Field(default_factory=list)
 
 
 class WaveformPeaks(SQLModel):

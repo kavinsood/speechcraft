@@ -16,11 +16,14 @@ from app.models import (
     ReferenceAsset,
     ReferenceAssetCreateFromCandidate,
     ReferenceAssetCreateFromSlice,
+    ReferenceEmbeddingEvaluationProbe,
+    ReferenceEmbeddingEvaluationRequest,
     ReferenceCandidateSummary,
     ReferenceRunCreate,
     ReferenceRunRerankRequest,
     ReferencePickerRun,
     ReferenceRunStatus,
+    ReferenceSourceKind,
     ReferenceVariant,
     ReviewStatus,
     SliceEdlUpdate,
@@ -49,10 +52,17 @@ def read_reference_manifest(path: Path) -> dict[str, object]:
     return json.loads(path.read_text())
 
 
-def build_legacy_clip(project_id: str, clip_id: str, source_file_id: str, order_index: int) -> dict[str, object]:
+def build_legacy_clip(
+    project_id: str,
+    clip_id: str,
+    source_file_id: str,
+    order_index: int,
+    *,
+    audio_path: str | None = None,
+) -> dict[str, object]:
     timestamp = "2026-03-18T15:16:30Z"
     return {
-        "audio_path": None,
+        "audio_path": audio_path,
         "channels": 1,
         "clip_edl": [],
         "created_at": timestamp,
@@ -303,6 +313,121 @@ class RepositoryMediaTests(TestCase):
 
         self.assertEqual(len(source_recordings), 2)
         self.assertEqual({recording.batch_id for recording in source_recordings}, {"project-a", "project-b"})
+
+    def test_seed_from_legacy_json_uses_real_audio_for_one_to_one_source_recordings(self) -> None:
+        root = Path(self.temp_dir.name)
+        legacy_path = root / "legacy-seed.json"
+        real_audio_path = root / "legacy-real.wav"
+        frame_count = write_silence_then_tone_wav(real_audio_path, 48000, 0.2, 0.8, 0.5)
+        legacy_payload = {
+            "projects": {
+                "project-a": {
+                    "id": "project-a",
+                    "name": "Project A",
+                    "status": "ready",
+                    "export_status": "idle",
+                    "created_at": "2026-03-18T15:16:30Z",
+                    "updated_at": "2026-03-18T15:16:30Z",
+                }
+            },
+            "clips_by_project": {
+                "project-a": [
+                    build_legacy_clip(
+                        "project-a",
+                        "clip-a",
+                        "source-a",
+                        0,
+                        audio_path=str(real_audio_path),
+                    )
+                ]
+            },
+            "commits_by_clip": {},
+            "history_by_clip": {},
+            "exports_by_project": {"project-a": []},
+        }
+        legacy_path.write_text(json.dumps(legacy_payload))
+
+        migrated_repository = SQLiteRepository(
+            db_path=root / "legacy-project.db",
+            legacy_seed_path=legacy_path,
+            media_root=root / "legacy-media",
+            exports_root=root / "legacy-exports",
+        )
+
+        with Session(migrated_repository.engine, expire_on_commit=False) as session:
+            source_recording = session.exec(select(SourceRecording)).one()
+            variant = session.exec(select(AudioVariant)).one()
+
+        self.assertEqual(
+            Path(source_recording.file_path).read_bytes(),
+            real_audio_path.read_bytes(),
+        )
+        self.assertEqual(
+            Path(source_recording.file_path).read_bytes(),
+            Path(variant.file_path).read_bytes(),
+        )
+        self.assertEqual(source_recording.num_samples, frame_count)
+        self.assertEqual(source_recording.processing_recipe, "legacy_seed_clip_source")
+
+    def test_migrate_legacy_seed_source_recordings_backfills_real_audio(self) -> None:
+        root = Path(self.temp_dir.name)
+        legacy_path = root / "legacy-seed.json"
+        real_audio_path = root / "legacy-real.wav"
+        write_silence_then_tone_wav(real_audio_path, 48000, 0.1, 0.6, 0.4)
+        legacy_payload = {
+            "projects": {
+                "project-a": {
+                    "id": "project-a",
+                    "name": "Project A",
+                    "status": "ready",
+                    "export_status": "idle",
+                    "created_at": "2026-03-18T15:16:30Z",
+                    "updated_at": "2026-03-18T15:16:30Z",
+                }
+            },
+            "clips_by_project": {
+                "project-a": [
+                    build_legacy_clip(
+                        "project-a",
+                        "clip-a",
+                        "source-a",
+                        0,
+                        audio_path=str(real_audio_path),
+                    )
+                ]
+            },
+            "commits_by_clip": {},
+            "history_by_clip": {},
+            "exports_by_project": {"project-a": []},
+        }
+        legacy_path.write_text(json.dumps(legacy_payload))
+
+        migrated_repository = SQLiteRepository(
+            db_path=root / "legacy-project.db",
+            legacy_seed_path=legacy_path,
+            media_root=root / "legacy-media",
+            exports_root=root / "legacy-exports",
+        )
+
+        with Session(migrated_repository.engine, expire_on_commit=False) as session:
+            source_recording = session.exec(select(SourceRecording)).one()
+            source_recording_path = Path(source_recording.file_path)
+            source_recording_path.write_bytes(
+                migrated_repository._render_synthetic_wave_bytes(48000, 1, 1.1, "synthetic-source")
+            )
+            source_recording.processing_recipe = None
+            session.add(source_recording)
+            session.commit()
+
+        self.assertNotEqual(source_recording_path.read_bytes(), real_audio_path.read_bytes())
+
+        migrated_repository._migrate_legacy_seed_source_recording_media()
+
+        with Session(migrated_repository.engine, expire_on_commit=False) as session:
+            repaired_recording = session.exec(select(SourceRecording)).one()
+
+        self.assertEqual(source_recording_path.read_bytes(), real_audio_path.read_bytes())
+        self.assertEqual(repaired_recording.processing_recipe, "legacy_seed_clip_source")
 
     def test_blank_modified_transcript_stays_blank_for_export(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
@@ -728,20 +853,199 @@ class RepositoryMediaTests(TestCase):
 
         self.assertTrue(embeddings_path.exists())
         payload = read_reference_embeddings(embeddings_path)
-        self.assertEqual(payload["extractor"]["name"], "acoustic_signature_v1")
-        self.assertEqual(payload["extractor"]["version"], 1)
+        self.assertEqual(payload["artifact_schema_version"], 2)
+        self.assertEqual(payload["space"]["id"], "acoustic_signature_v1:normalized_16bit_pcm_wav:v1")
+        self.assertEqual(payload["space"]["name"], "acoustic_signature_v1")
+        self.assertEqual(payload["space"]["version"], 1)
         entries = payload["entries"]
         self.assertEqual(len(entries), len(candidates))
-        self.assertEqual(payload["extractor"]["dimension"], len(entries[0]["vector"]))
-        self.assertTrue(all(len(entry["vector"]) == payload["extractor"]["dimension"] for entry in entries))
+        self.assertEqual(payload["space"]["dimension"], len(entries[0]["vector"]))
+        self.assertTrue(all(len(entry["vector"]) == payload["space"]["dimension"] for entry in entries))
         self.assertEqual(
             [entry["candidate_id"] for entry in entries],
             [candidate.candidate_id for candidate in candidates],
+        )
+        self.assertTrue(
+            all(candidate.embedding_space_id == payload["space"]["id"] for candidate in candidates)
         )
 
         manifest = read_reference_manifest(manifest_path)
         self.assertEqual(manifest["embedding_extractor"], "acoustic_signature_v1")
         self.assertEqual(manifest["embedding_extractor_version"], 1)
+        self.assertEqual(manifest["embedding_artifact_schema_version"], 2)
+        self.assertEqual(manifest["embedding_space_id"], payload["space"]["id"])
+
+    def test_promoted_reference_asset_summary_exposes_ready_embedding_state(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidate.candidate_id,
+            )
+        )
+        summary = self.repository.list_reference_assets("phase1-demo")[0]
+
+        self.assertEqual(summary.id, promoted.id)
+        self.assertEqual(summary.embedding_status, "ready")
+        self.assertEqual(summary.embedding_space_id, "acoustic_signature_v1:normalized_16bit_pcm_wav:v1")
+        self.assertEqual(summary.embedding_variant_id, summary.active_variant_id)
+        self.assertIsNotNone(summary.embedding_updated_at)
+        self.assertIsNone(summary.embedding_error_message)
+
+    def test_reference_asset_embedding_becomes_stale_when_active_variant_changes(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidate.candidate_id,
+            )
+        )
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            asset = session.get(ReferenceAsset, promoted.id)
+            self.assertIsNotNone(asset)
+            active_variant = session.get(ReferenceVariant, asset.active_variant_id)
+            self.assertIsNotNone(active_variant)
+            new_variant_id = self.repository._new_id("reference-variant")
+            new_storage_key = self.repository._reference_variant_storage_key(new_variant_id)
+            new_path = self.repository._managed_reference_variant_path(new_variant_id)
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            new_path.write_bytes(self.repository.get_reference_variant_media_path(active_variant.id).read_bytes())
+            new_variant = ReferenceVariant(
+                id=new_variant_id,
+                reference_asset_id=asset.id,
+                source_kind=ReferenceSourceKind.REFERENCE_VARIANT,
+                source_reference_variant_id=active_variant.id,
+                file_path=new_storage_key,
+                is_original=False,
+                generator_model="manual-copy",
+                sample_rate=active_variant.sample_rate,
+                num_samples=active_variant.num_samples,
+            )
+            session.add(new_variant)
+            session.flush()
+            asset.active_variant_id = new_variant.id
+            session.add(asset)
+            session.commit()
+
+        summary = self.repository.get_reference_asset(promoted.id)
+        self.assertEqual(summary.embedding_status, "stale")
+        self.assertNotEqual(summary.embedding_variant_id, summary.active_variant_id)
+
+    def test_reference_run_rerank_accepts_saved_reference_asset_anchors(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        self.repository.process_reference_run(run.id)
+        candidates = self.repository.list_reference_run_candidates(run.id, limit=8)
+        self.assertGreaterEqual(len(candidates), 2)
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidates[0].candidate_id,
+            )
+        )
+
+        reranked = self.repository.rerank_reference_run_candidates(
+            run.id,
+            ReferenceRunRerankRequest(
+                positive_reference_asset_ids=[promoted.id],
+                mode="both",
+            ),
+        )
+
+        self.assertEqual(reranked.embedding_space_id, "acoustic_signature_v1:normalized_16bit_pcm_wav:v1")
+        self.assertEqual(reranked.positive_reference_asset_ids, [promoted.id])
+        self.assertEqual(reranked.candidates[0].candidate_id, candidates[0].candidate_id)
+
+    def test_reference_run_rerank_rejects_reference_anchor_with_incompatible_embedding_space(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        self.repository.process_reference_run(run.id)
+        candidate = self.repository.list_reference_run_candidates(run.id, limit=1)[0]
+        promoted = self.repository.create_reference_asset_from_candidate(
+            ReferenceAssetCreateFromCandidate(
+                run_id=run.id,
+                candidate_id=candidate.candidate_id,
+            )
+        )
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            asset = session.get(ReferenceAsset, promoted.id)
+            self.assertIsNotNone(asset)
+            metadata = dict(asset.model_metadata or {})
+            embedding_cache = dict(metadata.get("embedding_cache") or {})
+            embedding_cache["space_id"] = "incompatible-space-v1"
+            metadata["embedding_cache"] = embedding_cache
+            asset.model_metadata = metadata
+            session.add(asset)
+            session.commit()
+
+        with self.assertRaisesRegex(ValueError, "space is incompatible"):
+            self.repository.rerank_reference_run_candidates(
+                run.id,
+                ReferenceRunRerankRequest(
+                    positive_reference_asset_ids=[promoted.id],
+                    mode="both",
+                ),
+            )
+
+    def test_reference_run_embedding_evaluation_reports_recall_at_k(self) -> None:
+        run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=6),
+        )
+        self.repository.process_reference_run(run.id)
+        candidates = self.repository.list_reference_run_candidates(run.id, limit=3)
+        self.assertGreaterEqual(len(candidates), 3)
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            run_row = session.get(ReferencePickerRun, run.id)
+            self.assertIsNotNone(run_row)
+            embeddings_path = self.repository._reference_run_embeddings_path(Path(run_row.artifact_root))
+        payload = read_reference_embeddings(embeddings_path)
+        payload["space"]["dimension"] = 3
+        for entry in payload["entries"]:
+            entry["vector"] = [0.0, 0.0, 1.0]
+        payload["entries"][0]["vector"] = [1.0, 0.0, 0.0]
+        payload["entries"][1]["vector"] = [0.99, 0.01, 0.0]
+        payload["entries"][2]["vector"] = [0.0, 1.0, 0.0]
+        embeddings_path.write_text(json.dumps(payload))
+
+        evaluation = self.repository.evaluate_reference_run_embeddings(
+            run.id,
+            ReferenceEmbeddingEvaluationRequest(
+                probes=[
+                    ReferenceEmbeddingEvaluationProbe(
+                        anchor_candidate_id=candidates[0].candidate_id,
+                        expected_neighbor_candidate_ids=[candidates[1].candidate_id],
+                        top_k=1,
+                    )
+                ]
+            ),
+        )
+
+        self.assertEqual(evaluation.embedding_space_id, "acoustic_signature_v1:normalized_16bit_pcm_wav:v1")
+        self.assertEqual(evaluation.probe_count, 1)
+        self.assertEqual(evaluation.average_recall_at_k, 1.0)
+        self.assertEqual(
+            evaluation.probes[0].retrieved_neighbor_candidate_ids,
+            [candidates[1].candidate_id],
+        )
 
     def test_reference_run_rerank_returns_separate_intent_scores_without_mutating_baseline_scores(self) -> None:
         run = self.repository.create_reference_run(

@@ -109,20 +109,31 @@ As of `2026-03-21`, the branch has crossed the first real picker threshold.
 - rerank requests are debounced on the frontend so rapid toggle bursts do not spam the backend
 - run artifacts now store a self-described `acoustic_signature_v1` feature set keyed by `candidate_id`
 - frontend interaction tests now cover the current rerank loop in addition to the earlier `reference` page state-machine cases
+- browser-side trim suggestion now exists in the selected-candidate detail pane
+- trim suggestion is advisory rather than auto-applied
+- manual trim input now keeps raw text separate from validated trim state and blocks promotion on invalid input
+- trim-aware promotion now uses explicit absolute source-relative payload fields:
+  - `source_start_seconds`
+  - `source_end_seconds`
+- trim-aware promotion now rejects invalid or out-of-bounds candidate subspans and records `trim_applied` provenance honestly
+- direct frontend trim-helper unit tests now exist in addition to page-level interaction coverage
 
 ### Partially Complete
 
 - the candidate miner is now energy-scaffolded rather than whole-recording sliding-window only, but it is not yet truly speech-aware
 - picker runs use an async-shaped local thread model, but not a claim-based durable worker contract
 - frontend state is cleaner than before, but the page still coordinates most picker state centrally
-- current rerank uses a deterministic acoustic-signature feature vector, not yet a stronger speaker/style embedding
-- Phase 1C is only partially complete:
-  - rerank exists as a modest acoustic-signature substrate
-  - trim refinement and trim-aware promotion are still ahead
+- current rerank uses a deterministic acoustic-signature feature vector
+- Phase 2A is now complete as a checkpoint and governance pass:
+  - the embedding substrate now has a versioned embedding-space contract
+  - active-variant asset-embedding invalidation and mixed-space rejection exist
+  - stable listening-pack export exists for human probe curation
+  - the evaluation harness can score both single-project and mixed-catalog probe sets
+  - the checkpoint outcome selected `acoustic_signature_v1` as the Phase 2B substrate for this milestone
+- saved-reference anchors backed by a stronger alternative embedding family are still deferred beyond this milestone
 
 ### Not Started
 
-- browser-side candidate auto-trim
 - cluster / mood discovery lens
 - reference-specific processing surface
 
@@ -133,34 +144,32 @@ Rough estimate against this document:
 - about `70%` of the real Phase 1 ship target is done
 - about `40%` of the full multi-phase spec is done
 
-These are deliberately conservative. The full picker path now exists, but trim, richer discovery, and stronger modeling are still ahead.
+These are deliberately conservative. The full picker path now exists, the representation checkpoint has now been run honestly, and richer discovery plus reference-specific processing are next.
 
 ### Next Implementation Slice
 
-The next slice to build is the trim half of Phase 1C, not another broad infrastructure pass.
+The next slice is Phase 2B discovery on top of the now-locked `acoustic_signature_v1` substrate.
 
 The next branch milestone should be:
 
-- a selected-candidate work surface in the center pane
-- browser-side trim suggestion on candidate preview audio
-- trim-aware candidate promotion using absolute source-relative bounds
-- frontend interaction coverage for trim behavior
+- backend cluster assignment and cluster artifact generation over `acoustic_signature_v1`
+- cluster summaries and cluster-aware candidate listing in the API
+- a center-pane UI toggle between ranked and clustered discovery
+- cluster-grouped browsing that preserves the existing selected-candidate detail / trim workflow
 
 This intentionally still defers:
 
-- cluster browse as a primary surface
+- any further representation bakeoff for this milestone
 - reference-specific processing depth
 - truly speech-aware candidate mining beyond the current energy scaffold
 - generalized background-job infrastructure
-- saved-reference anchors for rerank until there is a real asset-embedding cache / backfill policy
 
 Why:
 
-- the product now has a real run -> candidate -> preview -> promote path plus first-pass rerank
-- the biggest remaining user-facing gap is trim refinement
-- those features should now land on top of a hardened real picker surface, not a temporary shell
-- the current rerank substrate is intentionally modest (`acoustic_signature_v1`) and should not be mistaken for the final long-term reference-intent representation
-- the first trim suggestion will be a conservative boundary-cleanup heuristic, not a style-purity detector
+- the product now has a real run -> candidate -> rerank -> trim -> promote path
+- the representation checkpoint has now been run against repaired audio and curated mixed-speaker probes
+- `acoustic_signature_v1` is the best-performing tested representation for this milestone's reference-selection task
+- the next product value is letting the operator browse and exploit that space more effectively, not restarting the representation search immediately
 
 ### Verification Completed So Far
 
@@ -169,6 +178,59 @@ Why:
 - frontend: `npm run build`
 
 The full repo test matrix has still not been run yet.
+
+### Phase 2A Outcome
+
+Phase 2A was completed as a real representation checkpoint rather than a UI-first detour.
+
+What was locked and implemented:
+
+- versioned embedding-space identity and compatibility checks
+- active-variant asset-embedding invalidation policy
+- stable listening-pack export for human curation
+- committed probe-set scaffolding
+- repeatable evaluation commands for single-project and mixed-catalog runs
+
+What was learned:
+
+- the earlier synthetic-source legacy import bug was real and had to be corrected at the `SourceRecording` layer before evaluation could be trusted
+- `microsoft/wavlm-base-plus` with the current `mean + std` pooling recipe did not beat the baseline on curated Emma probes
+- on the mixed Emma + Billie `Probe Set v1`, `acoustic_signature_v1` outperformed the tested WavLM path:
+  - `acoustic_signature_v1`: `average_recall_at_k = 0.541667`, `average_negative_intrusion_rate = 0.111111`
+  - `microsoft/wavlm-base-plus`: `average_recall_at_k = 0.125`, `average_negative_intrusion_rate = 0.194445`
+- for this milestone, `acoustic_signature_v1` is therefore the locked discovery substrate
+
+Interpretation guardrails:
+
+- this does not prove `acoustic_signature_v1` is the forever-final representation
+- it does prove that it is the best-performing tested representation for the current curated reference-selection task
+- Phase 2B should proceed on top of this substrate rather than blocking on further embedding exploration
+
+### Locked Evaluation Protocol
+
+Before Phase 2B was allowed, the representation run had to follow a locked protocol.
+
+Locked model candidates for the completed pass:
+
+- `acoustic_signature_v1` as the frozen baseline
+- `microsoft/wavlm-base-plus` as the tested real-model contender
+- `facebook/wav2vec2-base-960h` remains a deferred comparison, not required for Phase 2B after the current checkpoint result
+
+Locked probe families actually used to clear the gate:
+
+- Emma `neutral_narrator`
+- Emma `high_energy_shouting`
+- Billie `calm`
+- Billie `energetic`
+- mixed Emma + Billie candidate-pool evaluation to pressure both delivery and speaker separation
+
+Locked setup budget and stop conditions for this checkpoint were:
+
+- CPU-only evaluation on the current workstation
+- no more CUDA / MX450 setup work for the checkpoint question
+- stop if the model path required renewed GPU bootstrap
+- stop if a model path could not be downloaded and smoke-run cleanly in one attempt
+- do not claim the gate is passed until the probe set is curated by listening and evaluated on repaired real audio
 
 ## Goals
 
@@ -285,15 +347,58 @@ Phase 1C intentionally defers:
 - clustering as a requirement for rerank
 - stronger semantic/style embedding families beyond the current acoustic-signature substrate
 
-### Phase 2: Discovery And Library Depth
+### Phase 2A: Representation Checkpoint
 
-Phase 2 includes:
+Phase 2A upgrades the representation layer before any discovery UI is treated as approved:
 
-- cluster / mood discovery lens
+- versioned candidate embedding artifacts with top-level artifact schema version
+- explicit embedding-space identity, not just extractor version
+- active-variant-bound `ReferenceAsset` embedding cache
+- asset embedding readiness states:
+  - `missing`
+  - `pending`
+  - `ready`
+  - `stale`
+  - `failed`
+- active variant invalidation policy:
+  - the authoritative asset anchor embedding is derived from the active variant only
+  - if `active_variant_id` changes, the old anchor embedding becomes stale until refreshed
+- mixed candidate + saved-reference anchors only when both sides prove they belong to the same embedding space
+- an evaluation gate before cluster / discovery UI continues
+
+Phase 2A must not proceed to discovery browse unless the checkpoint is actually passed.
+
+The checkpoint is not “tests are green.” It must show:
+
+- neighborhood quality is clearly better on representative examples
+- positive / negative rerank behaves better for preferred voice-mode steering
+- mixed candidate / saved-reference anchoring feels coherent
+- latency, storage, and backfill costs remain acceptable
+
+### Phase 2B: Discovery And Library Depth
+
+Phase 2B then includes:
+
+- cluster / mood discovery lens over the locked `acoustic_signature_v1` space
 - richer library browsing and filtering
 - better asset detail views
 - reference-specific processing surface
 - variant compare / switch improvements
+
+Phase 2B should be implemented in this order:
+
+1. backend cluster artifact generation during `process_reference_run`
+2. cluster summary / cluster-aware candidate APIs
+3. frontend ranked-vs-cluster discovery toggle in the center pane
+4. cluster-grouped candidate browse that still preserves selected-candidate rerank / trim / promote behavior
+5. follow-up library filtering and asset-detail improvements only after the cluster browse is stable
+
+Phase 2B is intentionally a discovery lens, not a change to promotion truth:
+
+- clustering must not rewrite `default_scores`
+- clustering must not become a requirement for rerank
+- cluster labels are browsing aids, not authoritative semantic truth
+- the existing selected-candidate detail pane remains the place where trim and promotion happen
 
 ### Phase 3: Deeper Modeling
 

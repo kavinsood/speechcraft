@@ -37,6 +37,10 @@ from .models import (
     ReferenceAssetCreateFromSlice,
     ReferenceAssetCreateFromCandidate,
     ReferenceAssetDetail,
+    ReferenceEmbeddingEvaluationRequest,
+    ReferenceEmbeddingEvaluationProbeResult,
+    ReferenceEmbeddingEvaluationResponse,
+    ReferenceEmbeddingStatus,
     ReferenceAssetStatus,
     ReferenceAssetSummary,
     ReferenceCandidateRerankResult,
@@ -81,7 +85,11 @@ DATA_VERSION_EXTERNAL_VARIANT_REHOME = 1
 DATA_VERSION_SLICE_REVISION_HISTORY = 2
 DATA_VERSION_REFERENCE_PICKER_SCHEMA = 3
 DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS = 4
-LATEST_DATA_VERSION = DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS
+DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL = 5
+LATEST_DATA_VERSION = DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL
+REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION = 2
+REFERENCE_ASSET_EMBEDDING_ARTIFACT_SCHEMA_VERSION = 1
+LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE = "legacy_seed_clip_source"
 
 
 class SliceSaveValidationError(ValueError):
@@ -241,18 +249,28 @@ class SQLiteRepository:
         try:
             candidates = self._build_reference_run_candidates(run_id, project_id, config)
             embeddings = self._build_reference_run_candidate_embeddings(candidates)
+            embedding_dimension = len(embeddings[0]) if embeddings else 17
+            embedding_space = self._current_reference_embedding_space_descriptor(embedding_dimension)
+            candidates = [
+                candidate.model_copy(update={"embedding_space_id": embedding_space["id"]})
+                for candidate in candidates
+            ]
             artifact_root.mkdir(parents=True, exist_ok=True)
+            config["embedding_space_id"] = embedding_space["id"]
+            config["embedding_provider"] = embedding_space["name"]
             (artifact_root / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True))
             self._write_reference_candidates_artifact(artifact_root, candidates)
-            self._write_reference_run_embeddings_artifact(artifact_root, candidates, embeddings)
+            self._write_reference_run_embeddings_artifact(artifact_root, candidates, embeddings, embedding_space)
             manifest_payload = {
                 "run_id": run_id,
                 "project_id": project_id,
                 "candidate_count": len(candidates),
                 "embedding_count": len(embeddings),
-                "embedding_dimension": len(embeddings[0]) if embeddings else 0,
-                "embedding_extractor": "acoustic_signature_v1",
-                "embedding_extractor_version": 1,
+                "embedding_dimension": embedding_dimension,
+                "embedding_artifact_schema_version": REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION,
+                "embedding_space_id": embedding_space["id"],
+                "embedding_extractor": embedding_space["name"],
+                "embedding_extractor_version": embedding_space["version"],
                 "generated_at": utc_now().isoformat(),
             }
             (artifact_root / "manifest.json").write_text(json.dumps(manifest_payload, indent=2, sort_keys=True))
@@ -262,6 +280,7 @@ class SQLiteRepository:
                 if run is None:
                     raise KeyError(run_id)
                 run.status = ReferenceRunStatus.COMPLETED
+                run.config = config
                 run.candidate_count = len(candidates)
                 run.completed_at = utc_now()
                 run.error_message = None
@@ -320,15 +339,19 @@ class SQLiteRepository:
                 raise ValueError("Reference run must be completed before reranking")
             artifact_root = Path(run.artifact_root)
             mode = self._normalize_reference_run_mode(payload.mode or run.mode)
-
-        candidates = self._read_reference_run_candidates(artifact_root)
-        embeddings_by_candidate_id = self._read_reference_run_embeddings_artifact(artifact_root)
+            candidates = self._read_reference_run_candidates(artifact_root)
+            loaded_artifact = self._load_reference_run_embeddings_artifact(artifact_root)
+            embedding_space_id = loaded_artifact["space_id"]
+            embeddings_by_candidate_id = loaded_artifact["vectors_by_candidate_id"]
         if not candidates:
             return ReferenceRunRerankResponse(
                 run_id=run_id,
                 mode=mode,
+                embedding_space_id=embedding_space_id,
                 positive_candidate_ids=[],
                 negative_candidate_ids=[],
+                positive_reference_asset_ids=[],
+                negative_reference_asset_ids=[],
                 candidates=[],
             )
         if len(embeddings_by_candidate_id) < len(candidates):
@@ -337,20 +360,35 @@ class SQLiteRepository:
         candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
         positive_ids = self._normalize_reference_anchor_ids(payload.positive_candidate_ids, candidate_by_id)
         negative_ids = self._normalize_reference_anchor_ids(payload.negative_candidate_ids, candidate_by_id)
+        positive_asset_ids = self._normalize_reference_asset_anchor_ids(payload.positive_reference_asset_ids)
+        negative_asset_ids = self._normalize_reference_asset_anchor_ids(payload.negative_reference_asset_ids)
         if overlap := sorted(set(positive_ids) & set(negative_ids)):
             raise ValueError(f"Candidate anchors cannot be both positive and negative: {', '.join(overlap)}")
+        if overlap := sorted(set(positive_asset_ids) & set(negative_asset_ids)):
+            raise ValueError(f"Reference anchors cannot be both positive and negative: {', '.join(overlap)}")
 
         normalized_vectors: dict[str, list[float]] = {}
         for candidate in candidates:
             raw_vector = embeddings_by_candidate_id.get(candidate.candidate_id)
-            if raw_vector is None and candidate.embedding_index is not None:
-                raw_vector = embeddings_by_candidate_id.get(str(candidate.embedding_index))
             if raw_vector is None:
                 raise ValueError(f"Reference run is missing an embedding for candidate {candidate.candidate_id}")
             normalized_vectors[candidate.candidate_id] = self._normalize_embedding_vector(raw_vector)
 
-        positive_mean = self._mean_embedding_vector([normalized_vectors[candidate_id] for candidate_id in positive_ids])
-        negative_mean = self._mean_embedding_vector([normalized_vectors[candidate_id] for candidate_id in negative_ids])
+            asset_vectors = self._load_reference_asset_anchor_vectors(
+                session,
+                run.project_id,
+                embedding_space_id,
+                positive_asset_ids + negative_asset_ids,
+            )
+
+        positive_mean = self._mean_embedding_vector(
+            [normalized_vectors[candidate_id] for candidate_id in positive_ids]
+            + [asset_vectors[asset_id] for asset_id in positive_asset_ids]
+        )
+        negative_mean = self._mean_embedding_vector(
+            [normalized_vectors[candidate_id] for candidate_id in negative_ids]
+            + [asset_vectors[asset_id] for asset_id in negative_asset_ids]
+        )
 
         reranked: list[ReferenceCandidateRerankResult] = []
         for candidate in candidates:
@@ -385,9 +423,78 @@ class SQLiteRepository:
         return ReferenceRunRerankResponse(
             run_id=run_id,
             mode=mode,
+            embedding_space_id=embedding_space_id,
             positive_candidate_ids=positive_ids,
             negative_candidate_ids=negative_ids,
+            positive_reference_asset_ids=positive_asset_ids,
+            negative_reference_asset_ids=negative_asset_ids,
             candidates=reranked,
+        )
+
+    def evaluate_reference_run_embeddings(
+        self,
+        run_id: str,
+        payload: ReferenceEmbeddingEvaluationRequest,
+    ) -> ReferenceEmbeddingEvaluationResponse:
+        with self._session() as session:
+            run = session.get(ReferencePickerRun, run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status != ReferenceRunStatus.COMPLETED:
+                raise ValueError("Reference run must be completed before evaluation")
+            artifact_root = Path(run.artifact_root)
+            candidates = self._read_reference_run_candidates(artifact_root)
+            loaded_artifact = self._load_reference_run_embeddings_artifact(artifact_root)
+
+        candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        normalized_vectors = {
+            candidate_id: self._normalize_embedding_vector(vector)
+            for candidate_id, vector in loaded_artifact["vectors_by_candidate_id"].items()
+        }
+        results: list[ReferenceEmbeddingEvaluationProbeResult] = []
+        for probe in payload.probes:
+            if probe.anchor_candidate_id not in candidate_by_id:
+                raise ValueError(f"Evaluation anchor does not belong to the run: {probe.anchor_candidate_id}")
+            top_k = max(1, min(int(probe.top_k or 5), 25))
+            anchor_vector = normalized_vectors.get(probe.anchor_candidate_id)
+            if anchor_vector is None:
+                raise ValueError(f"Reference run is missing an embedding for candidate {probe.anchor_candidate_id}")
+            ranked_neighbors = sorted(
+                (
+                    (
+                        other_candidate_id,
+                        self._cosine_similarity(anchor_vector, other_vector),
+                    )
+                    for other_candidate_id, other_vector in normalized_vectors.items()
+                    if other_candidate_id != probe.anchor_candidate_id
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+            retrieved = [candidate_id for candidate_id, _score in ranked_neighbors[:top_k]]
+            expected = [
+                candidate_id
+                for candidate_id in probe.expected_neighbor_candidate_ids
+                if candidate_id in candidate_by_id and candidate_id != probe.anchor_candidate_id
+            ]
+            matched = [candidate_id for candidate_id in retrieved if candidate_id in expected]
+            recall = len(matched) / len(expected) if expected else 0.0
+            results.append(
+                ReferenceEmbeddingEvaluationProbeResult(
+                    anchor_candidate_id=probe.anchor_candidate_id,
+                    top_k=top_k,
+                    retrieved_neighbor_candidate_ids=retrieved,
+                    matched_neighbor_candidate_ids=matched,
+                    recall_at_k=round(recall, 6),
+                )
+            )
+
+        average_recall = sum(result.recall_at_k for result in results) / len(results) if results else 0.0
+        return ReferenceEmbeddingEvaluationResponse(
+            run_id=run_id,
+            embedding_space_id=loaded_artifact["space_id"],
+            probe_count=len(results),
+            average_recall_at_k=round(average_recall, 6),
+            probes=results,
         )
 
     def get_reference_candidate_media_path(self, run_id: str, candidate_id: str) -> Path:
@@ -1258,6 +1365,7 @@ class SQLiteRepository:
             session.flush()
             asset.active_variant_id = variant.id
             session.add(asset)
+            self._cache_reference_asset_embedding(session, asset, variant, audio_bytes=rendered_audio_bytes)
             self._validate_reference_asset_integrity(session, asset, [variant])
             session.commit()
             return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset.id))
@@ -1355,6 +1463,7 @@ class SQLiteRepository:
             session.flush()
             asset.active_variant_id = variant.id
             session.add(asset)
+            self._cache_reference_asset_embedding(session, asset, variant, audio_bytes=rendered_audio_bytes)
             self._validate_reference_asset_integrity(session, asset, [variant])
             session.commit()
             return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset.id))
@@ -1383,6 +1492,10 @@ class SQLiteRepository:
         if version < DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS:
             self._migrate_reference_variant_storage_keys()
             self._set_data_version(DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS)
+            version = DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS
+        if version < DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL:
+            self._migrate_legacy_seed_source_recording_media()
+            self._set_data_version(DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL)
 
     def _get_data_version(self) -> int:
         with self.engine.begin() as connection:
@@ -1649,6 +1762,7 @@ class SQLiteRepository:
         projects = legacy.get("projects", {})
         clips_by_project = legacy.get("clips_by_project", {})
         exports_by_project = legacy.get("exports_by_project", {})
+        source_audio_overrides = self._legacy_seed_source_audio_overrides(clips_by_project)
 
         for project_id, batch_payload in projects.items():
             batch = ImportBatch(
@@ -1672,22 +1786,35 @@ class SQLiteRepository:
                 recording_id = f"source-{batch.id}-{clip_payload['source_file_id']}"
                 source_path = self._managed_media_path("sources", recording_id)
                 source_path.parent.mkdir(parents=True, exist_ok=True)
-                if not source_path.exists():
-                    source_path.write_bytes(
-                        self._render_synthetic_wave_bytes(
-                            clip_payload["sample_rate"],
-                            clip_payload["channels"],
-                            max(source_duration + 1.0, 1.0),
-                            recording_id,
-                        )
+                source_override = source_audio_overrides.get(source_key)
+                if source_override is not None:
+                    sample_rate, channels, num_samples = self._materialize_legacy_seed_source_recording_audio(
+                        source_path,
+                        source_override,
                     )
+                    processing_recipe = LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE
+                else:
+                    if not source_path.exists():
+                        source_path.write_bytes(
+                            self._render_synthetic_wave_bytes(
+                                clip_payload["sample_rate"],
+                                clip_payload["channels"],
+                                max(source_duration + 1.0, 1.0),
+                                recording_id,
+                            )
+                        )
+                    sample_rate = clip_payload["sample_rate"]
+                    channels = clip_payload["channels"]
+                    num_samples = max(int((source_duration + 1.0) * clip_payload["sample_rate"]), 1)
+                    processing_recipe = None
                 source_recording = SourceRecording(
                     id=recording_id,
                     batch_id=batch.id,
                     file_path=str(source_path),
-                    sample_rate=clip_payload["sample_rate"],
-                    num_channels=clip_payload["channels"],
-                    num_samples=max(int((source_duration + 1.0) * clip_payload["sample_rate"]), 1),
+                    sample_rate=sample_rate,
+                    num_channels=channels,
+                    num_samples=num_samples,
+                    processing_recipe=processing_recipe,
                 )
                 session.add(source_recording)
                 source_recordings[source_key] = source_recording
@@ -2284,6 +2411,7 @@ class SQLiteRepository:
             (variant for variant in variants if variant.id == asset.active_variant_id),
             None,
         )
+        embedding_state = self._effective_reference_asset_embedding_state(asset)
         return ReferenceAssetSummary(
             id=asset.id,
             project_id=asset.project_id,
@@ -2299,6 +2427,11 @@ class SQLiteRepository:
             source_slice_id=self._reference_asset_metadata(asset).get("source_slice_id"),
             source_audio_variant_id=self._reference_asset_metadata(asset).get("source_audio_variant_id"),
             source_edit_commit_id=self._reference_asset_metadata(asset).get("source_edit_commit_id"),
+            embedding_status=ReferenceEmbeddingStatus(embedding_state["status"]),
+            embedding_space_id=embedding_state.get("space_id"),
+            embedding_variant_id=embedding_state.get("variant_id"),
+            embedding_updated_at=self._coerce_optional_datetime(embedding_state.get("updated_at")),
+            embedding_error_message=embedding_state.get("error_message"),
             created_at=self._as_utc(asset.created_at),
             updated_at=self._as_utc(asset.updated_at),
             active_variant=self._reference_variant_view(active_variant),
@@ -2329,6 +2462,7 @@ class SQLiteRepository:
             mode=run.mode,
             config=run.config,
             candidate_count=run.candidate_count,
+            embedding_space_id=(run.config or {}).get("embedding_space_id"),
             error_message=run.error_message,
             created_at=self._as_utc(run.created_at),
             started_at=self._as_utc(run.started_at) if run.started_at is not None else None,
@@ -2384,6 +2518,13 @@ class SQLiteRepository:
     def _reference_run_embeddings_path(self, artifact_root: Path) -> Path:
         return artifact_root / "embeddings.json"
 
+    def _reference_asset_embeddings_root(self) -> Path:
+        return (self.db_path.parent / "reference-picker" / "asset-embeddings").resolve()
+
+    def _reference_asset_embedding_path(self, asset_id: str) -> Path:
+        safe_asset_id = self._validate_managed_media_id(asset_id)
+        return self._reference_asset_embeddings_root() / f"{safe_asset_id}.json"
+
     def _reference_candidate_preview_path(self, artifact_root: Path, candidate_id: str) -> Path:
         safe_candidate_id = self._validate_managed_media_id(candidate_id)
         return artifact_root / "preview-cache" / f"{safe_candidate_id}.wav"
@@ -2415,66 +2556,74 @@ class SQLiteRepository:
         artifact_root: Path,
         candidates: list[ReferenceCandidateSummary],
         embeddings: list[list[float]],
+        embedding_space: dict[str, Any],
     ) -> None:
         path = self._reference_run_embeddings_path(artifact_root)
         path.parent.mkdir(parents=True, exist_ok=True)
         dimension = len(embeddings[0]) if embeddings else 0
         payload = {
-            "extractor": {
-                "name": "acoustic_signature_v1",
-                "version": 1,
-                "domain": "deterministic_acoustic_feature_vector",
-                "normalized": True,
-                "source_format": "normalized_16bit_pcm_wav",
+            "artifact_schema_version": REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION,
+            "space": {
+                **embedding_space,
                 "dimension": dimension,
-                "features": [
-                    "global_rms",
-                    "global_mean_abs",
-                    "global_mean_delta",
-                    "global_zero_crossing_rate",
-                    "global_peak",
-                    "segment_rms_and_zero_crossing_rate_x6",
-                ],
             },
             "entries": [
                 {
                     "candidate_id": candidate.candidate_id,
-                    "embedding_index": candidate.embedding_index,
                     "vector": embedding,
                 }
                 for candidate, embedding in zip(candidates, embeddings, strict=True)
             ],
         }
-        path.write_text(json.dumps(payload))
+        self._write_json_atomic(path, payload)
 
-    def _read_reference_run_embeddings_artifact(self, artifact_root: Path) -> dict[str, list[float]]:
+    def _load_reference_run_embeddings_artifact(self, artifact_root: Path) -> dict[str, Any]:
         path = self._reference_run_embeddings_path(artifact_root)
         if not path.exists():
-            return {}
+            return {
+                "schema_version": REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION,
+                "space_id": self._current_reference_embedding_space_id(),
+                "vectors_by_candidate_id": {},
+            }
         payload = json.loads(path.read_text())
+        schema_version = int(payload.get("artifact_schema_version") or 0)
         raw_entries = payload.get("entries")
         if raw_entries is None:
             # Back-compat for earlier local artifacts before the keyed format.
             raw_vectors = payload.get("vectors") or []
             return {
-                str(index): [float(value) for value in list(raw_vector or [])]
-                for index, raw_vector in enumerate(raw_vectors)
-                if raw_vector
+                "schema_version": 1,
+                "space_id": "legacy:indexed-acoustic-signature-v1",
+                "vectors_by_candidate_id": {
+                    str(index): [float(value) for value in list(raw_vector or [])]
+                    for index, raw_vector in enumerate(raw_vectors)
+                    if raw_vector
+                },
             }
 
         vectors_by_candidate_id: dict[str, list[float]] = {}
-        expected_dimension = int(payload.get("extractor", {}).get("dimension", 0) or 0)
+        space = dict(payload.get("space") or {})
+        space_id = str(space.get("id") or "").strip()
+        if not space_id:
+            raise ValueError("Embedding artifact is missing space identity")
+        expected_dimension = int(space.get("dimension", 0) or 0)
         for raw_entry in list(raw_entries):
             candidate_id = str(raw_entry.get("candidate_id") or "").strip()
             if not candidate_id:
                 raise ValueError("Embedding artifact entry is missing candidate_id")
+            if candidate_id in vectors_by_candidate_id:
+                raise ValueError(f"Embedding artifact contains duplicate candidate_id {candidate_id}")
             vector = [float(value) for value in list(raw_entry.get("vector") or [])]
             if not vector:
                 raise ValueError(f"Embedding artifact entry is missing vector data for {candidate_id}")
             if expected_dimension and len(vector) != expected_dimension:
                 raise ValueError(f"Embedding artifact vector dimension mismatch for {candidate_id}")
             vectors_by_candidate_id[candidate_id] = vector
-        return vectors_by_candidate_id
+        return {
+            "schema_version": schema_version or REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION,
+            "space_id": space_id,
+            "vectors_by_candidate_id": vectors_by_candidate_id,
+        }
 
     def _get_reference_candidate(self, artifact_root: Path, candidate_id: str) -> ReferenceCandidateSummary:
         for candidate in self._read_reference_run_candidates(artifact_root):
@@ -2512,7 +2661,7 @@ class SQLiteRepository:
                 candidate.source_start_seconds,
                 candidate.source_end_seconds,
             )
-            embeddings.append(self._reference_candidate_embedding_from_audio_bytes(audio_bytes))
+            embeddings.append(self._embed_audio_bytes_for_reference_space(audio_bytes))
         return embeddings
 
     def _build_reference_run_candidates(
@@ -2831,11 +2980,237 @@ class SQLiteRepository:
                 normalized.append(cleaned)
         return normalized
 
+    def _normalize_reference_asset_anchor_ids(self, raw_ids: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for asset_id in raw_ids:
+            cleaned = asset_id.strip()
+            if cleaned and cleaned not in normalized:
+                normalized.append(cleaned)
+        return normalized
+
     def _normalize_embedding_vector(self, vector: list[float]) -> list[float]:
         norm = math.sqrt(sum(value * value for value in vector))
         if norm <= 1e-12:
             return [0.0 for _ in vector]
         return [float(value / norm) for value in vector]
+
+    def _current_reference_embedding_space_id(self) -> str:
+        return "acoustic_signature_v1:normalized_16bit_pcm_wav:v1"
+
+    def _current_reference_embedding_space_descriptor(self, dimension: int) -> dict[str, Any]:
+        return {
+            "id": self._current_reference_embedding_space_id(),
+            "name": "acoustic_signature_v1",
+            "family": "acoustic_signature",
+            "version": 1,
+            "domain": "deterministic_acoustic_feature_vector",
+            "normalized": True,
+            "source_format": "normalized_16bit_pcm_wav",
+            "preprocessing": {
+                "channel_render_policy": "mono_average",
+                "downsample_policy": "sample_stride_cap_6000",
+                "windowing_policy": "global_plus_six_segments",
+            },
+            "features": [
+                "global_rms",
+                "global_mean_abs",
+                "global_mean_delta",
+                "global_zero_crossing_rate",
+                "global_peak",
+                "segment_rms_and_zero_crossing_rate_x6",
+            ],
+            "dimension": dimension,
+        }
+
+    def _embed_audio_bytes_for_reference_space(self, audio_bytes: bytes) -> list[float]:
+        return self._reference_candidate_embedding_from_audio_bytes(audio_bytes)
+
+    def _reference_asset_embedding_metadata(self, asset: ReferenceAsset) -> dict[str, Any]:
+        metadata = self._reference_asset_metadata(asset)
+        return dict(metadata.get("embedding_cache") or {})
+
+    def _effective_reference_asset_embedding_state(self, asset: ReferenceAsset) -> dict[str, Any]:
+        metadata = self._reference_asset_embedding_metadata(asset)
+        status = str(metadata.get("status") or ReferenceEmbeddingStatus.MISSING.value)
+        variant_id = metadata.get("variant_id")
+        if (
+            asset.active_variant_id
+            and variant_id
+            and asset.active_variant_id != variant_id
+            and status == ReferenceEmbeddingStatus.READY.value
+        ):
+            status = ReferenceEmbeddingStatus.STALE.value
+        return {
+            "status": status,
+            "space_id": metadata.get("space_id"),
+            "variant_id": variant_id,
+            "updated_at": metadata.get("updated_at"),
+            "error_message": metadata.get("error_message"),
+        }
+
+    def _set_reference_asset_embedding_state(
+        self,
+        asset: ReferenceAsset,
+        *,
+        status: ReferenceEmbeddingStatus,
+        variant_id: str | None,
+        space_id: str | None,
+        updated_at: datetime,
+        error_message: str | None = None,
+    ) -> None:
+        metadata = self._reference_asset_metadata(asset)
+        metadata["embedding_cache"] = {
+            "status": status.value,
+            "variant_id": variant_id,
+            "space_id": space_id,
+            "updated_at": updated_at.isoformat(),
+            "error_message": error_message,
+            "artifact_schema_version": REFERENCE_ASSET_EMBEDDING_ARTIFACT_SCHEMA_VERSION,
+        }
+        asset.model_metadata = metadata
+        asset.updated_at = updated_at
+
+    def _load_reference_asset_anchor_vectors(
+        self,
+        session: Session,
+        project_id: str,
+        expected_space_id: str,
+        asset_ids: list[str],
+    ) -> dict[str, list[float]]:
+        if not asset_ids:
+            return {}
+
+        requires_commit = False
+        vectors_by_asset_id: dict[str, list[float]] = {}
+        for asset_id in asset_ids:
+            asset = self._get_reference_asset_row(session, asset_id)
+            if asset.project_id != project_id:
+                raise ValueError(f"Reference anchor does not belong to the run project: {asset_id}")
+            active_variant = self._get_active_reference_variant(session, asset)
+            state = self._effective_reference_asset_embedding_state(asset)
+            if state["status"] in {
+                ReferenceEmbeddingStatus.MISSING.value,
+                ReferenceEmbeddingStatus.STALE.value,
+                ReferenceEmbeddingStatus.FAILED.value,
+            }:
+                if expected_space_id != self._current_reference_embedding_space_id():
+                    raise ValueError(
+                        f"Reference anchor embedding space is incompatible with the run: {asset_id}"
+                    )
+                self._cache_reference_asset_embedding(session, asset, active_variant)
+                requires_commit = True
+                state = self._effective_reference_asset_embedding_state(asset)
+            if state["status"] != ReferenceEmbeddingStatus.READY.value:
+                raise ValueError(f"Reference anchor embedding is not ready: {asset_id}")
+            if state["space_id"] != expected_space_id:
+                raise ValueError(f"Reference anchor embedding space is incompatible with the run: {asset_id}")
+            artifact = self._read_reference_asset_embedding_artifact(asset.id)
+            if artifact["space_id"] != expected_space_id:
+                raise ValueError(f"Reference anchor embedding space is incompatible with the run: {asset_id}")
+            vectors_by_asset_id[asset_id] = self._normalize_embedding_vector(artifact["vector"])
+        if requires_commit:
+            session.commit()
+        return vectors_by_asset_id
+
+    def _get_active_reference_variant(self, session: Session, asset: ReferenceAsset) -> ReferenceVariant:
+        if asset.active_variant_id is None:
+            raise ValueError(f"Reference asset {asset.id} has no active variant")
+        active_variant = session.get(ReferenceVariant, asset.active_variant_id)
+        if active_variant is None or active_variant.reference_asset_id != asset.id:
+            raise ValueError(f"Reference asset {asset.id} active variant is invalid")
+        return active_variant
+
+    def _cache_reference_asset_embedding(
+        self,
+        session: Session,
+        asset: ReferenceAsset,
+        active_variant: ReferenceVariant,
+        audio_bytes: bytes | None = None,
+    ) -> None:
+        timestamp = utc_now()
+        self._set_reference_asset_embedding_state(
+            asset,
+            status=ReferenceEmbeddingStatus.PENDING,
+            variant_id=active_variant.id,
+            space_id=self._current_reference_embedding_space_id(),
+            updated_at=timestamp,
+        )
+        session.add(asset)
+        try:
+            if audio_bytes is None:
+                audio_bytes = self._resolve_reference_variant_media_path(active_variant.file_path).read_bytes()
+            vector = self._embed_audio_bytes_for_reference_space(audio_bytes)
+            self._write_reference_asset_embedding_artifact(asset.id, active_variant.id, vector)
+            self._set_reference_asset_embedding_state(
+                asset,
+                status=ReferenceEmbeddingStatus.READY,
+                variant_id=active_variant.id,
+                space_id=self._current_reference_embedding_space_id(),
+                updated_at=timestamp,
+            )
+        except Exception as exc:
+            self._set_reference_asset_embedding_state(
+                asset,
+                status=ReferenceEmbeddingStatus.FAILED,
+                variant_id=active_variant.id,
+                space_id=self._current_reference_embedding_space_id(),
+                updated_at=timestamp,
+                error_message=str(exc),
+            )
+        session.add(asset)
+
+    def _write_reference_asset_embedding_artifact(
+        self,
+        asset_id: str,
+        variant_id: str,
+        vector: list[float],
+    ) -> None:
+        path = self._reference_asset_embedding_path(asset_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "artifact_schema_version": REFERENCE_ASSET_EMBEDDING_ARTIFACT_SCHEMA_VERSION,
+            "space": self._current_reference_embedding_space_descriptor(len(vector)),
+            "asset_id": asset_id,
+            "variant_id": variant_id,
+            "vector": vector,
+        }
+        self._write_json_atomic(path, payload)
+
+    def _read_reference_asset_embedding_artifact(self, asset_id: str) -> dict[str, Any]:
+        path = self._reference_asset_embedding_path(asset_id)
+        if not path.exists():
+            raise ValueError(f"Reference asset embedding artifact is missing for {asset_id}")
+        payload = json.loads(path.read_text())
+        vector = [float(value) for value in list(payload.get("vector") or [])]
+        if not vector:
+            raise ValueError(f"Reference asset embedding artifact is missing vector data for {asset_id}")
+        space = dict(payload.get("space") or {})
+        space_id = str(space.get("id") or "").strip()
+        if not space_id:
+            raise ValueError(f"Reference asset embedding artifact is missing space identity for {asset_id}")
+        dimension = int(space.get("dimension", 0) or 0)
+        if dimension and len(vector) != dimension:
+            raise ValueError(f"Reference asset embedding vector dimension mismatch for {asset_id}")
+        return {
+            "space_id": space_id,
+            "variant_id": str(payload.get("variant_id") or "").strip() or None,
+            "vector": vector,
+        }
+
+    def _write_json_atomic(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f"{path.name}.tmp.{uuid4().hex}")
+        try:
+            temp_path.write_text(json.dumps(payload))
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+    def _coerce_optional_datetime(self, raw_value: Any) -> datetime | None:
+        if raw_value in {None, ""}:
+            return None
+        return self._as_utc(self._coerce_datetime(raw_value))
 
     def _mean_embedding_vector(self, vectors: list[list[float]]) -> list[float] | None:
         if not vectors:
@@ -3561,6 +3936,43 @@ class SQLiteRepository:
                 self._validate_audio_asset(raw_path, variant.sample_rate, expected_channels, variant.num_samples)
             return raw_path
 
+    def _legacy_seed_source_audio_overrides(
+        self,
+        clips_by_project: dict[str, list[dict[str, Any]]],
+    ) -> dict[tuple[str, str], Path]:
+        overrides: dict[tuple[str, str], Path] = {}
+        for project_id, clips in clips_by_project.items():
+            counts: dict[str, int] = {}
+            for clip in clips:
+                source_file_id = str(clip.get("source_file_id") or "")
+                if not source_file_id:
+                    continue
+                counts[source_file_id] = counts.get(source_file_id, 0) + 1
+            for clip in clips:
+                source_file_id = str(clip.get("source_file_id") or "")
+                if not source_file_id or counts.get(source_file_id) != 1:
+                    continue
+                raw_audio_path = clip.get("audio_path")
+                if not raw_audio_path:
+                    continue
+                raw_path = Path(str(raw_audio_path)).expanduser().resolve(strict=False)
+                if raw_path.exists():
+                    overrides[(project_id, source_file_id)] = raw_path
+        return overrides
+
+    def _materialize_legacy_seed_source_recording_audio(
+        self,
+        target_path: Path,
+        source_audio_path: Path,
+    ) -> tuple[int, int, int]:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_source_path = source_audio_path.expanduser().resolve(strict=False)
+        if not resolved_source_path.exists():
+            raise FileNotFoundError(resolved_source_path)
+        shutil.copyfile(resolved_source_path, target_path)
+        channels, _sample_width, sample_rate, num_samples = self._read_pcm_wav_header(target_path)
+        return sample_rate, channels, num_samples
+
     def _migrate_external_variant_media(self) -> None:
         with self._session() as session:
             variants = session.exec(
@@ -3588,6 +4000,60 @@ class SQLiteRepository:
                 if variant.file_path != str(managed_path):
                     variant.file_path = str(managed_path)
                     session.add(variant)
+                    updated = True
+            if updated:
+                session.commit()
+
+    def _migrate_legacy_seed_source_recording_media(self) -> None:
+        if not self.legacy_seed_path.exists():
+            return
+        legacy = json.loads(self.legacy_seed_path.read_text())
+        source_audio_overrides = self._legacy_seed_source_audio_overrides(legacy.get("clips_by_project", {}))
+        with self._session() as session:
+            recordings = session.exec(
+                select(SourceRecording).options(
+                    selectinload(SourceRecording.slices).selectinload(Slice.variants),
+                    selectinload(SourceRecording.slices).selectinload(Slice.active_variant),
+                )
+            ).all()
+            updated = False
+            for recording in recordings:
+                if len(recording.slices) != 1:
+                    continue
+                slice_row = recording.slices[0]
+                metadata = slice_row.model_metadata or {}
+                source_file_id = str(metadata.get("source_file_id") or "").strip()
+                if not source_file_id:
+                    continue
+                source_audio_path = source_audio_overrides.get((recording.batch_id, source_file_id))
+                if source_audio_path is None:
+                    original_variant = next((variant for variant in slice_row.variants if variant.is_original), None)
+                    fallback_variant = original_variant or slice_row.active_variant
+                    if fallback_variant is None:
+                        continue
+                    expected_channels = recording.num_channels if recording.num_channels > 0 else None
+                    try:
+                        source_audio_path = self._get_variant_audio_path(fallback_variant, expected_channels)
+                    except (FileNotFoundError, ValueError):
+                        continue
+                target_path = self._managed_media_path("sources", recording.id)
+                sample_rate, channels, num_samples = self._materialize_legacy_seed_source_recording_audio(
+                    target_path,
+                    source_audio_path,
+                )
+                if (
+                    recording.file_path != str(target_path)
+                    or recording.sample_rate != sample_rate
+                    or recording.num_channels != channels
+                    or recording.num_samples != num_samples
+                    or recording.processing_recipe != LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE
+                ):
+                    recording.file_path = str(target_path)
+                    recording.sample_rate = sample_rate
+                    recording.num_channels = channels
+                    recording.num_samples = num_samples
+                    recording.processing_recipe = LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE
+                    session.add(recording)
                     updated = True
             if updated:
                 session.commit()

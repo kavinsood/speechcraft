@@ -20,6 +20,8 @@ from .models import (
     ReferenceAssetCreateFromSlice,
     ReferenceAssetDetail,
     ReferenceAssetSummary,
+    ReferenceEmbeddingEvaluationRequest,
+    ReferenceEmbeddingEvaluationResponse,
     ReferenceCandidateSummary,
     ReferenceRunCreate,
     ReferenceRunRerankRequest,
@@ -418,6 +420,19 @@ def rerank_reference_run_candidates(
 ) -> ReferenceRunRerankResponse:
     try:
         return repository.rerank_reference_run_candidates(run_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/reference-runs/{run_id}/embedding-evaluation", response_model=ReferenceEmbeddingEvaluationResponse)
+def evaluate_reference_run_embeddings(
+    run_id: str,
+    payload: ReferenceEmbeddingEvaluationRequest,
+) -> ReferenceEmbeddingEvaluationResponse:
+    try:
+        return repository.evaluate_reference_run_embeddings(run_id, payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Missing entity: {exc}") from exc
     except ValueError as exc:
