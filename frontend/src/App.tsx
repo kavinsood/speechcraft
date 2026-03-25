@@ -4,7 +4,7 @@ import { ApiError, fetchProjects } from "./api";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
 import StepPlaceholderPage from "./pages/StepPlaceholderPage";
-import type { Project } from "./types";
+import type { ClipLabItemKind, ClipLabItemRef, Project } from "./types";
 
 type AppStep = "ingest" | "enhance" | "segment" | "label" | "train" | "deploy";
 type ProjectLoadStatus = "loading" | "ready" | "error";
@@ -12,6 +12,7 @@ type ProjectLoadStatus = "loading" | "ready" | "error";
 type AppRoute = {
   step: AppStep;
   projectId: string | null;
+  clipItem: ClipLabItemRef | null;
 };
 
 type StepDefinition = {
@@ -57,11 +58,19 @@ function readRouteFromLocation(): AppRoute {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
   const maybeStep = path.length > 0 ? path : "ingest";
   const step = isAppStep(maybeStep) ? maybeStep : "ingest";
-  const projectId = new URLSearchParams(window.location.search).get("project")?.trim() ?? null;
+  const searchParams = new URLSearchParams(window.location.search);
+  const projectId = searchParams.get("project")?.trim() ?? null;
+  const clipKindRaw = searchParams.get("clip_kind")?.trim() ?? null;
+  const clipId = searchParams.get("clip_id")?.trim() ?? null;
+  const clipItem =
+    (clipKindRaw === "slice" || clipKindRaw === "review_window") && clipId
+      ? ({ kind: clipKindRaw as ClipLabItemKind, id: clipId } satisfies ClipLabItemRef)
+      : null;
 
   return {
     step,
     projectId: projectId && projectId.length > 0 ? projectId : null,
+    clipItem,
   };
 }
 
@@ -72,6 +81,13 @@ function writeRouteToLocation(route: AppRoute, replace = false) {
     url.searchParams.set("project", route.projectId);
   } else {
     url.searchParams.delete("project");
+  }
+  if (route.clipItem) {
+    url.searchParams.set("clip_kind", route.clipItem.kind);
+    url.searchParams.set("clip_id", route.clipItem.id);
+  } else {
+    url.searchParams.delete("clip_kind");
+    url.searchParams.delete("clip_id");
   }
 
   if (replace) {
@@ -208,7 +224,7 @@ export default function App() {
   }, [route.step]);
 
   function navigate(nextStep: AppStep, nextProjectId = route.projectId) {
-    const nextRoute = { step: nextStep, projectId: nextProjectId ?? null };
+    const nextRoute = { step: nextStep, projectId: nextProjectId ?? null, clipItem: route.clipItem };
     setRoute(nextRoute);
     writeRouteToLocation(nextRoute);
   }
@@ -217,6 +233,7 @@ export default function App() {
     const nextRoute = {
       step: route.step,
       projectId: nextProjectId,
+      clipItem: route.clipItem,
     };
     setRoute(nextRoute);
     writeRouteToLocation(nextRoute);
@@ -234,7 +251,18 @@ export default function App() {
   if (route.step === "ingest") {
     pageContent = <IngestPage {...pageProps} />;
   } else if (route.step === "label") {
-    pageContent = <LabelPage {...pageProps} onHeaderActionsChange={setPageHeaderActions} />;
+    pageContent = (
+      <LabelPage
+        {...pageProps}
+        activeClipItem={route.clipItem}
+        onActiveClipItemChange={(clipItem) => {
+          const nextRoute = { ...route, clipItem };
+          setRoute(nextRoute);
+          writeRouteToLocation(nextRoute, true);
+        }}
+        onHeaderActionsChange={setPageHeaderActions}
+      />
+    );
   } else {
     const configByStep: Record<Exclude<AppStep, "ingest" | "label">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
       enhance: {

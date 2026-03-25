@@ -90,6 +90,105 @@ export type Slice = SliceSummary & {
   active_commit?: EditCommit | null;
 };
 
+export type ClipLabItemKind = "slice" | "review_window";
+
+export type ClipLabItemRef = {
+  kind: ClipLabItemKind;
+  id: string;
+};
+
+export type ClipLabTranscript = {
+  id: string;
+  original_text: string;
+  modified_text?: string | null;
+  is_modified: boolean;
+  alignment_data?: Record<string, unknown> | null;
+};
+
+export type ClipLabVariant = {
+  id: string;
+  is_original: boolean;
+  generator_model?: string | null;
+  sample_rate: number;
+  num_samples: number;
+};
+
+export type ClipLabCommit = {
+  id: string;
+  parent_commit_id?: string | null;
+  edl_operations: {
+    op: string;
+    range?: ClipRange | null;
+    duration_seconds?: number | null;
+  }[];
+  transcript_text: string;
+  status: ReviewStatus;
+  tags: Tag[];
+  active_variant_id?: string | null;
+  message?: string | null;
+  is_milestone: boolean;
+  created_at: string;
+};
+
+export type ClipLabCapabilities = {
+  can_edit_transcript: boolean;
+  can_edit_tags: boolean;
+  can_set_status: boolean;
+  can_save: boolean;
+  can_split: boolean;
+  can_merge: boolean;
+  can_edit_waveform: boolean;
+  can_run_processing: boolean;
+  can_switch_variants: boolean;
+  can_export: boolean;
+  can_finalize: boolean;
+};
+
+export type ClipLabItem = {
+  id: string;
+  kind: ClipLabItemKind;
+  source_recording_id: string;
+  source_recording: SourceRecording;
+  start_seconds: number;
+  end_seconds: number;
+  duration_seconds: number;
+  status?: ReviewStatus | null;
+  created_at: string;
+  transcript?: ClipLabTranscript | null;
+  tags: Tag[];
+  speaker_name?: string | null;
+  language?: string | null;
+  audio_url: string;
+  item_metadata?: Record<string, unknown> | null;
+  transcript_source?: string | null;
+  can_run_asr: boolean;
+  asr_placeholder_message?: string | null;
+  active_variant_generator_model?: string | null;
+  can_undo: boolean;
+  can_redo: boolean;
+  capabilities: ClipLabCapabilities;
+  variants: ClipLabVariant[];
+  commits: ClipLabCommit[];
+  active_variant?: ClipLabVariant | null;
+  active_commit?: ClipLabCommit | null;
+};
+
+export type ReviewWindowSummary = {
+  id: string;
+  source_recording_id: string;
+  start_seconds: number;
+  end_seconds: number;
+  rough_transcript: string;
+  reviewed_transcript: string;
+  review_status: ReviewStatus;
+  tags: Tag[];
+  order_index: number;
+  window_metadata?: Record<string, unknown> | null;
+  can_undo: boolean;
+  can_redo: boolean;
+  created_at: string;
+};
+
 export type ImportBatch = {
   id: string;
   name: string;

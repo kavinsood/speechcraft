@@ -10,6 +10,9 @@ from .models import (
     ActiveVariantUpdate,
     AudioVariantCreate,
     AudioVariantRunRequest,
+    ClipLabItemView,
+    DatasetProcessingRunRequest,
+    DatasetProcessingRunView,
     ExportPreview,
     ExportRun,
     ForcedAlignAndPackRequest,
@@ -20,6 +23,7 @@ from .models import (
     RecordingDerivativeCreate,
     ReferenceAsset,
     ReferenceAssetCreate,
+    ReviewWindowAsrRequest,
     ReviewWindowView,
     SliceSaveRequest,
     SliceDetail,
@@ -104,12 +108,31 @@ def list_project_slices(project_id: str) -> list[SliceSummary]:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
+@app.get("/api/projects/{project_id}/review-windows", response_model=list[ReviewWindowView])
+def list_project_review_windows(project_id: str) -> list[ReviewWindowView]:
+    try:
+        return repository.list_project_review_windows(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
 @app.get("/api/slices/{slice_id}", response_model=SliceDetail)
 def get_slice_detail(slice_id: str) -> SliceDetail:
     try:
         return repository.get_slice_detail(slice_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.get("/api/clip-lab-items/{item_kind}/{item_id}", response_model=ClipLabItemView)
+def get_clip_lab_item(item_kind: str, item_id: str) -> ClipLabItemView:
+    try:
+        return repository.get_clip_lab_item(item_kind, item_id)
+    except KeyError as exc:
+        detail = "Slice not found" if item_kind == "slice" else "Review window not found"
+        raise HTTPException(status_code=404, detail=detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/projects/{project_id}/export-preview", response_model=ExportPreview)
@@ -240,6 +263,17 @@ def get_waveform_peaks(clip_id: str, bins: int = 120) -> WaveformPeaks:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/clip-lab-items/{item_kind}/{item_id}/waveform-peaks", response_model=WaveformPeaks)
+def get_clip_lab_item_waveform_peaks(item_kind: str, item_id: str, bins: int = 120) -> WaveformPeaks:
+    try:
+        return repository.get_clip_lab_waveform_peaks(item_kind, item_id, bins)
+    except KeyError as exc:
+        detail = "Slice not found" if item_kind == "slice" else "Review window not found"
+        raise HTTPException(status_code=404, detail=detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.patch("/api/clips/{clip_id}/active-variant", response_model=SliceDetail)
 def set_active_variant(clip_id: str, payload: ActiveVariantUpdate) -> SliceDetail:
     try:
@@ -264,6 +298,130 @@ def run_audio_variant(clip_id: str, payload: AudioVariantRunRequest) -> SliceDet
         return repository.run_audio_variant(clip_id, payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/review-windows/{review_window_id}/status", response_model=ClipLabItemView)
+def update_review_window_status(
+    review_window_id: str,
+    payload: SliceStatusUpdate,
+) -> ClipLabItemView:
+    try:
+        return repository.update_review_window_status(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+
+
+@app.patch("/api/review-windows/{review_window_id}/transcript", response_model=ClipLabItemView)
+def update_review_window_transcript(
+    review_window_id: str,
+    payload: SliceTranscriptUpdate,
+) -> ClipLabItemView:
+    try:
+        return repository.update_review_window_transcript(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+
+
+@app.patch("/api/review-windows/{review_window_id}/tags", response_model=ClipLabItemView)
+def update_review_window_tags(
+    review_window_id: str,
+    payload: SliceTagUpdate,
+) -> ClipLabItemView:
+    try:
+        return repository.update_review_window_tags(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/save", response_model=ClipLabItemView)
+def save_review_window_state(
+    review_window_id: str,
+    payload: SliceSaveRequest,
+) -> ClipLabItemView:
+    try:
+        return repository.save_review_window_state(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+    except SliceSaveValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/edl", response_model=ClipLabItemView)
+def append_review_window_edl_operation(
+    review_window_id: str,
+    payload: SliceEdlUpdate,
+) -> ClipLabItemView:
+    try:
+        return repository.append_review_window_edl_operation(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/undo", response_model=ClipLabItemView)
+def undo_review_window(review_window_id: str) -> ClipLabItemView:
+    try:
+        return repository.undo_review_window(review_window_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/redo", response_model=ClipLabItemView)
+def redo_review_window(review_window_id: str) -> ClipLabItemView:
+    try:
+        return repository.redo_review_window(review_window_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/split", response_model=list[ReviewWindowView])
+def split_review_window(
+    review_window_id: str,
+    payload: SliceSplitRequest,
+) -> list[ReviewWindowView]:
+    try:
+        return repository.split_review_window(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/merge-next", response_model=list[ReviewWindowView])
+def merge_with_next_review_window(review_window_id: str) -> list[ReviewWindowView]:
+    try:
+        return repository.merge_with_next_review_window(review_window_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/review-windows/{review_window_id}/active-variant", response_model=ClipLabItemView)
+def set_active_review_window_variant(
+    review_window_id: str,
+    payload: ActiveVariantUpdate,
+) -> ClipLabItemView:
+    try:
+        return repository.set_active_review_window_variant(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window variant not found") from exc
+
+
+@app.post("/api/review-windows/{review_window_id}/variants/run", response_model=ClipLabItemView)
+def run_review_window_variant(
+    review_window_id: str,
+    payload: AudioVariantRunRequest,
+) -> ClipLabItemView:
+    try:
+        return repository.run_review_window_variant(review_window_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -304,6 +462,19 @@ def get_source_recording_window_media(
         path = repository.get_source_recording_window_media_path(recording_id, start_seconds, end_seconds)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
+@app.get("/media/review-windows/{review_window_id}.wav")
+def get_review_window_media(review_window_id: str) -> FileResponse:
+    try:
+        path = repository.get_review_window_media_path(review_window_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Review window not found") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
     except ValueError as exc:
@@ -371,6 +542,51 @@ def get_processing_job(job_id: str) -> ProcessingJobView:
         return repository.get_processing_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Processing job not found") from exc
+
+
+@app.post(
+    "/api/source-recordings/{recording_id}/dataset-processing",
+    response_model=DatasetProcessingRunView,
+    status_code=202,
+)
+def start_dataset_processing_run(
+    recording_id: str,
+    payload: DatasetProcessingRunRequest,
+) -> DatasetProcessingRunView:
+    try:
+        return repository.start_dataset_processing_run(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/source-recordings/{recording_id}/processing-status",
+    response_model=DatasetProcessingRunView,
+)
+def get_source_recording_processing_status(recording_id: str) -> DatasetProcessingRunView:
+    try:
+        return repository.get_source_recording_processing_status(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset processing run not found") from exc
+
+
+@app.post(
+    "/api/source-recordings/{recording_id}/review-window-asr",
+    response_model=ProcessingJobView,
+    status_code=202,
+)
+def enqueue_review_window_asr(
+    recording_id: str,
+    payload: ReviewWindowAsrRequest,
+) -> ProcessingJobView:
+    try:
+        return repository.enqueue_review_window_asr(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post(

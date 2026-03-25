@@ -1,15 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type WaveSurfer from "wavesurfer.js";
 import WaveformPane from "../WaveformPane";
-import { fetchWaveformPeaks } from "../api";
-import type { ReviewStatus, Slice, SliceSummary, WaveformPeaks } from "../types";
+import { fetchClipLabWaveformPeaks } from "../api";
+import type { ClipLabItem, ClipLabItemRef, ReviewStatus, WaveformPeaks } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatClipTimestamp,
   formatSeconds,
   getAlignmentConfidence,
   getAlignmentSource,
-  getSliceAudioRevisionKey,
   getSliceDuration,
   getSliceTranscriptText,
   parseTagDraft,
@@ -21,16 +20,16 @@ type EditorPaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
-  activeClip: Slice | null;
+  activeClip: ClipLabItem | null;
   activeClipAudioUrl: string | null;
   canUndo: boolean;
   canRedo: boolean;
   allClipTagNames: string[];
-  getNextClipId: (currentClipId: string) => string | null;
-  onSelectClip: (clipId: string) => void;
+  getNextClipItem: (currentClipItem: ClipLabItemRef) => ClipLabItemRef | null;
+  onSelectClip: (clipItem: ClipLabItemRef) => void;
   onRetryLoad: () => void;
-  onSaveSlice: (
-    clipId: string,
+  onSaveClipLabItem: (
+    clipItem: ClipLabItemRef,
     payload: {
       modified_text?: string | null;
       tags?: { name: string; color: string }[] | null;
@@ -38,20 +37,20 @@ type EditorPaneProps = {
       message?: string | null;
       is_milestone?: boolean;
     },
-  ) => Promise<Slice>;
+  ) => Promise<ClipLabItem>;
   onAppendEdlOperation: (
-    clipId: string,
+    clipItem: ClipLabItemRef,
     payload: {
       op: string;
       range?: { start_seconds: number; end_seconds: number } | null;
       duration_seconds?: number | null;
     },
-  ) => Promise<Slice>;
-  onUndo: (clipId: string) => Promise<Slice>;
-  onRedo: (clipId: string) => Promise<Slice>;
-  onSplitClip: (clipId: string, splitAtSeconds: number) => Promise<SliceSummary[]>;
-  onMergeClip: (clipId: string) => Promise<SliceSummary[]>;
-  onRunClipLabModel: (clipId: string, generatorModel: string) => Promise<Slice>;
+  ) => Promise<ClipLabItem>;
+  onUndo: (clipItem: ClipLabItemRef) => Promise<ClipLabItem>;
+  onRedo: (clipItem: ClipLabItemRef) => Promise<ClipLabItem>;
+  onSplitClip: (clipItem: ClipLabItemRef, splitAtSeconds: number) => Promise<number>;
+  onMergeClip: (clipItem: ClipLabItemRef) => Promise<number>;
+  onRunClipLabModel: (clipItem: ClipLabItemRef, generatorModel: string) => Promise<ClipLabItem>;
 };
 
 export default function EditorPane({
@@ -63,10 +62,10 @@ export default function EditorPane({
   canUndo,
   canRedo,
   allClipTagNames,
-  getNextClipId,
+  getNextClipItem,
   onSelectClip,
   onRetryLoad,
-  onSaveSlice,
+  onSaveClipLabItem,
   onAppendEdlOperation,
   onUndo,
   onRedo,
@@ -99,7 +98,15 @@ export default function EditorPane({
   const [waveformError, setWaveformError] = useState<string | null>(null);
 
   const activeDuration = activeClip ? getSliceDuration(activeClip) : 0;
-  const activeAudioRevisionKey = activeClip ? getSliceAudioRevisionKey(activeClip) : null;
+  const activeAudioRevisionKey = activeClip
+    ? JSON.stringify({
+        audio_url: activeClip.audio_url,
+        active_variant_id: activeClip.active_variant?.id ?? null,
+        active_commit_id: activeClip.active_commit?.id ?? null,
+        edl_operations: activeClip.active_commit?.edl_operations ?? [],
+      })
+    : null;
+  const capabilities = activeClip?.capabilities;
   const draftTagEntries = useMemo(() => parseTagDraft(draftTags), [draftTags]);
   const suggestedTagNames = useMemo(() => {
     const selected = new Set(draftTagEntries.map((tag) => tag.name.toLowerCase()));
@@ -148,7 +155,7 @@ export default function EditorPane({
 
     void (async () => {
       try {
-        const nextPeaks = await fetchWaveformPeaks(activeClip.id, 960);
+        const nextPeaks = await fetchClipLabWaveformPeaks(activeClip.kind, activeClip.id, 960);
         if (cancelled) {
           return;
         }
@@ -238,8 +245,8 @@ export default function EditorPane({
     applyPlaybackRate(waveSurferRef.current, nextRate);
   }
 
-  async function handleSaveSlice(forceStatus?: ReviewStatus): Promise<Slice | null> {
-    if (!activeClip) {
+  async function handleSaveClip(forceStatus?: ReviewStatus): Promise<ClipLabItem | null> {
+    if (!activeClip || !capabilities?.can_save) {
       return null;
     }
 
@@ -249,23 +256,23 @@ export default function EditorPane({
     try {
       const nextTags = parseTagDraft(draftTags);
       const currentTagDraft = activeClip.tags.map((tag) => tag.name).join(", ");
-      const workingSlice = await onSaveSlice(activeClip.id, {
+      const workingClip = await onSaveClipLabItem({ kind: activeClip.kind, id: activeClip.id }, {
         modified_text:
           draftTranscript !== getSliceTranscriptText(activeClip) ? draftTranscript : undefined,
         tags: draftTags.trim() !== currentTagDraft.trim() ? nextTags : undefined,
         status: forceStatus && activeClip.status !== forceStatus ? forceStatus : undefined,
         message:
           forceStatus === "accepted"
-            ? "Accepted slice milestone"
+            ? "Accepted clip milestone"
             : forceStatus === "rejected"
-              ? "Rejected slice milestone"
-              : "Saved slice milestone",
+              ? "Rejected clip milestone"
+              : "Saved clip milestone",
         is_milestone: true,
       });
-      setEditorNotice("Saved slice state.");
-      setDraftTranscript(getSliceTranscriptText(workingSlice));
-      setDraftTags(workingSlice.tags.map((tag) => tag.name).join(", "));
-      return workingSlice;
+      setEditorNotice("Saved clip state.");
+      setDraftTranscript(getSliceTranscriptText(workingClip));
+      setDraftTags(workingClip.tags.map((tag) => tag.name).join(", "));
+      return workingClip;
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Save failed.");
       return null;
@@ -275,42 +282,42 @@ export default function EditorPane({
   }
 
   async function handleAcceptNextAndPlay() {
-    if (!activeClip || isSavingSlice || isApplyingEdit) {
+    if (!activeClip || !capabilities?.can_set_status || isSavingSlice || isApplyingEdit) {
       return;
     }
 
-    const nextClipId = getNextClipId(activeClip.id);
-    const savedSlice = await handleSaveSlice("accepted");
-    if (!savedSlice) {
+    const nextClipItem = getNextClipItem({ kind: activeClip.kind, id: activeClip.id });
+    const savedClip = await handleSaveClip("accepted");
+    if (!savedClip) {
       return;
     }
 
-    if (!nextClipId) {
-      setEditorNotice("Saved. No next slice in the current queue.");
+    if (!nextClipItem) {
+      setEditorNotice("Saved. No next item in the current queue.");
       return;
     }
 
     shouldAutoPlayAfterClipChangeRef.current = true;
-    onSelectClip(nextClipId);
+    onSelectClip(nextClipItem);
   }
 
   async function handleRejectNextAndPlay() {
-    if (!activeClip || isSavingSlice || isApplyingEdit) {
+    if (!activeClip || !capabilities?.can_set_status || isSavingSlice || isApplyingEdit) {
       return;
     }
 
-    const nextClipId = getNextClipId(activeClip.id);
-    const savedSlice = await handleSaveSlice("rejected");
-    if (!savedSlice) {
+    const nextClipItem = getNextClipItem({ kind: activeClip.kind, id: activeClip.id });
+    const savedClip = await handleSaveClip("rejected");
+    if (!savedClip) {
       return;
     }
 
-    if (!nextClipId) {
+    if (!nextClipItem) {
       return;
     }
 
     shouldAutoPlayAfterClipChangeRef.current = true;
-    onSelectClip(nextClipId);
+    onSelectClip(nextClipItem);
   }
 
   async function handleTogglePlayback() {
@@ -415,7 +422,7 @@ export default function EditorPane({
   }, []);
 
   async function handleDeleteSelection() {
-    if (!activeClip) {
+    if (!activeClip || !capabilities?.can_edit_waveform) {
       return;
     }
 
@@ -433,7 +440,7 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const updated = await onAppendEdlOperation(activeClip.id, {
+      const updated = await onAppendEdlOperation({ kind: activeClip.kind, id: activeClip.id }, {
         op: "delete_range",
         range: { start_seconds: start, end_seconds: end },
       });
@@ -451,7 +458,7 @@ export default function EditorPane({
   }
 
   async function handleInsertSilence() {
-    if (!activeClip) {
+    if (!activeClip || !capabilities?.can_edit_waveform) {
       return;
     }
 
@@ -463,7 +470,7 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const updated = await onAppendEdlOperation(activeClip.id, {
+      const updated = await onAppendEdlOperation({ kind: activeClip.kind, id: activeClip.id }, {
         op: "insert_silence",
         range: { start_seconds: insertAt, end_seconds: insertAt },
         duration_seconds: 0.2,
@@ -481,13 +488,13 @@ export default function EditorPane({
   }
 
   async function handleUndo() {
-    if (!activeClip) {
+    if (!activeClip || !canUndo) {
       return;
     }
 
     pausePlayback();
     try {
-      const updated = await onUndo(activeClip.id);
+      const updated = await onUndo({ kind: activeClip.kind, id: activeClip.id });
       setDraftTranscript(getSliceTranscriptText(updated));
       setDraftTags(updated.tags.map((tag) => tag.name).join(", "));
       setSelectionStart(0);
@@ -500,13 +507,13 @@ export default function EditorPane({
   }
 
   async function handleRedo() {
-    if (!activeClip) {
+    if (!activeClip || !canRedo) {
       return;
     }
 
     pausePlayback();
     try {
-      const updated = await onRedo(activeClip.id);
+      const updated = await onRedo({ kind: activeClip.kind, id: activeClip.id });
       setDraftTranscript(getSliceTranscriptText(updated));
       setDraftTags(updated.tags.map((tag) => tag.name).join(", "));
       setSelectionStart(0);
@@ -519,7 +526,7 @@ export default function EditorPane({
   }
 
   async function handleSplitClip() {
-    if (!activeClip) {
+    if (!activeClip || !capabilities?.can_split) {
       return;
     }
 
@@ -536,8 +543,8 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const result = await onSplitClip(activeClip.id, splitAt);
-      setEditorNotice(`Split ${activeClip.id} into ${result.length} visible slices.`);
+      const count = await onSplitClip({ kind: activeClip.kind, id: activeClip.id }, splitAt);
+      setEditorNotice(`Split ${activeClip.id}. Workspace now shows ${count} visible item(s).`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Split failed.");
     } finally {
@@ -546,15 +553,15 @@ export default function EditorPane({
   }
 
   async function handleMergeClip() {
-    if (!activeClip) {
+    if (!activeClip || !capabilities?.can_merge) {
       return;
     }
 
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const result = await onMergeClip(activeClip.id);
-      setEditorNotice(`Merged. Workspace now has ${result.length} visible slices.`);
+      const count = await onMergeClip({ kind: activeClip.kind, id: activeClip.id });
+      setEditorNotice(`Merged. Workspace now has ${count} visible item(s).`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Merge failed.");
     } finally {
@@ -563,14 +570,14 @@ export default function EditorPane({
   }
 
   async function handleRunDeepFilterNet() {
-    if (!activeClip) {
+    if (!activeClip || !capabilities?.can_run_processing) {
       return;
     }
     setIsRunningModel(true);
     pausePlayback();
     try {
-      const updated = await onRunClipLabModel(activeClip.id, "deepfilternet");
-      setEditorNotice(`Activated variant ${updated.active_variant_id ?? "unknown"}.`);
+      const updated = await onRunClipLabModel({ kind: activeClip.kind, id: activeClip.id }, "deepfilternet");
+      setEditorNotice(`Activated variant ${updated.active_variant?.id ?? "unknown"}.`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Clip Lab model failed.");
     } finally {
@@ -583,7 +590,7 @@ export default function EditorPane({
       <section className="panel waveform-panel">
         <div className="panel-header">
           <div className="clip-editor-header-main">
-            <p className="eyebrow">Slice Editor</p>
+            <p className="eyebrow">Clip Lab</p>
             {activeClip ? (
               <div className="tag-list header-tag-list">
                 {activeClip.tags.length > 0 ? (
@@ -609,16 +616,16 @@ export default function EditorPane({
                 <button
                   className="primary-button"
                   type="button"
-                  onClick={() => void handleSaveSlice()}
-                  disabled={!activeClip || isSavingSlice}
+                  onClick={() => void handleSaveClip()}
+                  disabled={!activeClip || !capabilities?.can_save || isSavingSlice}
                 >
-                  Save Slice
+                  Save
                 </button>
                 <button
                   className="primary-button"
                   type="button"
                   onClick={() => void handleAcceptNextAndPlay()}
-                  disabled={!activeClip || isSavingSlice}
+                  disabled={!activeClip || !capabilities?.can_set_status || isSavingSlice}
                 >
                   Accept & Next
                 </button>
@@ -626,14 +633,14 @@ export default function EditorPane({
                   className="primary-button"
                   type="button"
                   onClick={() => void handleRejectNextAndPlay()}
-                  disabled={!activeClip || isSavingSlice || isApplyingEdit}
+                  disabled={!activeClip || !capabilities?.can_set_status || isSavingSlice || isApplyingEdit}
                 >
                   Reject & Next
                 </button>
                 <button
                   type="button"
                   onClick={() => void handleRunDeepFilterNet()}
-                  disabled={!activeClip || isRunningModel}
+                  disabled={!activeClip || !capabilities?.can_run_processing || isRunningModel}
                 >
                   {isRunningModel ? "Running..." : "Run DeepFilterNet"}
                 </button>
@@ -726,18 +733,34 @@ export default function EditorPane({
                 <button type="button" onClick={() => void handleRedo()} disabled={!canRedo}>
                   Redo
                 </button>
-                <button type="button" onClick={() => void handleSplitClip()} disabled={isApplyingEdit}>
-                  {isApplyingEdit ? "Applying..." : "Split Slice"}
+                <button
+                  type="button"
+                  onClick={() => void handleSplitClip()}
+                  disabled={!capabilities?.can_split || isApplyingEdit}
+                >
+                  {isApplyingEdit ? "Applying..." : "Split Item"}
                 </button>
-                <button type="button" onClick={() => void handleMergeClip()} disabled={isApplyingEdit}>
-                  Merge Next Slice
+                <button
+                  type="button"
+                  onClick={() => void handleMergeClip()}
+                  disabled={!capabilities?.can_merge || isApplyingEdit}
+                >
+                  Merge Next Item
                 </button>
                 {hasActiveSelection ? (
-                  <button type="button" onClick={() => void handleDeleteSelection()} disabled={isApplyingEdit}>
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteSelection()}
+                    disabled={!capabilities?.can_edit_waveform || isApplyingEdit}
+                  >
                     Delete Selection
                   </button>
                 ) : null}
-                <button type="button" onClick={() => void handleInsertSilence()} disabled={isApplyingEdit}>
+                <button
+                  type="button"
+                  onClick={() => void handleInsertSilence()}
+                  disabled={!capabilities?.can_edit_waveform || isApplyingEdit}
+                >
                   Insert Silence
                 </button>
               </div>
@@ -766,66 +789,8 @@ export default function EditorPane({
           value={draftTranscript}
           onChange={(event) => setDraftTranscript(event.target.value)}
           placeholder="Transcript text"
+          disabled={!capabilities?.can_edit_transcript}
         />
-
-        <div className="selection-panel">
-          <div className="selection-header">
-            <strong>Tags</strong>
-            <button className="primary-button" type="button" onClick={() => void handleSaveSlice()}>
-              Save Slice
-            </button>
-          </div>
-          <p className="muted-copy">
-            Pipeline status is strict control flow. Tags are subjective QA metadata.
-          </p>
-          <div className="tag-token-list">
-            {draftTagEntries.length > 0 ? (
-              draftTagEntries.map((tag) => (
-                <button
-                  key={`draft-${tag.name}`}
-                  type="button"
-                  className="tag-pill"
-                  style={{ backgroundColor: tag.color }}
-                  onClick={() => removeTagFromDraft(tag.name)}
-                  title="Remove tag"
-                >
-                  {tag.name} ×
-                </button>
-              ))
-            ) : (
-              <span className="muted-copy">No tags on this slice yet.</span>
-            )}
-          </div>
-          <div className="tag-input-row">
-            <input
-              className="search-input tag-entry-input"
-              value={tagInputDraft}
-              onChange={(event) => setTagInputDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === ",") {
-                  event.preventDefault();
-                  handleAddTagFromInput();
-                }
-              }}
-              placeholder="Add tag (press Enter)"
-            />
-            <button type="button" onClick={handleAddTagFromInput}>
-              Add
-            </button>
-          </div>
-          <div className="tag-suggestion-wrap">
-            {suggestedTagNames.map((tagName) => (
-              <button
-                key={`suggested-tag-${tagName}`}
-                type="button"
-                className="tag-suggestion-pill"
-                onClick={() => addTagToDraft(tagName)}
-              >
-                + {tagName}
-              </button>
-            ))}
-          </div>
-        </div>
 
         <div className="transcript-footer">
           <span>
@@ -842,6 +807,95 @@ export default function EditorPane({
           <span>
             Redo: <strong>{activeClip && canRedo ? "available" : "none"}</strong>
           </span>
+        </div>
+
+        <div className="transcript-meta-grid">
+          {activeClip ? (
+            <div className="selection-panel asr-panel">
+              <div className="selection-header">
+                <strong>ASR</strong>
+                <button type="button" disabled={!activeClip.can_run_asr}>
+                  {activeClip.can_run_asr ? "Run ASR" : "Run ASR (Soon)"}
+                </button>
+              </div>
+              <p className="muted-copy">
+                Source: {activeClip.transcript_source ?? "unknown"}
+              </p>
+              <p className="muted-copy">
+                {activeClip.asr_placeholder_message ?? "ASR controls will land here."}
+              </p>
+            </div>
+          ) : null}
+
+          <div className="selection-panel">
+            <div className="selection-header">
+              <strong>Tags</strong>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => void handleSaveClip()}
+                disabled={!capabilities?.can_save}
+              >
+                Save
+              </button>
+            </div>
+            <p className="muted-copy">
+              Pipeline status is strict control flow. Tags are subjective QA metadata.
+            </p>
+            <div className="tag-token-list">
+              {draftTagEntries.length > 0 ? (
+                draftTagEntries.map((tag) => (
+                  <button
+                    key={`draft-${tag.name}`}
+                    type="button"
+                    className="tag-pill"
+                    style={{ backgroundColor: tag.color }}
+                    onClick={() => removeTagFromDraft(tag.name)}
+                    title="Remove tag"
+                    disabled={!capabilities?.can_edit_tags}
+                  >
+                    {tag.name} ×
+                  </button>
+                ))
+              ) : (
+                <span className="muted-copy">No tags on this slice yet.</span>
+              )}
+            </div>
+            <div className="tag-input-row">
+              <input
+                className="search-input tag-entry-input"
+                value={tagInputDraft}
+                onChange={(event) => setTagInputDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (!capabilities?.can_edit_tags) {
+                    return;
+                  }
+                  if (event.key === "Enter" || event.key === ",") {
+                    event.preventDefault();
+                    handleAddTagFromInput();
+                  }
+                }}
+                placeholder="Add tag (press Enter)"
+                disabled={!capabilities?.can_edit_tags}
+              />
+              <button type="button" onClick={handleAddTagFromInput} disabled={!capabilities?.can_edit_tags}>
+                Add
+              </button>
+            </div>
+            <div className="tag-suggestion-wrap">
+              {suggestedTagNames.map((tagName) => (
+                <button
+                  key={`suggested-tag-${tagName}`}
+                  type="button"
+                  className="tag-suggestion-pill"
+                  onClick={() => addTagToDraft(tagName)}
+                  disabled={!capabilities?.can_edit_tags}
+                >
+                  + {tagName}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </section>
     </section>

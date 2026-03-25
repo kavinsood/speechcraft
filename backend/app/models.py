@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import Enum as SQLEnum
 from sqlmodel import Column, Field, JSON, Relationship, SQLModel
@@ -32,6 +32,7 @@ class JobKind(str, Enum):
     IMPORT = "import"
     PREPROCESS = "preprocess"
     SLICE = "slice"
+    REVIEW_WINDOW_ASR = "review_window_asr"
     FORCED_ALIGN_AND_PACK = "forced_align_and_pack"
     INFERENCE = "inference"
     EXPORT = "export"
@@ -87,6 +88,7 @@ class SourceRecording(SQLModel, table=True):
     batch: ImportBatch = Relationship(back_populates="recordings")
     review_windows: list["ReviewWindow"] = Relationship(back_populates="source_recording", cascade_delete=True)
     processing_jobs: list["ProcessingJob"] = Relationship(back_populates="source_recording", cascade_delete=True)
+    dataset_processing_runs: list["DatasetProcessingRun"] = Relationship(back_populates="source_recording", cascade_delete=True)
     slices: list["Slice"] = Relationship(back_populates="source_recording", cascade_delete=True)
 
     @property
@@ -102,11 +104,19 @@ class ReviewWindow(SQLModel, table=True):
     start_seconds: float
     end_seconds: float
     rough_transcript: str = ""
+    asr_draft_transcript: str | None = None
+    last_asr_job_id: str | None = None
+    last_asr_at: datetime | None = None
+    asr_model_name: str | None = None
+    asr_model_version: str | None = None
+    asr_language: str | None = None
     order_index: int = 0
     window_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
 
     source_recording: SourceRecording = Relationship(back_populates="review_windows")
+    revisions: list["ReviewWindowRevision"] = Relationship(back_populates="review_window", cascade_delete=True)
+    variants: list["ReviewWindowVariant"] = Relationship(back_populates="review_window", cascade_delete=True)
 
 
 class ProcessingJob(SQLModel, table=True):
@@ -116,14 +126,66 @@ class ProcessingJob(SQLModel, table=True):
     kind: JobKind = Field(sa_column=Column(sql_enum(JobKind), index=True))
     status: JobStatus = Field(default=JobStatus.PENDING, sa_column=Column(sql_enum(JobStatus), index=True))
     source_recording_id: str | None = Field(default=None, foreign_key="sourcerecording.id")
+    dataset_processing_run_id: str | None = Field(default=None, foreign_key="datasetprocessingrun.id", index=True)
+    target_review_window_id: str | None = Field(default=None, foreign_key="reviewwindow.id", index=True)
     input_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     output_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     error_message: str | None = None
+    claimed_by: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
+    heartbeat_at: datetime | None = None
     completed_at: datetime | None = None
 
     source_recording: SourceRecording | None = Relationship(back_populates="processing_jobs")
+
+
+class DatasetProcessingRun(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    source_recording_id: str = Field(foreign_key="sourcerecording.id", index=True)
+    status: str = Field(index=True)
+    phase: str = Field(index=True)
+    total_review_windows: int = 0
+    alignment_total: int = 0
+    asr_completed: int = 0
+    asr_failed: int = 0
+    alignment_completed: int = 0
+    alignment_failed: int = 0
+    current_message: str | None = None
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+    source_recording: SourceRecording | None = Relationship(back_populates="dataset_processing_runs")
+
+
+class ReviewWindowVariant(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    review_window_id: str = Field(foreign_key="reviewwindow.id")
+    file_path: str
+    is_original: bool = False
+    generator_model: str | None = None
+    sample_rate: int
+    num_samples: int
+    created_at: datetime = Field(default_factory=utc_now)
+
+    review_window: ReviewWindow | None = Relationship(back_populates="variants")
+
+
+class ReviewWindowRevision(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    review_window_id: str = Field(foreign_key="reviewwindow.id", index=True)
+    parent_revision_id: str | None = None
+    transcript_text: str = ""
+    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED, sa_column=Column(sql_enum(ReviewStatus)))
+    tags_payload: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    edl_operations: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    active_variant_id_snapshot: str | None = None
+    message: str | None = None
+    is_milestone: bool = False
+    is_active: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
+
+    review_window: ReviewWindow | None = Relationship(back_populates="revisions")
 
 
 # ==========================================
@@ -294,8 +356,20 @@ class ReviewWindowView(SQLModel):
     start_seconds: float
     end_seconds: float
     rough_transcript: str = ""
+    reviewed_transcript: str = ""
+    asr_draft_transcript: str | None = None
+    transcript_source: str | None = None
+    last_asr_job_id: str | None = None
+    last_asr_at: datetime | None = None
+    asr_model_name: str | None = None
+    asr_model_version: str | None = None
+    asr_language: str | None = None
+    review_status: ReviewStatus = ReviewStatus.UNRESOLVED
+    tags: list[TagView] = Field(default_factory=list)
     order_index: int = 0
     window_metadata: dict[str, Any] | None = None
+    can_undo: bool = False
+    can_redo: bool = False
     created_at: datetime
 
 
@@ -307,9 +381,81 @@ class ProcessingJobView(SQLModel):
     input_payload: dict[str, Any] | None = None
     output_payload: dict[str, Any] | None = None
     error_message: str | None = None
+    claimed_by: str | None = None
     created_at: datetime
     started_at: datetime | None = None
+    heartbeat_at: datetime | None = None
     completed_at: datetime | None = None
+
+
+class DatasetProcessingRunRequest(SQLModel):
+    review_window_ids: list[str] | None = None
+    model_name: str | None = None
+    model_version: str | None = None
+    language_hint: str | None = None
+
+
+class DatasetProcessingRunView(SQLModel):
+    id: str
+    source_recording_id: str
+    status: str
+    phase: str
+    total_review_windows: int = 0
+    asr_total: int = 0
+    alignment_total: int = 0
+    asr_completed: int = 0
+    asr_failed: int = 0
+    alignment_completed: int = 0
+    alignment_failed: int = 0
+    current_message: str | None = None
+    started_at: datetime
+    completed_at: datetime | None = None
+    health_page_ready: bool = False
+
+
+class ClipLabCapabilitiesView(SQLModel):
+    can_edit_transcript: bool = False
+    can_edit_tags: bool = False
+    can_set_status: bool = False
+    can_save: bool = False
+    can_split: bool = False
+    can_merge: bool = False
+    can_edit_waveform: bool = False
+    can_run_processing: bool = False
+    can_switch_variants: bool = False
+    can_export: bool = False
+    can_finalize: bool = False
+
+
+class ClipLabTranscriptView(SQLModel):
+    id: str
+    original_text: str
+    modified_text: str | None = None
+    is_modified: bool
+    draft_text: str | None = None
+    draft_source: str | None = None
+    alignment_data: dict[str, Any] | None = None
+
+
+class ClipLabVariantView(SQLModel):
+    id: str
+    is_original: bool = False
+    generator_model: str | None = None
+    sample_rate: int
+    num_samples: int
+
+
+class ClipLabCommitView(SQLModel):
+    id: str
+    parent_commit_id: str | None = None
+    edl_operations: list[dict[str, Any]] = Field(default_factory=list)
+    transcript_text: str = ""
+    status: ReviewStatus
+    tags: list["TagPayload"] = Field(default_factory=list)
+    active_variant_id: str | None = None
+    message: str | None = None
+    is_milestone: bool = False
+    created_at: datetime
 
 
 class SliceRevision(SQLModel):
@@ -349,6 +495,41 @@ class SliceDetail(SliceSummary):
     commits: list[SliceRevision] = Field(default_factory=list)
     active_variant: AudioVariantView | None = None
     active_commit: SliceRevision | None = None
+
+
+class ClipLabItemView(SQLModel):
+    id: str
+    kind: Literal["slice", "review_window"]
+    source_recording_id: str
+    source_recording: SourceRecordingView
+    start_seconds: float
+    end_seconds: float
+    duration_seconds: float = 0.0
+    status: ReviewStatus | None = None
+    created_at: datetime
+    transcript: ClipLabTranscriptView | None = None
+    tags: list[TagView] = Field(default_factory=list)
+    speaker_name: str | None = None
+    language: str | None = None
+    audio_url: str
+    item_metadata: dict[str, Any] | None = None
+    transcript_source: str | None = None
+    can_run_asr: bool = False
+    asr_placeholder_message: str | None = None
+    asr_draft_transcript: str | None = None
+    last_asr_job_id: str | None = None
+    last_asr_at: datetime | None = None
+    asr_model_name: str | None = None
+    asr_model_version: str | None = None
+    asr_language: str | None = None
+    active_variant_generator_model: str | None = None
+    can_undo: bool = False
+    can_redo: bool = False
+    capabilities: ClipLabCapabilitiesView = Field(default_factory=ClipLabCapabilitiesView)
+    variants: list[ClipLabVariantView] = Field(default_factory=list)
+    commits: list[ClipLabCommitView] = Field(default_factory=list)
+    active_variant: ClipLabVariantView | None = None
+    active_commit: ClipLabCommitView | None = None
 
 
 class ReferenceAsset(SQLModel, table=True):
@@ -484,12 +665,23 @@ class SlicerChunkInput(SQLModel):
 
 class SlicerHandoffRequest(SQLModel):
     windows: list[SlicerChunkInput]
+    pre_padding_ms: int = 150
+    post_padding_ms: int = 250
+    merge_gap_threshold_ms: int = 200
+    minimum_window_duration_ms: int = 750
 
 
 class ForcedAlignAndPackRequest(SQLModel):
     transcript_text: str
     review_window_ids: list[str] | None = None
     minimum_duration_seconds: float = 6.0
+
+
+class ReviewWindowAsrRequest(SQLModel):
+    review_window_ids: list[str]
+    model_name: str | None = None
+    model_version: str | None = None
+    language_hint: str | None = None
 
 
 class AudioVariantCreate(SQLModel):

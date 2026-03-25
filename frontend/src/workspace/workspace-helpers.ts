@@ -1,4 +1,6 @@
-import type { AudioVariant, ReviewStatus, Slice, SliceSummary } from "../types";
+import type { ClipLabItem, ClipLabVariant, ReviewStatus, Slice, SliceSummary } from "../types";
+
+type ClipLikeSummary = SliceSummary | ClipLabItem;
 
 export const queuePriorityOrder: ReviewStatus[] = [
   "unresolved",
@@ -41,47 +43,61 @@ export function formatDurationCompact(totalSeconds: number): string {
 }
 
 export function getSliceMetadata<T>(
-  slice: SliceSummary,
+  slice: ClipLikeSummary,
   key: string,
   fallback: T,
 ): T {
-  const value = slice.model_metadata?.[key];
+  const itemMetadata =
+    "model_metadata" in slice ? slice.model_metadata : (slice as ClipLabItem).item_metadata;
+  const value = itemMetadata?.[key];
   return (value as T | undefined) ?? fallback;
 }
 
-export function getSliceTranscriptText(slice: SliceSummary): string {
+export function getSliceTranscriptText(slice: ClipLikeSummary): string {
   return slice.transcript?.modified_text ?? slice.transcript?.original_text ?? "";
 }
 
-export function getSliceDuration(slice: SliceSummary): number {
+export function getSliceDuration(slice: ClipLikeSummary): number {
   return Number((slice.duration_seconds ?? 0).toFixed(2));
 }
 
-export function getSliceOrderIndex(slice: SliceSummary): number {
+export function getSliceOrderIndex(slice: ClipLikeSummary): number {
   return Number(getSliceMetadata(slice, "order_index", 0));
 }
 
-export function getSliceOriginalStart(slice: SliceSummary): number {
+export function getSliceOriginalStart(slice: ClipLikeSummary): number {
+  if ("start_seconds" in slice) {
+    return Number(slice.start_seconds);
+  }
   return Number(getSliceMetadata(slice, "original_start_time", 0));
 }
 
-export function getSliceOriginalEnd(slice: SliceSummary): number {
+export function getSliceOriginalEnd(slice: ClipLikeSummary): number {
+  if ("end_seconds" in slice) {
+    return Number(slice.end_seconds);
+  }
   return Number(getSliceMetadata(slice, "original_end_time", getSliceDuration(slice)));
 }
 
-export function getSliceSpeakerName(slice: SliceSummary): string {
+export function getSliceSpeakerName(slice: ClipLikeSummary): string {
+  if ("speaker_name" in slice && slice.speaker_name) {
+    return slice.speaker_name;
+  }
   return String(getSliceMetadata(slice, "speaker_name", "speaker_a"));
 }
 
-export function getSliceLanguage(slice: SliceSummary): string {
+export function getSliceLanguage(slice: ClipLikeSummary): string {
+  if ("language" in slice && slice.language) {
+    return slice.language;
+  }
   return String(getSliceMetadata(slice, "language", "en"));
 }
 
-export function isSliceSuperseded(slice: SliceSummary): boolean {
+export function isSliceSuperseded(slice: ClipLikeSummary): boolean {
   return Boolean(getSliceMetadata(slice, "is_superseded", false));
 }
 
-export function getAlignmentSource(slice: SliceSummary): string {
+export function getAlignmentSource(slice: ClipLikeSummary): string {
   const alignmentData =
     slice.transcript && "alignment_data" in slice.transcript
       ? slice.transcript.alignment_data
@@ -92,7 +108,7 @@ export function getAlignmentSource(slice: SliceSummary): string {
   return "manual";
 }
 
-export function getAlignmentConfidence(slice: SliceSummary): number | null {
+export function getAlignmentConfidence(slice: ClipLikeSummary): number | null {
   const alignmentData =
     slice.transcript && "alignment_data" in slice.transcript
       ? slice.transcript.alignment_data
@@ -120,7 +136,7 @@ export function getRedoTarget(slice: Slice): string | null {
   );
 }
 
-export function sortVariantsForHistory(variants: AudioVariant[]): AudioVariant[] {
+export function sortVariantsForHistory(variants: ClipLabVariant[]): ClipLabVariant[] {
   return [...variants].sort((left, right) => {
     if (left.is_original !== right.is_original) {
       return left.is_original ? -1 : 1;
