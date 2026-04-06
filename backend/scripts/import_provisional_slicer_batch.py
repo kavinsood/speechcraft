@@ -6,6 +6,7 @@ import wave
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from sqlmodel import Session, delete, select
 
 from app.models import (
@@ -29,6 +30,9 @@ DEFAULT_REVIEW_CONTEXT_SECONDS = 0.06
 DEFAULT_REVIEW_TAIL_SECONDS = 0.08
 BREATH_REVIEW_CONTEXT_SECONDS = 0.18
 WORD_EDGE_MARGIN_SECONDS = 0.015
+REVIEW_EDGE_SCAN_WINDOW_SECONDS = 0.02
+REVIEW_EDGE_MAX_SAMPLE_SECONDS = 0.003
+REVIEW_EDGE_ENERGY_SPIKE_RATIO = 4.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +84,7 @@ def main() -> None:
         next_order_index = 0
         imported_recordings = 0
         imported_slices = 0
+        audio_cache: dict[str, tuple[np.ndarray, int]] = {}
 
         for slicer_path in sorted(slicer_dir.glob("*.json")):
             stem = slicer_path.stem
@@ -88,6 +93,7 @@ def main() -> None:
                 raise SystemExit(f"Missing WAV for slicer result {slicer_path.name}: {audio_path}")
 
             sample_rate, channels, frames = wav_metadata(audio_path)
+            recording_duration = frames / sample_rate if sample_rate > 0 else 0.0
             recording = SourceRecording(
                 id=f"{args.batch_id}-src-{stem}",
                 batch_id=batch.id,
@@ -112,6 +118,9 @@ def main() -> None:
                 start_seconds, end_seconds = resolve_slice_bounds(
                     slice_payload,
                     args.bounds_mode,
+                    recording_duration=recording_duration,
+                    audio_path=audio_path,
+                    audio_cache=audio_cache,
                     previous_slice=previous_slice,
                     next_slice=next_slice,
                 )
@@ -191,24 +200,55 @@ def resolve_slice_bounds(
     slice_payload: dict[str, Any],
     bounds_mode: str,
     *,
+    recording_duration: float,
+    audio_path: Path,
+    audio_cache: dict[str, tuple[np.ndarray, int]],
     previous_slice: dict[str, Any] | None = None,
     next_slice: dict[str, Any] | None = None,
 ) -> tuple[float, float]:
     if bounds_mode == "raw":
-        return float(slice_payload["raw_start"]), float(slice_payload["raw_end"])
+        return clamp_bounds(
+            float(slice_payload["raw_start"]),
+            float(slice_payload["raw_end"]),
+            recording_duration,
+        )
     if bounds_mode == "padded":
-        return float(slice_payload["padded_start"]), float(slice_payload["padded_end"])
+        return clamp_bounds(
+            float(slice_payload["padded_start"]),
+            float(slice_payload["padded_end"]),
+            recording_duration,
+        )
     if bounds_mode == "review_safe":
-        return resolve_review_safe_bounds(slice_payload, previous_slice=previous_slice, next_slice=next_slice)
-    return (
+        return clamp_bounds(
+            *resolve_review_safe_bounds(
+            slice_payload,
+            audio_path=audio_path,
+            audio_cache=audio_cache,
+            previous_slice=previous_slice,
+            next_slice=next_slice,
+        ),
+            recording_duration,
+        )
+    return clamp_bounds(
         float(slice_payload.get("snapped_start", slice_payload["raw_start"])),
         float(slice_payload.get("snapped_end", slice_payload["raw_end"])),
+        recording_duration,
     )
+
+
+def clamp_bounds(start_seconds: float, end_seconds: float, recording_duration: float) -> tuple[float, float]:
+    start_seconds = max(0.0, min(start_seconds, recording_duration))
+    end_seconds = max(0.0, min(end_seconds, recording_duration))
+    if end_seconds < start_seconds:
+        end_seconds = start_seconds
+    return start_seconds, end_seconds
 
 
 def resolve_review_safe_bounds(
     slice_payload: dict[str, Any],
     *,
+    audio_path: Path,
+    audio_cache: dict[str, tuple[np.ndarray, int]],
     previous_slice: dict[str, Any] | None,
     next_slice: dict[str, Any] | None,
 ) -> tuple[float, float]:
@@ -239,6 +279,23 @@ def resolve_review_safe_bounds(
         next_word_start = raw_end + next_gap
         end_seconds = min(end_seconds, next_word_start - WORD_EDGE_MARGIN_SECONDS)
 
+    if start_seconds < start_anchor:
+        start_seconds = _adjust_review_edge(
+            anchor_seconds=start_anchor,
+            proposed_seconds=start_seconds,
+            audio_path=audio_path,
+            audio_cache=audio_cache,
+            prefer="start",
+        )
+    if end_seconds > end_anchor:
+        end_seconds = _adjust_review_edge(
+            anchor_seconds=end_anchor,
+            proposed_seconds=end_seconds,
+            audio_path=audio_path,
+            audio_cache=audio_cache,
+            prefer="end",
+        )
+
     start_seconds = min(start_seconds, start_anchor)
     end_seconds = max(end_seconds, end_anchor)
     return start_seconds, end_seconds
@@ -247,6 +304,121 @@ def resolve_review_safe_bounds(
 def wav_metadata(audio_path: Path) -> tuple[int, int, int]:
     with wave.open(str(audio_path), "rb") as wav_file:
         return wav_file.getframerate(), wav_file.getnchannels(), wav_file.getnframes()
+
+
+def load_pcm_wav(audio_path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(audio_path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        raw_frames = wav_file.readframes(frame_count)
+
+    audio = np.frombuffer(raw_frames, dtype="<i2").astype(np.float64)
+    if frame_count == 0:
+        return np.zeros(0, dtype=np.float64), sample_rate
+    if channels > 1:
+        audio = audio.reshape(frame_count, channels).mean(axis=1)
+    return audio / 32768.0, sample_rate
+
+
+def _cached_audio(
+    audio_path: Path,
+    audio_cache: dict[str, tuple[np.ndarray, int]],
+) -> tuple[np.ndarray, int]:
+    key = str(audio_path)
+    cached = audio_cache.get(key)
+    if cached is not None:
+        return cached
+    loaded = load_pcm_wav(audio_path)
+    audio_cache[key] = loaded
+    return loaded
+
+
+def _adjust_review_edge(
+    *,
+    anchor_seconds: float,
+    proposed_seconds: float,
+    audio_path: Path,
+    audio_cache: dict[str, tuple[np.ndarray, int]],
+    prefer: str,
+) -> float:
+    audio, sample_rate = _cached_audio(audio_path, audio_cache)
+    if len(audio) == 0 or sample_rate <= 0:
+        return proposed_seconds
+    if proposed_seconds <= anchor_seconds and prefer == "end":
+        return anchor_seconds
+    if proposed_seconds >= anchor_seconds and prefer == "start":
+        return anchor_seconds
+
+    scan_span = abs(proposed_seconds - anchor_seconds)
+    if scan_span <= 0:
+        return anchor_seconds
+
+    frame_samples = max(1, int(REVIEW_EDGE_MAX_SAMPLE_SECONDS * sample_rate))
+    scan_samples = max(1, int(REVIEW_EDGE_SCAN_WINDOW_SECONDS * sample_rate))
+
+    if prefer == "end":
+        start_idx = max(0, int(anchor_seconds * sample_rate))
+        end_idx = min(len(audio), int(proposed_seconds * sample_rate))
+        if end_idx <= start_idx + frame_samples:
+            return proposed_seconds
+        baseline = _region_rms(audio, start_idx, min(len(audio), start_idx + scan_samples))
+        best_idx = end_idx
+        best_rms = _region_rms(audio, max(start_idx, end_idx - frame_samples), end_idx)
+        limit_rms = max(baseline * REVIEW_EDGE_ENERGY_SPIKE_RATIO, baseline + 1e-5)
+        for idx in range(start_idx + frame_samples, end_idx + 1):
+            rms = _region_rms(audio, idx - frame_samples, idx)
+            if rms < best_rms:
+                best_rms = rms
+                best_idx = idx
+            if rms > limit_rms and idx > start_idx + frame_samples:
+                break
+        return _nearest_zero_crossing_time(audio, sample_rate, best_idx, start_idx, end_idx)
+
+    start_idx = max(0, int(proposed_seconds * sample_rate))
+    end_idx = min(len(audio), int(anchor_seconds * sample_rate))
+    if end_idx <= start_idx + frame_samples:
+        return proposed_seconds
+    baseline = _region_rms(audio, max(0, end_idx - scan_samples), end_idx)
+    best_idx = start_idx
+    best_rms = _region_rms(audio, start_idx, min(len(audio), start_idx + frame_samples))
+    limit_rms = max(baseline * REVIEW_EDGE_ENERGY_SPIKE_RATIO, baseline + 1e-5)
+    for idx in range(end_idx - frame_samples, start_idx - 1, -1):
+        rms = _region_rms(audio, idx, idx + frame_samples)
+        if rms < best_rms:
+            best_rms = rms
+            best_idx = idx
+        if rms > limit_rms and idx < end_idx - frame_samples:
+            break
+    return _nearest_zero_crossing_time(audio, sample_rate, best_idx, start_idx, end_idx)
+
+
+def _region_rms(audio: np.ndarray, start_idx: int, end_idx: int) -> float:
+    start_idx = max(0, min(start_idx, len(audio)))
+    end_idx = max(start_idx + 1, min(end_idx, len(audio)))
+    region = audio[start_idx:end_idx]
+    if len(region) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(region**2)))
+
+
+def _nearest_zero_crossing_time(
+    audio: np.ndarray,
+    sample_rate: int,
+    center_idx: int,
+    lo_idx: int,
+    hi_idx: int,
+) -> float:
+    center_idx = max(lo_idx, min(center_idx, hi_idx - 1))
+    for offset in range(0, max(center_idx - lo_idx, hi_idx - center_idx) + 1):
+        for candidate in (center_idx - offset, center_idx + offset):
+            if candidate <= lo_idx or candidate >= hi_idx:
+                continue
+            prev = audio[candidate - 1]
+            cur = audio[candidate]
+            if prev == 0 or cur == 0 or (prev < 0 <= cur) or (prev > 0 >= cur):
+                return candidate / sample_rate
+    return center_idx / sample_rate
 
 
 def delete_batch(session: Session, repository: SQLiteRepository, batch_id: str) -> None:

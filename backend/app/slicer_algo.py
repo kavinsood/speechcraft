@@ -273,10 +273,7 @@ def apply_acoustic_refinement(
                 config,
             )
         breath_present = _detect_breath(audio, sample_rate, left.raw_end, max(0.0, right.raw_start - left.raw_end), config)
-        if breath_present:
-            shared_boundary = _choose_breath_boundary(gap_start, gap_end, rms, rms_times, config)
-        else:
-            shared_boundary = _snap_boundary_in_gap(gap_start, gap_end, config, rms, rms_times)
+        shared_boundary = _snap_boundary_in_gap(gap_start, gap_end, config, rms, rms_times)
 
         left.snapped_end = shared_boundary
         right.snapped_start = shared_boundary
@@ -333,7 +330,7 @@ def build_slice_entries(
 
     for index, spec in enumerate(specs):
         clip_words = words[spec.start_word_index : spec.end_word_index + 1]
-        clip_start = spec.padded_start
+        clip_start = spec.training_start
         relative_words = [
             {
                 "word": word.word,
@@ -346,14 +343,20 @@ def build_slice_entries(
 
         overlap_prev = 0.0
         overlap_next = 0.0
+        review_overlap_prev = 0.0
+        review_overlap_next = 0.0
         if index > 0:
-            overlap_prev = max(0.0, specs[index - 1].padded_end - spec.padded_start)
+            overlap_prev = max(0.0, specs[index - 1].training_end - spec.training_start)
+            review_overlap_prev = max(0.0, specs[index - 1].padded_end - spec.padded_start)
         if index + 1 < len(specs):
-            overlap_next = max(0.0, spec.padded_end - specs[index + 1].padded_start)
+            overlap_next = max(0.0, spec.training_end - specs[index + 1].training_start)
+            review_overlap_next = max(0.0, spec.padded_end - specs[index + 1].padded_start)
 
         slices.append(
             {
                 "slice_index": index,
+                "start_word_index": spec.start_word_index,
+                "end_word_index": spec.end_word_index,
                 "transcript": spec.transcript,
                 "transcript_original": spec.transcript_original,
                 "duration": round(spec.duration, 4),
@@ -366,12 +369,15 @@ def build_slice_entries(
                 "raw_end": round(spec.raw_end, 4),
                 "snapped_start": round(spec.snapped_start, 4),
                 "snapped_end": round(spec.snapped_end, 4),
+                "relative_word_offsets_from": "training_start",
                 "training_start": round(spec.training_start, 4),
                 "training_end": round(spec.training_end, 4),
                 "padded_start": round(spec.padded_start, 4),
                 "padded_end": round(spec.padded_end, 4),
                 "overlap_with_previous_s": round(overlap_prev, 4),
                 "overlap_with_next_s": round(overlap_next, 4),
+                "review_overlap_with_previous_s": round(review_overlap_prev, 4),
+                "review_overlap_with_next_s": round(review_overlap_next, 4),
                 "word_count": spec.word_count,
                 "avg_alignment_confidence": round(spec.avg_confidence, 4),
                 "forced_cut": spec.forced_cut,
@@ -757,22 +763,6 @@ def _snap_boundary_in_gap(
 
     best_index = min(candidate_indices, key=lambda idx: abs(float(local_times[idx]) - midpoint))
     return float(local_times[best_index])
-
-
-def _choose_breath_boundary(
-    gap_start: float,
-    gap_end: float,
-    rms: np.ndarray,
-    rms_times: np.ndarray,
-    config: SlicerConfig,
-) -> float:
-    if gap_end <= gap_start:
-        return gap_start
-
-    edge_span = max(config.edge_window_ms / 1000.0, 0.02)
-    left_energy = _window_mean_rms(gap_start, min(gap_start + edge_span, gap_end), rms, rms_times)
-    right_energy = _window_mean_rms(max(gap_end - edge_span, gap_start), gap_end, rms, rms_times)
-    return gap_start if left_energy <= right_energy else gap_end
 
 
 def _detect_breath(
