@@ -159,8 +159,27 @@ class SlicerAlgoTests(TestCase):
         self.assertEqual(result["stats"]["total_clips"], 2)
         self.assertEqual(result["stats"]["overlap_audio_s"], 0.0)
         self.assertGreater(result["stats"]["review_overlap_audio_s"], 0.0)
-        self.assertGreater(result["slices"][0]["overlap_with_next_s"], 0.0)
-        self.assertGreater(result["slices"][1]["overlap_with_previous_s"], 0.0)
+        self.assertEqual(result["slices"][0]["overlap_with_next_s"], 0.0)
+        self.assertEqual(result["slices"][1]["overlap_with_previous_s"], 0.0)
+        self.assertGreater(result["slices"][0]["review_overlap_with_next_s"], 0.0)
+        self.assertGreater(result["slices"][1]["review_overlap_with_previous_s"], 0.0)
+
+    def test_plan_slices_words_are_training_relative_not_padded_relative(self) -> None:
+        sample_rate = 1000
+        audio = np.zeros(3000, dtype=np.float64)
+        result = plan_slices(
+            [
+                {"word": "one", "start": 1.0, "end": 1.4},
+            ],
+            audio,
+            sample_rate,
+            SlicerConfig(min_duration=0.1, padding_ms=150),
+        )
+
+        self.assertEqual(result["slices"][0]["relative_word_offsets_from"], "training_start")
+        self.assertEqual(result["slices"][0]["words"][0]["start"], 0.0)
+        self.assertEqual(result["slices"][0]["training_start"], 1.0)
+        self.assertLess(result["slices"][0]["padded_start"], result["slices"][0]["training_start"])
 
     def test_plan_slices_uses_union_for_coverage_not_padded_sum(self) -> None:
         sample_rate = 1000
