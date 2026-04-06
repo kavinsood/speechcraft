@@ -1412,6 +1412,27 @@ button:disabled {
   text-align: center;
 }
 
+.workspace-empty-stack {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.recording-status-list {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.recording-status-card {
+  border: 1px solid rgba(97, 91, 74, 0.14);
+  border-radius: 1rem;
+  padding: 0.85rem;
+  background: rgba(247, 243, 234, 0.92);
+}
+
+.recording-status-card p {
+  margin: 0.4rem 0 0.55rem;
+}
+
 @media (max-width: 1080px) {
   .shell-header,
   .step-page-header,

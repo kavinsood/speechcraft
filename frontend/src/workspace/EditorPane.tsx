@@ -155,7 +155,7 @@ export default function EditorPane({
 
     void (async () => {
       try {
-        const nextPeaks = await fetchClipLabWaveformPeaks(activeClip.kind, activeClip.id, 960);
+        const nextPeaks = await fetchClipLabWaveformPeaks(activeClip.id, 960);
         if (cancelled) {
           return;
         }
@@ -256,7 +256,7 @@ export default function EditorPane({
     try {
       const nextTags = parseTagDraft(draftTags);
       const currentTagDraft = activeClip.tags.map((tag) => tag.name).join(", ");
-      const workingClip = await onSaveClipLabItem({ kind: activeClip.kind, id: activeClip.id }, {
+      const workingClip = await onSaveClipLabItem({ id: activeClip.id }, {
         modified_text:
           draftTranscript !== getSliceTranscriptText(activeClip) ? draftTranscript : undefined,
         tags: draftTags.trim() !== currentTagDraft.trim() ? nextTags : undefined,
@@ -286,7 +286,7 @@ export default function EditorPane({
       return;
     }
 
-    const nextClipItem = getNextClipItem({ kind: activeClip.kind, id: activeClip.id });
+    const nextClipItem = getNextClipItem({ id: activeClip.id });
     const savedClip = await handleSaveClip("accepted");
     if (!savedClip) {
       return;
@@ -306,7 +306,7 @@ export default function EditorPane({
       return;
     }
 
-    const nextClipItem = getNextClipItem({ kind: activeClip.kind, id: activeClip.id });
+    const nextClipItem = getNextClipItem({ id: activeClip.id });
     const savedClip = await handleSaveClip("rejected");
     if (!savedClip) {
       return;
@@ -440,7 +440,7 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const updated = await onAppendEdlOperation({ kind: activeClip.kind, id: activeClip.id }, {
+      const updated = await onAppendEdlOperation({ id: activeClip.id }, {
         op: "delete_range",
         range: { start_seconds: start, end_seconds: end },
       });
@@ -470,7 +470,7 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const updated = await onAppendEdlOperation({ kind: activeClip.kind, id: activeClip.id }, {
+      const updated = await onAppendEdlOperation({ id: activeClip.id }, {
         op: "insert_silence",
         range: { start_seconds: insertAt, end_seconds: insertAt },
         duration_seconds: 0.2,
@@ -494,7 +494,7 @@ export default function EditorPane({
 
     pausePlayback();
     try {
-      const updated = await onUndo({ kind: activeClip.kind, id: activeClip.id });
+      const updated = await onUndo({ id: activeClip.id });
       setDraftTranscript(getSliceTranscriptText(updated));
       setDraftTags(updated.tags.map((tag) => tag.name).join(", "));
       setSelectionStart(0);
@@ -513,7 +513,7 @@ export default function EditorPane({
 
     pausePlayback();
     try {
-      const updated = await onRedo({ kind: activeClip.kind, id: activeClip.id });
+      const updated = await onRedo({ id: activeClip.id });
       setDraftTranscript(getSliceTranscriptText(updated));
       setDraftTags(updated.tags.map((tag) => tag.name).join(", "));
       setSelectionStart(0);
@@ -543,7 +543,7 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const count = await onSplitClip({ kind: activeClip.kind, id: activeClip.id }, splitAt);
+      const count = await onSplitClip({ id: activeClip.id }, splitAt);
       setEditorNotice(`Split ${activeClip.id}. Workspace now shows ${count} visible item(s).`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Split failed.");
@@ -560,7 +560,7 @@ export default function EditorPane({
     setIsApplyingEdit(true);
     pausePlayback();
     try {
-      const count = await onMergeClip({ kind: activeClip.kind, id: activeClip.id });
+      const count = await onMergeClip({ id: activeClip.id });
       setEditorNotice(`Merged. Workspace now has ${count} visible item(s).`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Merge failed.");
@@ -576,7 +576,7 @@ export default function EditorPane({
     setIsRunningModel(true);
     pausePlayback();
     try {
-      const updated = await onRunClipLabModel({ kind: activeClip.kind, id: activeClip.id }, "deepfilternet");
+      const updated = await onRunClipLabModel({ id: activeClip.id }, "deepfilternet");
       setEditorNotice(`Activated variant ${updated.active_variant?.id ?? "unknown"}.`);
     } catch (error) {
       setEditorNotice(error instanceof Error ? error.message : "Clip Lab model failed.");

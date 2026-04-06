@@ -2,29 +2,20 @@ import { startTransition, useEffect, useMemo, useRef, useState, type ReactNode }
 import {
   ApiError,
   appendClipEdlOperation,
-  appendReviewWindowEdlOperation,
   cleanupProjectMedia,
   fetchClipLabItem,
   fetchProjectExports,
-  fetchProjectReviewWindows,
+  fetchProjectRecordings,
   fetchProjectSlices,
   mergeWithNextClip,
-  mergeWithNextReviewWindow,
-  redoReviewWindow,
   redoClip,
   resolveApiUrl,
   runClipLabModel,
-  runReviewWindowModel,
   runProjectExport,
   saveClipState,
-  saveReviewWindowState,
   setActiveVariant,
-  setActiveReviewWindowVariant,
-  splitReviewWindow,
   splitClip,
-  updateReviewWindowStatus,
   undoClip,
-  undoReviewWindow,
 } from "../api";
 import ErrorBoundary from "../ErrorBoundary";
 import ClipQueuePane from "../workspace/ClipQueuePane";
@@ -40,13 +31,15 @@ import type {
   ClipLabItemRef,
   ExportRun,
   Project,
-  ReviewWindowSummary,
   ReviewStatus,
   Slice,
   SliceSummary,
+  SourceRecordingQueue,
 } from "../types";
 
 type WorkspaceStatus = "loading" | "error" | "ready";
+
+const ACTIVE_RECORDING_PROCESSING_STATES = new Set(["transcribing", "aligning", "slicing"]);
 
 type LabelPageProps = {
   activeProject: Project | null;
@@ -88,24 +81,6 @@ function summarizeSlice(slice: Slice): SliceSummary {
   };
 }
 
-function summarizeReviewWindow(item: ClipLabItem): ReviewWindowSummary {
-  return {
-    id: item.id,
-    source_recording_id: item.source_recording_id,
-    start_seconds: item.start_seconds,
-    end_seconds: item.end_seconds,
-    rough_transcript: item.transcript?.original_text ?? "",
-    reviewed_transcript: item.transcript?.modified_text ?? item.transcript?.original_text ?? "",
-    review_status: item.status ?? "unresolved",
-    tags: item.tags,
-    order_index: Number(item.item_metadata?.order_index ?? 0),
-    window_metadata: item.item_metadata ?? null,
-    can_undo: item.can_undo,
-    can_redo: item.can_redo,
-    created_at: item.created_at,
-  };
-}
-
 export default function LabelPage({
   activeProject,
   activeClipItem,
@@ -120,10 +95,9 @@ export default function LabelPage({
   const [workspaceEmptyMessage, setWorkspaceEmptyMessage] = useState<string | null>(null);
   const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
   const [slices, setSlices] = useState<SliceSummary[]>([]);
-  const [reviewWindows, setReviewWindows] = useState<ReviewWindowSummary[]>([]);
+  const [recordings, setRecordings] = useState<SourceRecordingQueue[]>([]);
   const [activeClip, setActiveClip] = useState<ClipLabItem | null>(null);
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
-  const [visibleReviewWindowIds, setVisibleReviewWindowIds] = useState<string[]>([]);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [isRunningExport, setIsRunningExport] = useState(false);
   const [isCleaningMedia, setIsCleaningMedia] = useState(false);
@@ -131,30 +105,60 @@ export default function LabelPage({
   const latestDetailRequestRef = useRef(0);
   const showDangerousDevActions = import.meta.env.DEV;
 
-  async function loadWorkspace(projectId: string | null | undefined) {
+  function getWorkspaceEmptyMessage(nextSlices: SliceSummary[], nextRecordings: SourceRecordingQueue[]): string | null {
+    if (nextSlices.length > 0) {
+      return null;
+    }
+
+    const activeRecording = nextRecordings.find((recording) =>
+      ACTIVE_RECORDING_PROCESSING_STATES.has(recording.processing_state),
+    );
+    if (activeRecording) {
+      return activeRecording.processing_message ?? "Generating slices from source recordings...";
+    }
+
+    const staleRecording = nextRecordings.find((recording) => recording.processing_state === "alignment_stale");
+    if (staleRecording) {
+      return staleRecording.processing_message ?? "Source transcript changed. Re-run alignment before slicing.";
+    }
+
+    const failedRecording = nextRecordings.find((recording) => recording.processing_state === "failed");
+    if (failedRecording) {
+      return failedRecording.processing_message ?? "Recording processing failed. Check the backend logs.";
+    }
+
+    if (nextRecordings.length > 0) {
+      return "This project has recordings, but no slices yet.";
+    }
+
+    return "This project does not contain slices yet.";
+  }
+
+  async function loadWorkspace(projectId: string | null | undefined, options?: { silent?: boolean }) {
     const requestId = latestWorkspaceRequestRef.current + 1;
     latestWorkspaceRequestRef.current = requestId;
-    setWorkspaceStatus("loading");
-    setWorkspaceError(null);
-    setWorkspaceEmptyMessage(null);
-    setWorkspaceNotice(null);
+    if (!options?.silent) {
+      setWorkspaceStatus("loading");
+      setWorkspaceError(null);
+      setWorkspaceEmptyMessage(null);
+      setWorkspaceNotice(null);
+    }
 
     if (!projectId) {
       setSlices([]);
-      setReviewWindows([]);
+      setRecordings([]);
       setExportRuns([]);
       onActiveClipItemChange(null);
       setVisibleQueueClipIds([]);
-      setVisibleReviewWindowIds([]);
       setWorkspaceStatus("ready");
       setWorkspaceEmptyMessage("Select a project to open the review workstation.");
       return;
     }
 
     try {
-      const [nextSlices, nextReviewWindows, nextExports] = await Promise.all([
+      const [nextSlices, nextRecordings, nextExports] = await Promise.all([
         fetchProjectSlices(projectId),
-        fetchProjectReviewWindows(projectId),
+        fetchProjectRecordings(projectId),
         fetchProjectExports(projectId),
       ]);
 
@@ -163,56 +167,43 @@ export default function LabelPage({
       }
 
       const sortedSlices = sortClipsForQueue(nextSlices);
-      const sortedReviewWindows = [...nextReviewWindows].sort((left, right) => {
-        if (left.source_recording_id !== right.source_recording_id) {
-          return left.source_recording_id.localeCompare(right.source_recording_id);
-        }
-        if (left.order_index !== right.order_index) {
-          return left.order_index - right.order_index;
-        }
-        return left.created_at.localeCompare(right.created_at);
-      });
       setSlices(nextSlices);
-      setReviewWindows(sortedReviewWindows);
-      setActiveClip(null);
+      setRecordings(nextRecordings);
+      if (!options?.silent) {
+        setActiveClip(null);
+      }
       setExportRuns(nextExports);
       setVisibleQueueClipIds(sortedSlices.map((slice) => slice.id));
-      setVisibleReviewWindowIds(sortedReviewWindows.map((window) => window.id));
       const nextActiveClip =
-        activeClipItem?.kind === "review_window"
-          ? activeClipItem && sortedReviewWindows.some((window) => window.id === activeClipItem.id)
-            ? activeClipItem
-            : sortedReviewWindows[0]
-              ? { kind: "review_window" as const, id: sortedReviewWindows[0].id }
-              : sortedSlices[0]
-                ? { kind: "slice" as const, id: sortedSlices[0].id }
-                : null
-          : activeClipItem && sortedSlices.some((slice) => slice.id === activeClipItem.id)
+        activeClipItem && sortedSlices.some((slice) => slice.id === activeClipItem.id)
             ? activeClipItem
             : sortedSlices[0]
-              ? { kind: "slice" as const, id: sortedSlices[0].id }
-              : sortedReviewWindows[0]
-                ? { kind: "review_window" as const, id: sortedReviewWindows[0].id }
+              ? { id: sortedSlices[0].id }
               : null;
-      onActiveClipItemChange(nextActiveClip);
+      if (
+        nextActiveClip?.id !== activeClipItem?.id
+        || (nextActiveClip === null && activeClipItem !== null)
+      ) {
+        onActiveClipItemChange(nextActiveClip);
+      }
       setWorkspaceStatus("ready");
-      setWorkspaceEmptyMessage(
-        sortedSlices.length === 0 && sortedReviewWindows.length === 0
-          ? "This project does not contain slices or review windows yet."
-          : null,
-      );
+      setWorkspaceEmptyMessage(getWorkspaceEmptyMessage(sortedSlices, nextRecordings));
     } catch (error) {
       if (latestWorkspaceRequestRef.current !== requestId) {
         return;
       }
 
+      if (options?.silent) {
+        setWorkspaceNotice(getErrorMessage(error, "Background workspace refresh failed."));
+        return;
+      }
+
       setSlices([]);
-      setReviewWindows([]);
+      setRecordings([]);
       setActiveClip(null);
       setExportRuns([]);
       onActiveClipItemChange(null);
       setVisibleQueueClipIds([]);
-      setVisibleReviewWindowIds([]);
       setWorkspaceStatus("error");
       setWorkspaceError(
         getErrorMessage(error, "The label workspace failed to load. Check the backend and try again."),
@@ -235,57 +226,53 @@ export default function LabelPage({
     void loadWorkspace(activeProject?.id);
   }, [activeProject?.id, projectLoadStatus, projectLoadError]);
 
+  useEffect(() => {
+    if (!activeProject?.id || workspaceStatus !== "ready") {
+      return;
+    }
+    if (!recordings.some((recording) => ACTIVE_RECORDING_PROCESSING_STATES.has(recording.processing_state))) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadWorkspace(activeProject.id, { silent: true });
+    }, 3000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [activeProject?.id, recordings, workspaceStatus]);
+
   const allClipTagNames = useMemo(() => {
     return Array.from(
       new Set(
-        [...slices.flatMap((slice) => slice.tags), ...reviewWindows.flatMap((window) => window.tags)]
+        slices
+          .flatMap((slice) => slice.tags)
           .map((tag) => tag.name.toLowerCase())
           .sort(),
       ),
     );
-  }, [slices, reviewWindows]);
+  }, [slices]);
 
   const sliceMap = useMemo(() => new Map(slices.map((slice) => [slice.id, slice])), [slices]);
-  const reviewWindowMap = useMemo(
-    () => new Map(reviewWindows.map((window) => [window.id, window])),
-    [reviewWindows],
-  );
 
   const activeSliceSummary = useMemo(() => {
     const visibleQueueClips = visibleQueueClipIds
       .map((clipId) => sliceMap.get(clipId) ?? null)
       .filter((slice): slice is SliceSummary => slice !== null);
 
-    if (activeClipItem?.kind === "slice") {
+    if (activeClipItem) {
       return sliceMap.get(activeClipItem.id) ?? visibleQueueClips[0] ?? slices[0] ?? null;
     }
 
     return visibleQueueClips[0] ?? slices[0] ?? null;
   }, [sliceMap, slices, activeClipItem, visibleQueueClipIds]);
 
-  const activeReviewWindowSummary = useMemo(() => {
-    const visibleQueueWindows = visibleReviewWindowIds
-      .map((windowId) => reviewWindowMap.get(windowId) ?? null)
-      .filter((window): window is ReviewWindowSummary => window !== null);
-
-    if (activeClipItem?.kind === "review_window") {
-      return reviewWindowMap.get(activeClipItem.id) ?? visibleQueueWindows[0] ?? reviewWindows[0] ?? null;
-    }
-
-    return visibleQueueWindows[0] ?? reviewWindows[0] ?? null;
-  }, [reviewWindowMap, reviewWindows, activeClipItem, visibleReviewWindowIds]);
-
   useEffect(() => {
     const requestId = latestDetailRequestRef.current + 1;
     latestDetailRequestRef.current = requestId;
 
-    const nextActiveTarget =
-      activeClipItem
-      ?? (activeSliceSummary
-        ? { kind: "slice" as const, id: activeSliceSummary.id }
-        : activeReviewWindowSummary
-          ? { kind: "review_window" as const, id: activeReviewWindowSummary.id }
-          : null);
+    const nextActiveTarget = activeClipItem ?? (activeSliceSummary ? { id: activeSliceSummary.id } : null);
 
     if (!nextActiveTarget) {
       setActiveClip(null);
@@ -294,7 +281,7 @@ export default function LabelPage({
 
     void (async () => {
       try {
-        const detail = await fetchClipLabItem(nextActiveTarget.kind, nextActiveTarget.id);
+        const detail = await fetchClipLabItem(nextActiveTarget.id);
         if (latestDetailRequestRef.current !== requestId) {
           return;
         }
@@ -307,7 +294,7 @@ export default function LabelPage({
         setWorkspaceNotice(getErrorMessage(error, "The active Clip Lab item failed to load."));
       }
     })();
-  }, [activeClipItem, activeSliceSummary?.id, activeReviewWindowSummary?.id]);
+  }, [activeClipItem, activeSliceSummary?.id]);
 
   const activeClipAudioUrl = useMemo(() => {
     if (!activeClip) {
@@ -324,15 +311,14 @@ export default function LabelPage({
   }
 
   function getNextClipItem(currentClipItem: ClipLabItemRef): ClipLabItemRef | null {
-    const visibleIds =
-      currentClipItem.kind === "review_window" ? visibleReviewWindowIds : visibleQueueClipIds;
+    const visibleIds = visibleQueueClipIds;
     if (visibleIds.length === 0) {
       return null;
     }
 
     const currentIndex = visibleIds.findIndex((clipId) => clipId === currentClipItem.id);
     if (currentIndex < 0) {
-      return visibleIds[0] ? { kind: currentClipItem.kind, id: visibleIds[0] } : null;
+      return visibleIds[0] ? { id: visibleIds[0] } : null;
     }
 
     const nextClipId = visibleIds[currentIndex + 1] ?? visibleIds[0] ?? null;
@@ -340,7 +326,7 @@ export default function LabelPage({
       return null;
     }
 
-    return { kind: currentClipItem.kind, id: nextClipId };
+    return { id: nextClipId };
   }
 
   function replaceSlice(updatedSlice: Slice) {
@@ -349,14 +335,8 @@ export default function LabelPage({
     );
   }
 
-  function replaceReviewWindow(updatedWindow: ReviewWindowSummary) {
-    setReviewWindows((current) =>
-      current.map((window) => (window.id === updatedWindow.id ? updatedWindow : window)),
-    );
-  }
-
   async function refreshActiveClipItem(nextClipItem: ClipLabItemRef): Promise<ClipLabItem> {
-    const detail = await fetchClipLabItem(nextClipItem.kind, nextClipItem.id);
+    const detail = await fetchClipLabItem(nextClipItem.id);
     setActiveClip(detail);
     return detail;
   }
@@ -398,17 +378,12 @@ export default function LabelPage({
     setIsCleaningMedia(true);
     try {
       const result = await cleanupProjectMedia(activeProject.id);
-      const [nextSlices, nextReviewWindows] = await Promise.all([
-        fetchProjectSlices(activeProject.id),
-        fetchProjectReviewWindows(activeProject.id),
-      ]);
+      const nextSlices = await fetchProjectSlices(activeProject.id);
       const sorted = sortClipsForQueue(nextSlices);
       setSlices(nextSlices);
-      setReviewWindows(nextReviewWindows);
       setActiveClip(null);
       setVisibleQueueClipIds(sorted.map((slice) => slice.id));
-      setVisibleReviewWindowIds(nextReviewWindows.map((window) => window.id));
-      onActiveClipItemChange(sorted[0] ? { kind: "slice", id: sorted[0].id } : null);
+      onActiveClipItemChange(sorted[0] ? { id: sorted[0].id } : null);
       setWorkspaceNotice(
         `Cleanup removed ${result.deleted_slice_count} superseded slice(s), ${result.deleted_variant_count} variant row(s), and ${result.deleted_file_count} file(s).`,
       );
@@ -429,13 +404,6 @@ export default function LabelPage({
       is_milestone?: boolean;
     },
   ): Promise<ClipLabItem> {
-    if (clipItem.kind === "review_window") {
-      const updatedItem = await saveReviewWindowState(clipItem.id, payload);
-      replaceReviewWindow(summarizeReviewWindow(updatedItem));
-      setActiveClip(updatedItem);
-      return updatedItem;
-    }
-
     const updatedSlice = await saveClipState(clipItem.id, payload);
     replaceSlice(updatedSlice);
     return await refreshActiveClipItem(clipItem);
@@ -449,56 +417,24 @@ export default function LabelPage({
       duration_seconds?: number | null;
     },
   ): Promise<ClipLabItem> {
-    if (clipItem.kind === "review_window") {
-      const updatedItem = await appendReviewWindowEdlOperation(clipItem.id, payload);
-      replaceReviewWindow(summarizeReviewWindow(updatedItem));
-      setActiveClip(updatedItem);
-      return updatedItem;
-    }
-
     const updatedSlice = await appendClipEdlOperation(clipItem.id, payload);
     replaceSlice(updatedSlice);
     return await refreshActiveClipItem(clipItem);
   }
 
   async function undoClipMutation(clipItem: ClipLabItemRef): Promise<ClipLabItem> {
-    if (clipItem.kind === "review_window") {
-      const updatedItem = await undoReviewWindow(clipItem.id);
-      replaceReviewWindow(summarizeReviewWindow(updatedItem));
-      setActiveClip(updatedItem);
-      return updatedItem;
-    }
-
     const updatedSlice = await undoClip(clipItem.id);
     replaceSlice(updatedSlice);
     return await refreshActiveClipItem(clipItem);
   }
 
   async function redoClipMutation(clipItem: ClipLabItemRef): Promise<ClipLabItem> {
-    if (clipItem.kind === "review_window") {
-      const updatedItem = await redoReviewWindow(clipItem.id);
-      replaceReviewWindow(summarizeReviewWindow(updatedItem));
-      setActiveClip(updatedItem);
-      return updatedItem;
-    }
-
     const updatedSlice = await redoClip(clipItem.id);
     replaceSlice(updatedSlice);
     return await refreshActiveClipItem(clipItem);
   }
 
   async function splitClipMutation(clipItem: ClipLabItemRef, splitAtSeconds: number): Promise<number> {
-    if (clipItem.kind === "review_window") {
-      const existingIds = new Set(reviewWindows.map((window) => window.id));
-      const nextWindows = await splitReviewWindow(clipItem.id, splitAtSeconds);
-      setReviewWindows(nextWindows);
-      setActiveClip(null);
-      setVisibleReviewWindowIds(nextWindows.map((window) => window.id));
-      const nextActiveWindow = nextWindows.find((window) => !existingIds.has(window.id)) ?? nextWindows[0] ?? null;
-      onActiveClipItemChange(nextActiveWindow ? { kind: "review_window", id: nextActiveWindow.id } : null);
-      return nextWindows.length;
-    }
-
     const existingIds = new Set(slices.map((slice) => slice.id));
     const nextSlices = await splitClip(clipItem.id, splitAtSeconds);
     setSlices(nextSlices);
@@ -506,22 +442,11 @@ export default function LabelPage({
     const sorted = sortClipsForQueue(nextSlices);
     setVisibleQueueClipIds(sorted.map((slice) => slice.id));
     const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
-    onActiveClipItemChange(nextActiveClip ? { kind: "slice", id: nextActiveClip.id } : null);
+    onActiveClipItemChange(nextActiveClip ? { id: nextActiveClip.id } : null);
     return nextSlices.length;
   }
 
   async function mergeNextClipMutation(clipItem: ClipLabItemRef): Promise<number> {
-    if (clipItem.kind === "review_window") {
-      const existingIds = new Set(reviewWindows.map((window) => window.id));
-      const nextWindows = await mergeWithNextReviewWindow(clipItem.id);
-      setReviewWindows(nextWindows);
-      setActiveClip(null);
-      setVisibleReviewWindowIds(nextWindows.map((window) => window.id));
-      const nextActiveWindow = nextWindows.find((window) => !existingIds.has(window.id)) ?? nextWindows[0] ?? null;
-      onActiveClipItemChange(nextActiveWindow ? { kind: "review_window", id: nextActiveWindow.id } : null);
-      return nextWindows.length;
-    }
-
     const existingIds = new Set(slices.map((slice) => slice.id));
     const nextSlices = await mergeWithNextClip(clipItem.id);
     setSlices(nextSlices);
@@ -529,7 +454,7 @@ export default function LabelPage({
     const sorted = sortClipsForQueue(nextSlices);
     setVisibleQueueClipIds(sorted.map((slice) => slice.id));
     const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
-    onActiveClipItemChange(nextActiveClip ? { kind: "slice", id: nextActiveClip.id } : null);
+    onActiveClipItemChange(nextActiveClip ? { id: nextActiveClip.id } : null);
     return nextSlices.length;
   }
 
@@ -537,13 +462,6 @@ export default function LabelPage({
     clipItem: ClipLabItemRef,
     generatorModel: string,
   ): Promise<ClipLabItem> {
-    if (clipItem.kind === "review_window") {
-      const updatedItem = await runReviewWindowModel(clipItem.id, generatorModel);
-      replaceReviewWindow(summarizeReviewWindow(updatedItem));
-      setActiveClip(updatedItem);
-      return updatedItem;
-    }
-
     const updatedSlice = await runClipLabModel(clipItem.id, generatorModel);
     replaceSlice(updatedSlice);
     return await refreshActiveClipItem(clipItem);
@@ -554,15 +472,9 @@ export default function LabelPage({
       return;
     }
     try {
-      if (activeClip.kind === "review_window") {
-        const updatedItem = await setActiveReviewWindowVariant(activeClip.id, variantId);
-        replaceReviewWindow(summarizeReviewWindow(updatedItem));
-        setActiveClip(updatedItem);
-      } else {
-        const updatedSlice = await setActiveVariant(activeClip.id, variantId);
-        replaceSlice(updatedSlice);
-        await refreshActiveClipItem({ kind: "slice", id: activeClip.id });
-      }
+      const updatedSlice = await setActiveVariant(activeClip.id, variantId);
+      replaceSlice(updatedSlice);
+      await refreshActiveClipItem({ id: activeClip.id });
       setWorkspaceNotice(`Activated variant ${variantId}.`);
     } catch (error) {
       setWorkspaceNotice(getErrorMessage(error, "Variant switch failed."));
@@ -663,13 +575,12 @@ export default function LabelPage({
             workspacePhase={workspaceStatus}
             workspaceError={workspaceError}
             workspaceEmptyMessage={workspaceEmptyMessage}
+            recordings={recordings}
             clips={slices}
-            reviewWindows={reviewWindows}
             activeClipItem={activeClipItem}
             onSelectClipItem={handleClipSelect}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
             onVisibleClipIdsChange={setVisibleQueueClipIds}
-            onVisibleReviewWindowIdsChange={setVisibleReviewWindowIds}
           />
 
           <EditorPane
@@ -709,15 +620,7 @@ export default function LabelPage({
               if (!activeClip) {
                 return;
               }
-              const nextRef = { kind: activeClip.kind, id: activeClip.id } as const;
-              if (activeClip.kind === "review_window") {
-                void updateReviewWindowStatus(activeClip.id, status).then((updatedItem) => {
-                  replaceReviewWindow(summarizeReviewWindow(updatedItem));
-                  setActiveClip(updatedItem);
-                });
-                return;
-              }
-              void saveFullClipLabItem(nextRef, {
+              void saveFullClipLabItem({ id: activeClip.id }, {
                 status,
                 message: `Status: ${status}`,
               });

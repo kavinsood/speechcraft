@@ -1,14 +1,13 @@
 import type {
   ClipLabItem,
-  ClipLabItemKind,
   ExportPreview,
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
-  ReviewWindowSummary,
   ReviewStatus,
   Slice,
   SliceSummary,
+  SourceRecordingQueue,
   WaveformPeaks,
 } from "./types";
 
@@ -89,9 +88,9 @@ export async function fetchProjectSlices(projectId: string): Promise<SliceSummar
   return await parseJson<SliceSummary[]>(response);
 }
 
-export async function fetchProjectReviewWindows(projectId: string): Promise<ReviewWindowSummary[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/review-windows`);
-  return await parseJson<ReviewWindowSummary[]>(response);
+export async function fetchProjectRecordings(projectId: string): Promise<SourceRecordingQueue[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/recordings`);
+  return await parseJson<SourceRecordingQueue[]>(response);
 }
 
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
@@ -99,11 +98,8 @@ export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
   return await parseJson<Slice>(response);
 }
 
-export async function fetchClipLabItem(
-  itemKind: ClipLabItemKind,
-  itemId: string,
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/clip-lab-items/${itemKind}/${itemId}`);
+export async function fetchClipLabItem(sliceId: string): Promise<ClipLabItem> {
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}/clip-lab`);
   return await parseJson<ClipLabItem>(response);
 }
 
@@ -254,133 +250,6 @@ export async function runClipLabModel(
   return await parseJson<Slice>(response);
 }
 
-export async function updateReviewWindowStatus(
-  reviewWindowId: string,
-  status: ReviewStatus,
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/status`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status }),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function updateReviewWindowTranscript(
-  reviewWindowId: string,
-  modifiedText: string,
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/transcript`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ modified_text: modifiedText }),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function updateReviewWindowTags(
-  reviewWindowId: string,
-  tags: { name: string; color: string }[],
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/tags`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ tags }),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function saveReviewWindowState(
-  reviewWindowId: string,
-  payload: {
-    modified_text?: string | null;
-    tags?: { name: string; color: string }[] | null;
-    status?: ReviewStatus | null;
-    message?: string | null;
-    is_milestone?: boolean;
-  },
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/save`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function appendReviewWindowEdlOperation(
-  reviewWindowId: string,
-  payload: {
-    op: string;
-    range?: { start_seconds: number; end_seconds: number } | null;
-    duration_seconds?: number | null;
-  },
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/edl`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function undoReviewWindow(reviewWindowId: string): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/undo`, {
-    method: "POST",
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function redoReviewWindow(reviewWindowId: string): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/redo`, {
-    method: "POST",
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function splitReviewWindow(
-  reviewWindowId: string,
-  splitAtSeconds: number,
-): Promise<ReviewWindowSummary[]> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/split`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ split_at_seconds: splitAtSeconds }),
-  });
-  return await parseJson<ReviewWindowSummary[]>(response);
-}
-
-export async function mergeWithNextReviewWindow(reviewWindowId: string): Promise<ReviewWindowSummary[]> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/merge-next`, {
-    method: "POST",
-  });
-  return await parseJson<ReviewWindowSummary[]>(response);
-}
-
-export async function runReviewWindowModel(
-  reviewWindowId: string,
-  generatorModel: string,
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/variants/run`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ generator_model: generatorModel }),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
-export async function setActiveReviewWindowVariant(
-  reviewWindowId: string,
-  activeVariantId: string,
-): Promise<ClipLabItem> {
-  const response = await fetch(`${API_BASE}/api/review-windows/${reviewWindowId}/active-variant`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ active_variant_id: activeVariantId }),
-  });
-  return await parseJson<ClipLabItem>(response);
-}
-
 export async function setActiveVariant(
   clipId: string,
   activeVariantId: string,
@@ -395,21 +264,10 @@ export async function setActiveVariant(
   return await parseJson<Slice>(response);
 }
 
-export async function fetchWaveformPeaks(
-  clipId: string,
-  bins = 120,
-): Promise<WaveformPeaks> {
-  const response = await fetch(`${API_BASE}/api/clips/${clipId}/waveform-peaks?bins=${bins}`);
-  return await parseJson<WaveformPeaks>(response);
-}
-
 export async function fetchClipLabWaveformPeaks(
-  itemKind: ClipLabItemKind,
-  itemId: string,
+  sliceId: string,
   bins = 120,
 ): Promise<WaveformPeaks> {
-  const response = await fetch(
-    `${API_BASE}/api/clip-lab-items/${itemKind}/${itemId}/waveform-peaks?bins=${bins}`,
-  );
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}/waveform-peaks?bins=${bins}`);
   return await parseJson<WaveformPeaks>(response);
 }

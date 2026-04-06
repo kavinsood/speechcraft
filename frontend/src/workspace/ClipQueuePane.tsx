@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { ClipLabItemRef, ReviewWindowSummary, SliceSummary } from "../types";
+import type { ClipLabItemRef, SliceSummary, SourceRecordingQueue } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   clipMatchesFilters,
@@ -17,26 +17,24 @@ type ClipQueuePaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
+  recordings: SourceRecordingQueue[];
   clips: SliceSummary[];
-  reviewWindows: ReviewWindowSummary[];
   activeClipItem: ClipLabItemRef | null;
   onSelectClipItem: (clipItem: ClipLabItemRef) => void;
   onRetryLoad: () => void;
   onVisibleClipIdsChange: (clipIds: string[]) => void;
-  onVisibleReviewWindowIdsChange: (clipIds: string[]) => void;
 };
 
 export default function ClipQueuePane({
   workspacePhase,
   workspaceError,
   workspaceEmptyMessage,
+  recordings,
   clips,
-  reviewWindows,
   activeClipItem,
   onSelectClipItem,
   onRetryLoad,
   onVisibleClipIdsChange,
-  onVisibleReviewWindowIdsChange,
 }: ClipQueuePaneProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilterTags, setSelectedFilterTags] = useState<string[]>([]);
@@ -71,11 +69,12 @@ export default function ClipQueuePane({
 
   const availableFilterTags = useMemo(() => {
     const statusTagNames = new Set(queuePriorityOrder.map((status) => status.toLowerCase()));
-    const allClipTags = [...clips.flatMap((clip) => clip.tags), ...reviewWindows.flatMap((window) => window.tags)]
+    const allClipTags = clips
+      .flatMap((clip) => clip.tags)
       .map((tag) => tag.name.toLowerCase())
       .filter((tagName) => !statusTagNames.has(tagName));
     return Array.from(new Set(allClipTags)).sort();
-  }, [clips, reviewWindows]);
+  }, [clips]);
 
   const queueClips = useMemo(() => {
     return sortClipsForQueue(clips).filter((clip) =>
@@ -87,49 +86,35 @@ export default function ClipQueuePane({
     onVisibleClipIdsChange(queueClips.map((clip) => clip.id));
   }, [queueClips, onVisibleClipIdsChange]);
 
-  const queueReviewWindows = useMemo(() => {
-    return [...reviewWindows]
-      .sort((left, right) => {
-        if (left.source_recording_id !== right.source_recording_id) {
-          return left.source_recording_id.localeCompare(right.source_recording_id);
-        }
-        if (left.order_index !== right.order_index) {
-          return left.order_index - right.order_index;
-        }
-        return left.created_at.localeCompare(right.created_at);
-      })
-      .filter((window) => {
-        if (
-          selectedFilterTags.length > 0 &&
-          !selectedFilterTags.some((selectedTag) =>
-            window.tags.some((tag) => tag.name.toLowerCase() === selectedTag),
-          )
-        ) {
-          return false;
-        }
-        if (!deferredSearch) {
-          return true;
-        }
-        const haystacks = [
-          window.id,
-          window.reviewed_transcript || window.rough_transcript,
-          window.review_status,
-          ...window.tags.map((tag) => tag.name),
-        ];
-        return haystacks.some((value) => value.toLowerCase().includes(deferredSearch));
-      });
-  }, [reviewWindows, deferredSearch, selectedFilterTags]);
-
-  useEffect(() => {
-    onVisibleReviewWindowIdsChange(queueReviewWindows.map((window) => window.id));
-  }, [queueReviewWindows, onVisibleReviewWindowIdsChange]);
-
   function toggleFilterTag(tagName: string) {
     setSelectedFilterTags((current) =>
       current.includes(tagName)
         ? current.filter((entry) => entry !== tagName)
         : [...current, tagName],
     );
+  }
+
+  function getRecordingStatusLabel(recording: SourceRecordingQueue): string {
+    switch (recording.processing_state) {
+      case "transcribing":
+        return "Transcribing";
+      case "aligning":
+        return "Aligning";
+      case "slicing":
+        return "Slicing";
+      case "alignment_stale":
+        return "Needs Realignment";
+      case "failed":
+        return "Failed";
+      case "sliced":
+        return "Sliced";
+      case "aligned":
+        return "Aligned";
+      case "transcribed":
+        return "Transcribed";
+      default:
+        return "Idle";
+    }
   }
 
   return (
@@ -196,12 +181,34 @@ export default function ClipQueuePane({
           />
         ) : null}
         {workspacePhase === "empty" ? (
-          <div className="empty-state">
-            {workspaceEmptyMessage ?? "No projects are available yet."}
+          <div className="workspace-empty-stack">
+            <div className="empty-state">
+              {workspaceEmptyMessage ?? "No projects are available yet."}
+            </div>
+            {recordings.length > 0 ? (
+              <div className="recording-status-list">
+                <p className="eyebrow">Recordings</p>
+                {recordings.map((recording) => (
+                  <div key={recording.id} className="recording-status-card">
+                    <div className="clip-list-row">
+                      <strong>{recording.id}</strong>
+                      <span className={`review-chip status-${recording.processing_state === "failed" ? "rejected" : recording.processing_state === "sliced" ? "accepted" : "unresolved"}`}>
+                        {getRecordingStatusLabel(recording)}
+                      </span>
+                    </div>
+                    <p>{recording.processing_message ?? "Recording is idle."}</p>
+                    <div className="clip-list-meta">
+                      <span>{formatSeconds(recording.duration_seconds)}</span>
+                      <span>{recording.slice_count} slice{recording.slice_count === 1 ? "" : "s"}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         ) : null}
         {workspacePhase === "ready" && queueClips.length === 0 ? (
-          queueReviewWindows.length === 0 ? <div className="empty-state">No items match the current filters.</div> : null
+          <div className="empty-state">No items match the current filters.</div>
         ) : null}
         {workspacePhase === "ready" ? (
           <>
@@ -209,9 +216,9 @@ export default function ClipQueuePane({
             {queueClips.map((clip, index) => (
               <button
                 key={clip.id}
-                className={`clip-list-item ${activeClipItem?.kind === "slice" && clip.id === activeClipItem.id ? "active" : ""}`}
+                className={`clip-list-item ${clip.id === activeClipItem?.id ? "active" : ""}`}
                 type="button"
-                onClick={() => onSelectClipItem({ kind: "slice", id: clip.id })}
+                onClick={() => onSelectClipItem({ id: clip.id })}
               >
                 <div className="clip-list-row">
                   <strong>
@@ -225,30 +232,6 @@ export default function ClipQueuePane({
                 <div className="clip-list-meta">
                   <span>{formatSeconds(getSliceDuration(clip))}</span>
                   <span>{clip.active_variant_generator_model ?? "source"}</span>
-                </div>
-              </button>
-            ))}
-
-            {queueReviewWindows.length > 0 ? <p className="eyebrow">Review Windows</p> : null}
-            {queueReviewWindows.map((window, index) => (
-              <button
-                key={window.id}
-                className={`clip-list-item ${activeClipItem?.kind === "review_window" && window.id === activeClipItem.id ? "active" : ""}`}
-                type="button"
-                onClick={() => onSelectClipItem({ kind: "review_window", id: window.id })}
-              >
-                <div className="clip-list-row">
-                  <strong>
-                    <span className="order-pill">{index + 1}.</span>
-                  </strong>
-                  <span className={`review-chip status-${window.review_status}`}>
-                    {statusLabels[window.review_status]}
-                  </span>
-                </div>
-                <p>{window.reviewed_transcript || window.rough_transcript}</p>
-                <div className="clip-list-meta">
-                  <span>{formatSeconds(Math.max(window.end_seconds - window.start_seconds, 0))}</span>
-                  <span>review window</span>
                 </div>
               </button>
             ))}

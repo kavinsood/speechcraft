@@ -4,7 +4,7 @@ import { ApiError, fetchProjects } from "./api";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
 import StepPlaceholderPage from "./pages/StepPlaceholderPage";
-import type { ClipLabItemKind, ClipLabItemRef, Project } from "./types";
+import type { ClipLabItemRef, Project } from "./types";
 
 type AppStep = "ingest" | "enhance" | "segment" | "label" | "train" | "deploy";
 type ProjectLoadStatus = "loading" | "ready" | "error";
@@ -60,12 +60,8 @@ function readRouteFromLocation(): AppRoute {
   const step = isAppStep(maybeStep) ? maybeStep : "ingest";
   const searchParams = new URLSearchParams(window.location.search);
   const projectId = searchParams.get("project")?.trim() ?? null;
-  const clipKindRaw = searchParams.get("clip_kind")?.trim() ?? null;
   const clipId = searchParams.get("clip_id")?.trim() ?? null;
-  const clipItem =
-    (clipKindRaw === "slice" || clipKindRaw === "review_window") && clipId
-      ? ({ kind: clipKindRaw as ClipLabItemKind, id: clipId } satisfies ClipLabItemRef)
-      : null;
+  const clipItem = clipId ? ({ id: clipId } satisfies ClipLabItemRef) : null;
 
   return {
     step,
@@ -83,10 +79,8 @@ function writeRouteToLocation(route: AppRoute, replace = false) {
     url.searchParams.delete("project");
   }
   if (route.clipItem) {
-    url.searchParams.set("clip_kind", route.clipItem.kind);
     url.searchParams.set("clip_id", route.clipItem.id);
   } else {
-    url.searchParams.delete("clip_kind");
     url.searchParams.delete("clip_id");
   }
 

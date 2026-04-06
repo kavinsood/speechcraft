@@ -65,12 +65,62 @@ export type SourceRecording = {
   processing_recipe?: string | null;
 };
 
+export type SourceRecordingArtifact = {
+  source_recording_id: string;
+  transcript_text_path?: string | null;
+  transcript_json_path?: string | null;
+  alignment_json_path?: string | null;
+  transcript_status?: string | null;
+  alignment_status?: string | null;
+  transcript_word_count: number;
+  alignment_word_count: number;
+  transcript_updated_at?: string | null;
+  aligned_at?: string | null;
+  alignment_backend?: string | null;
+  artifact_metadata?: Record<string, unknown> | null;
+};
+
+export type ProcessingJob = {
+  id: string;
+  kind:
+    | "import"
+    | "preprocess"
+    | "slice"
+    | "source_transcription"
+    | "source_alignment"
+    | "source_slicing"
+    | "review_window_asr"
+    | "forced_align_and_pack"
+    | "inference"
+    | "export";
+  status: "pending" | "running" | "completed" | "failed";
+  source_recording_id?: string | null;
+  input_payload?: Record<string, unknown> | null;
+  output_payload?: Record<string, unknown> | null;
+  error_message?: string | null;
+  claimed_by?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  heartbeat_at?: string | null;
+  completed_at?: string | null;
+};
+
+export type SourceRecordingQueue = SourceRecording & {
+  duration_seconds: number;
+  slice_count: number;
+  processing_state: string;
+  processing_message?: string | null;
+  active_job?: ProcessingJob | null;
+  artifact?: SourceRecordingArtifact | null;
+};
+
 export type SliceSummary = {
   id: string;
   source_recording_id: string;
   active_variant_id?: string | null;
   active_commit_id?: string | null;
   status: ReviewStatus;
+  is_locked?: boolean;
   duration_seconds: number;
   model_metadata?: Record<string, unknown> | null;
   created_at: string;
@@ -90,10 +140,7 @@ export type Slice = SliceSummary & {
   active_commit?: EditCommit | null;
 };
 
-export type ClipLabItemKind = "slice" | "review_window";
-
 export type ClipLabItemRef = {
-  kind: ClipLabItemKind;
   id: string;
 };
 
@@ -146,13 +193,14 @@ export type ClipLabCapabilities = {
 
 export type ClipLabItem = {
   id: string;
-  kind: ClipLabItemKind;
+  kind: "slice";
   source_recording_id: string;
   source_recording: SourceRecording;
   start_seconds: number;
   end_seconds: number;
   duration_seconds: number;
   status?: ReviewStatus | null;
+  is_locked?: boolean;
   created_at: string;
   transcript?: ClipLabTranscript | null;
   tags: Tag[];
@@ -171,22 +219,6 @@ export type ClipLabItem = {
   commits: ClipLabCommit[];
   active_variant?: ClipLabVariant | null;
   active_commit?: ClipLabCommit | null;
-};
-
-export type ReviewWindowSummary = {
-  id: string;
-  source_recording_id: string;
-  start_seconds: number;
-  end_seconds: number;
-  rough_transcript: string;
-  reviewed_transcript: string;
-  review_status: ReviewStatus;
-  tags: Tag[];
-  order_index: number;
-  window_metadata?: Record<string, unknown> | null;
-  can_undo: boolean;
-  can_redo: boolean;
-  created_at: string;
 };
 
 export type ImportBatch = {
