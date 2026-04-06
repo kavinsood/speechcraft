@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 import numpy as np
+from sqlalchemy import func
 from sqlalchemy import update as sql_update
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, SQLModel, create_engine, delete, select
@@ -34,13 +35,9 @@ from .models import (
     ClipLabItemView,
     ClipLabTranscriptView,
     ClipLabVariantView,
-    DatasetProcessingRun,
-    DatasetProcessingRunRequest,
-    DatasetProcessingRunView,
     EditCommit,
     ExportRun,
     ExportPreview,
-    ForcedAlignAndPackRequest,
     ImportBatch,
     ImportBatchCreate,
     JobKind,
@@ -51,11 +48,6 @@ from .models import (
     ProjectSummary,
     ReferenceAsset,
     ReferenceAssetCreate,
-    ReviewWindow,
-    ReviewWindowAsrRequest,
-    ReviewWindowRevision,
-    ReviewWindowVariant,
-    ReviewWindowView,
     ReviewStatus,
     SliceRevision,
     SliceSaveRequest,
@@ -68,13 +60,18 @@ from .models import (
     SliceTagUpdate,
     SliceStatusUpdate,
     SliceTranscriptUpdate,
+    SourceAlignmentRequest,
+    SourceRecordingArtifact,
+    SourceRecordingArtifactView,
+    SourceRecordingQueueView,
+    SourceSlicingRequest,
+    SourceTranscriptionRequest,
     SourceRecordingView,
     TagPayload,
     TagView,
     SourceRecording,
     SourceRecordingCreate,
     RecordingDerivativeCreate,
-    SlicerHandoffRequest,
     Tag,
     TranscriptSummaryView,
     TranscriptView,
@@ -82,9 +79,11 @@ from .models import (
     WaveformPeaks,
     utc_now,
 )
-from .slicer_core import pack_aligned_words
+from .slicer_algo import SlicerConfig, plan_slices
 
 DEFAULT_PROCESSING_JOB_STALE_AFTER_SECONDS = 60.0
+LOCKED_SLICE_OVERLAP_RATIO_THRESHOLD = 0.10
+LOCKED_SLICE_DRIFT_WARNING_SECONDS = 0.08
 
 DATA_VERSION_EXTERNAL_VARIANT_REHOME = 1
 DATA_VERSION_SLICE_REVISION_HISTORY = 2
@@ -142,8 +141,9 @@ class SQLiteRepository:
         self._migrate_enum_storage()
         self._migrate_editcommit_schema()
         self._migrate_processingjob_schema()
-        self._migrate_dataset_processing_run_schema()
-        self._migrate_reviewwindow_schema()
+        self._purge_legacy_review_window_schema()
+        self._migrate_slice_schema()
+        self._migrate_source_recording_artifact_rows()
         self._seed_if_needed()
         self._run_data_migrations()
 
@@ -166,27 +166,6 @@ class SQLiteRepository:
         with self._session() as session:
             return self._project_summary(session, self._get_batch(session, project_id))
 
-    def list_review_windows(self, recording_id: str) -> list[ReviewWindowView]:
-        with self._session() as session:
-            self._get_source_recording(session, recording_id)
-            windows = session.exec(
-                select(ReviewWindow)
-                .where(ReviewWindow.source_recording_id == recording_id)
-                .order_by(ReviewWindow.order_index, ReviewWindow.created_at)
-            ).all()
-            return [self._review_window_view(window, session) for window in windows]
-
-    def list_project_review_windows(self, project_id: str) -> list[ReviewWindowView]:
-        with self._session() as session:
-            self._get_batch(session, project_id)
-            windows = session.exec(
-                select(ReviewWindow)
-                .join(SourceRecording, SourceRecording.id == ReviewWindow.source_recording_id)
-                .where(SourceRecording.batch_id == project_id)
-                .order_by(SourceRecording.id, ReviewWindow.order_index, ReviewWindow.created_at)
-            ).all()
-            return [self._review_window_view(window, session) for window in windows]
-
     def get_project_slices(self, project_id: str) -> list[SliceSummary]:
         with self._session() as session:
             self._get_batch(session, project_id)
@@ -196,19 +175,151 @@ class SQLiteRepository:
         with self._session() as session:
             return self._get_slice_detail(session, slice_id)
 
-    def get_clip_lab_item(self, item_kind: str, item_id: str) -> ClipLabItemView:
+    def get_slice_clip_lab_item(self, slice_id: str) -> ClipLabItemView:
         with self._session() as session:
-            if item_kind == "slice":
-                return self._to_clip_lab_item_from_slice(self._get_loaded_slice(session, item_id))
-            if item_kind == "review_window":
-                window = self._get_review_window(session, item_id)
-                recording = self._get_source_recording(session, window.source_recording_id)
-                return self._to_clip_lab_item_from_review_window(window, recording, session)
-            raise ValueError(f"Unsupported Clip Lab item kind: {item_kind}")
+            return self._to_clip_lab_item_from_slice(self._get_loaded_slice(session, slice_id))
 
     def get_processing_job(self, job_id: str) -> ProcessingJobView:
         with self._session() as session:
             return self._processing_job_view(self._get_processing_job(session, job_id))
+
+    def get_source_recording_artifact(self, recording_id: str) -> SourceRecordingArtifactView:
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            artifact = self._ensure_source_recording_artifact(session, recording)
+            return self._source_recording_artifact_view(artifact)  # type: ignore[return-value]
+
+    def list_project_recordings(self, project_id: str) -> list[SourceRecordingQueueView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            recordings = session.exec(
+                select(SourceRecording)
+                .where(SourceRecording.batch_id == project_id)
+                .options(
+                    selectinload(SourceRecording.source_artifact),
+                    selectinload(SourceRecording.processing_jobs),
+                )
+                .order_by(SourceRecording.id.asc())
+            ).all()
+            if not recordings:
+                return []
+
+            slice_counts = dict(
+                session.exec(
+                    select(Slice.source_recording_id, func.count(Slice.id))
+                    .where(Slice.source_recording_id.in_([recording.id for recording in recordings]))
+                    .group_by(Slice.source_recording_id)
+                ).all()
+            )
+            return [
+                self._source_recording_queue_view(
+                    recording,
+                    slice_count=int(slice_counts.get(recording.id, 0) or 0),
+                )
+                for recording in recordings
+            ]
+
+    def set_source_recording_artifact_paths(
+        self,
+        recording_id: str,
+        *,
+        transcript_text_path: str | None = None,
+        transcript_json_path: str | None = None,
+        alignment_json_path: str | None = None,
+        transcript_status: str | None = None,
+        alignment_status: str | None = None,
+        transcript_word_count: int | None = None,
+        alignment_word_count: int | None = None,
+        alignment_backend: str | None = None,
+        artifact_metadata: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> SourceRecordingArtifactView:
+        timestamp = self._as_utc(now) if now is not None else utc_now()
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            artifact = self._ensure_source_recording_artifact(session, recording)
+            if transcript_text_path is not None:
+                artifact.transcript_text_path = transcript_text_path
+                artifact.transcript_updated_at = timestamp
+            if transcript_json_path is not None:
+                artifact.transcript_json_path = transcript_json_path
+                artifact.transcript_updated_at = timestamp
+            if alignment_json_path is not None:
+                artifact.alignment_json_path = alignment_json_path
+                artifact.aligned_at = timestamp
+            if transcript_status is not None:
+                artifact.transcript_status = transcript_status
+            if alignment_status is not None:
+                artifact.alignment_status = alignment_status
+            if transcript_word_count is not None:
+                artifact.transcript_word_count = transcript_word_count
+            if alignment_word_count is not None:
+                artifact.alignment_word_count = alignment_word_count
+            if alignment_backend is not None:
+                artifact.alignment_backend = alignment_backend
+            if artifact_metadata is not None:
+                artifact.artifact_metadata = artifact_metadata
+            session.add(artifact)
+            session.commit()
+            session.refresh(artifact)
+            return self._source_recording_artifact_view(artifact)  # type: ignore[return-value]
+
+    def enqueue_source_transcription(
+        self,
+        recording_id: str,
+        payload: SourceTranscriptionRequest,
+    ) -> ProcessingJobView:
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            job = ProcessingJob(
+                id=self._new_id("job"),
+                kind=JobKind.SOURCE_TRANSCRIPTION,
+                status=JobStatus.PENDING,
+                source_recording_id=recording.id,
+                input_payload=payload.model_dump(mode="json"),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return self._processing_job_view(job)
+
+    def enqueue_source_alignment(
+        self,
+        recording_id: str,
+        payload: SourceAlignmentRequest,
+    ) -> ProcessingJobView:
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            job = ProcessingJob(
+                id=self._new_id("job"),
+                kind=JobKind.SOURCE_ALIGNMENT,
+                status=JobStatus.PENDING,
+                source_recording_id=recording.id,
+                input_payload=payload.model_dump(mode="json"),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return self._processing_job_view(job)
+
+    def enqueue_source_slicing(
+        self,
+        recording_id: str,
+        payload: SourceSlicingRequest,
+    ) -> ProcessingJobView:
+        with self._session() as session:
+            recording = self._get_source_recording(session, recording_id)
+            job = ProcessingJob(
+                id=self._new_id("job"),
+                kind=JobKind.SOURCE_SLICING,
+                status=JobStatus.PENDING,
+                source_recording_id=recording.id,
+                input_payload=payload.model_dump(mode="json"),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return self._processing_job_view(job)
 
     def list_source_recording_jobs(self, recording_id: str) -> list[ProcessingJobView]:
         with self._session() as session:
@@ -219,83 +330,6 @@ class SQLiteRepository:
                 .order_by(ProcessingJob.created_at.desc())
             ).all()
             return [self._processing_job_view(job) for job in jobs]
-
-    def start_dataset_processing_run(
-        self,
-        recording_id: str,
-        payload: DatasetProcessingRunRequest,
-    ) -> DatasetProcessingRunView:
-        with self._session() as session:
-            recording = self._get_source_recording(session, recording_id)
-            existing_active_run = session.exec(
-                select(DatasetProcessingRun)
-                .where(
-                    DatasetProcessingRun.source_recording_id == recording.id,
-                    DatasetProcessingRun.status.in_(["pending", "asr_running", "alignment_running"]),
-                )
-                .order_by(DatasetProcessingRun.started_at.desc())
-            ).first()
-            if existing_active_run is not None:
-                raise ValueError("A dataset processing run is already active for this source recording")
-
-            if payload.review_window_ids:
-                ordered_windows = self._load_selected_review_windows_for_recording(
-                    session,
-                    recording,
-                    payload.review_window_ids,
-                    empty_selection_message="Dataset processing run requires at least one review window",
-                )
-            else:
-                ordered_windows = self._list_recording_review_windows(session, recording.id)
-                if not ordered_windows:
-                    raise ValueError("Dataset processing run requires at least one review window")
-
-            run = DatasetProcessingRun(
-                id=self._new_id("dataset-run"),
-                source_recording_id=recording.id,
-                status="asr_running",
-                phase="asr",
-                total_review_windows=len(ordered_windows),
-                alignment_total=0,
-                current_message=f"ASR queued for {len(ordered_windows)} review windows",
-            )
-            session.add(run)
-            session.flush()
-
-            for window in ordered_windows:
-                session.add(
-                    ProcessingJob(
-                        id=self._new_id("job"),
-                        kind=JobKind.REVIEW_WINDOW_ASR,
-                        status=JobStatus.PENDING,
-                        source_recording_id=recording.id,
-                        dataset_processing_run_id=run.id,
-                        target_review_window_id=window.id,
-                        input_payload={
-                            "target_kind": "review_window",
-                            "review_window_ids": [window.id],
-                            "model_name": payload.model_name,
-                            "model_version": payload.model_version,
-                            "language_hint": payload.language_hint,
-                        },
-                    )
-                )
-
-            session.commit()
-            session.refresh(run)
-            return self._dataset_processing_run_view(run)
-
-    def get_source_recording_processing_status(self, recording_id: str) -> DatasetProcessingRunView:
-        with self._session() as session:
-            self._get_source_recording(session, recording_id)
-            run = session.exec(
-                select(DatasetProcessingRun)
-                .where(DatasetProcessingRun.source_recording_id == recording_id)
-                .order_by(DatasetProcessingRun.started_at.desc(), DatasetProcessingRun.id.desc())
-            ).first()
-            if run is None:
-                raise KeyError(recording_id)
-            return self._dataset_processing_run_view(run)
 
     def list_export_runs(self, project_id: str) -> list[ExportRun]:
         with self._session() as session:
@@ -403,12 +437,21 @@ class SQLiteRepository:
                 transcript.modified_text = payload.modified_text
                 transcript.is_modified = payload.modified_text != transcript.original_text
                 session.add(transcript)
+                self._patch_source_transcript_for_slice(
+                    session,
+                    slice_row,
+                    payload.modified_text,
+                    remove_patch=not transcript.is_modified,
+                )
 
             if payload.tags is not None:
                 self._replace_slice_tags(session, slice_row, payload.tags)
 
             if payload.status is not None:
                 slice_row.status = payload.status
+
+            if state_changed:
+                slice_row.is_locked = True
 
             self._touch_slice(slice_row)
             session.add(slice_row)
@@ -446,82 +489,6 @@ class SQLiteRepository:
             SliceSaveRequest(tags=payload.tags, message="Tags updated"),
         )
 
-    def save_review_window_state(self, review_window_id: str, payload: SliceSaveRequest) -> ClipLabItemView:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            active_revision = self._get_active_review_window_revision(session, window)
-            current_transcript = active_revision.transcript_text
-            current_tags = self._normalized_tag_payloads(
-                [TagPayload.model_validate(tag) for tag in active_revision.tags_payload or []]
-            )
-            next_transcript = payload.modified_text if payload.modified_text is not None else current_transcript
-            next_tags = (
-                self._normalized_tag_payloads(payload.tags)
-                if payload.tags is not None
-                else current_tags
-            )
-            next_status = payload.status if payload.status is not None else active_revision.status
-
-            state_changed = (
-                next_transcript != current_transcript
-                or next_tags != current_tags
-                or next_status != active_revision.status
-            )
-            if not state_changed and not payload.is_milestone:
-                message_only_request = (
-                    payload.message is not None
-                    and payload.modified_text is None
-                    and payload.tags is None
-                    and payload.status is None
-                )
-                if message_only_request:
-                    raise SliceSaveValidationError("message requires milestone or state change")
-                return self._to_clip_lab_item_from_review_window(window, recording, session)
-
-            self._append_review_window_revision(
-                session,
-                window,
-                transcript_text=next_transcript,
-                status=next_status,
-                tags=[TagPayload.model_validate(tag) for tag in next_tags],
-                edl_operations=list(active_revision.edl_operations or []),
-                active_variant_id=active_revision.active_variant_id_snapshot,
-                message=payload.message,
-                is_milestone=payload.is_milestone,
-            )
-            session.commit()
-            session.expire_all()
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            return self._to_clip_lab_item_from_review_window(window, recording, session)
-
-    def update_review_window_status(self, review_window_id: str, payload: SliceStatusUpdate) -> ClipLabItemView:
-        return self.save_review_window_state(
-            review_window_id,
-            SliceSaveRequest(
-                status=payload.status,
-                message=f"Status: {payload.status.value.replace('_', ' ')}",
-            ),
-        )
-
-    def update_review_window_transcript(
-        self,
-        review_window_id: str,
-        payload: SliceTranscriptUpdate,
-    ) -> ClipLabItemView:
-        return self.save_review_window_state(
-            review_window_id,
-            SliceSaveRequest(modified_text=payload.modified_text, message="Transcript updated"),
-        )
-
-    def update_review_window_tags(self, review_window_id: str, payload: SliceTagUpdate) -> ClipLabItemView:
-        return self.save_review_window_state(
-            review_window_id,
-            SliceSaveRequest(tags=payload.tags, message="Tags updated"),
-        )
-
     def append_edl_operation(self, slice_id: str, payload: SliceEdlUpdate) -> SliceDetail:
         with self._session() as session:
             slice_row = self._get_loaded_slice(session, slice_id)
@@ -529,6 +496,7 @@ class SQLiteRepository:
                 *self._collect_edl_operations(slice_row),
                 payload.model_dump(mode="json"),
             ]
+            slice_row.is_locked = True
             self._touch_slice(slice_row)
             session.add(slice_row)
             session.flush()
@@ -543,36 +511,6 @@ class SQLiteRepository:
             detail = self._get_slice_detail(session, slice_id)
         self._warm_slice_artifacts_for_id(slice_id)
         return detail
-
-    def append_review_window_edl_operation(
-        self,
-        review_window_id: str,
-        payload: SliceEdlUpdate,
-    ) -> ClipLabItemView:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            active_revision = self._get_active_review_window_revision(session, window)
-            next_operations = [
-                *list(active_revision.edl_operations or []),
-                payload.model_dump(mode="json"),
-            ]
-            self._append_review_window_revision(
-                session,
-                window,
-                transcript_text=active_revision.transcript_text,
-                status=active_revision.status,
-                tags=self._review_window_tag_payloads(active_revision),
-                edl_operations=next_operations,
-                active_variant_id=active_revision.active_variant_id_snapshot,
-                message=self._edl_message(payload),
-            )
-            session.commit()
-            session.expire_all()
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            return self._to_clip_lab_item_from_review_window(window, recording, session)
 
     def undo_slice(self, slice_id: str) -> SliceDetail:
         with self._session() as session:
@@ -602,38 +540,6 @@ class SQLiteRepository:
             detail = self._get_slice_detail(session, slice_id)
         self._warm_slice_artifacts_for_id(slice_id)
         return detail
-
-    def undo_review_window(self, review_window_id: str) -> ClipLabItemView:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            active_revision = self._get_active_review_window_revision(session, window)
-            if active_revision.parent_revision_id is None:
-                raise ValueError("No earlier edit state is available")
-            target_revision = self._get_review_window_revision(session, active_revision.parent_revision_id)
-            self._set_active_review_window_revision(session, window, target_revision)
-            session.commit()
-            session.expire_all()
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            return self._to_clip_lab_item_from_review_window(window, recording, session)
-
-    def redo_review_window(self, review_window_id: str) -> ClipLabItemView:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            active_revision = self._get_active_review_window_revision(session, window)
-            redo_target = self._get_review_window_redo_target(session, window, active_revision)
-            if redo_target is None:
-                raise ValueError("No newer edit state is available")
-            self._set_active_review_window_revision(session, window, redo_target)
-            session.commit()
-            session.expire_all()
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            return self._to_clip_lab_item_from_review_window(window, recording, session)
 
     def split_slice(self, slice_id: str, payload: SliceSplitRequest) -> list[SliceSummary]:
         with self._session() as session:
@@ -894,186 +800,6 @@ class SQLiteRepository:
         self._warm_slice_artifacts_for_id(merged_id)
         return summaries
 
-    def split_review_window(self, review_window_id: str, payload: SliceSplitRequest) -> list[ReviewWindowView]:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            active_revision = self._get_active_review_window_revision(session, window)
-            active_variant = self._get_active_review_window_variant(session, window, active_revision)
-            current_duration = self._review_window_duration(window, active_revision, active_variant)
-            split_at = payload.split_at_seconds
-            if split_at <= 0 or split_at >= current_duration:
-                raise ValueError("Split point must be inside the clip duration")
-            if active_revision.edl_operations:
-                raise ValueError("Split is only supported before ReviewWindow waveform edits change timing")
-
-            transcript_text = active_revision.transcript_text
-            left_text, right_text = self._split_transcript_text(
-                transcript_text,
-                split_at / current_duration if current_duration > 0 else 0.5,
-            )
-            current_audio = self._render_review_window_audio_bytes(session, window)
-            left_bytes = self._apply_edl_to_wav_bytes(
-                current_audio,
-                [{"op": "crop", "range": {"start_seconds": 0.0, "end_seconds": split_at}}],
-            )
-            right_bytes = self._apply_edl_to_wav_bytes(
-                current_audio,
-                [{"op": "crop", "range": {"start_seconds": split_at, "end_seconds": current_duration}}],
-            )
-            source_duration = max(window.end_seconds - window.start_seconds, 0.001)
-            source_split = window.start_seconds + (source_duration * (split_at / max(current_duration, 0.001)))
-            left_window = ReviewWindow(
-                id=self._new_id("review-window"),
-                source_recording_id=window.source_recording_id,
-                start_seconds=window.start_seconds,
-                end_seconds=min(max(source_split, window.start_seconds + 0.001), window.end_seconds),
-                rough_transcript=left_text,
-                order_index=window.order_index,
-                window_metadata={
-                    **dict(window.window_metadata or {}),
-                    "parent_review_window_id": window.id,
-                    "split_side": "left",
-                    "source_boundary_mode": "proportional_unedited_mapping",
-                    "source_split_seconds": round(source_split, 6),
-                },
-                created_at=utc_now(),
-            )
-            right_window = ReviewWindow(
-                id=self._new_id("review-window"),
-                source_recording_id=window.source_recording_id,
-                start_seconds=max(min(source_split, window.end_seconds - 0.001), window.start_seconds),
-                end_seconds=window.end_seconds,
-                rough_transcript=right_text,
-                order_index=window.order_index + 1,
-                window_metadata={
-                    **dict(window.window_metadata or {}),
-                    "parent_review_window_id": window.id,
-                    "split_side": "right",
-                    "source_boundary_mode": "proportional_unedited_mapping",
-                    "source_split_seconds": round(source_split, 6),
-                },
-                created_at=utc_now(),
-            )
-            session.add(left_window)
-            session.add(right_window)
-            session.flush()
-            self._shift_review_window_order_indices(
-                session,
-                window.source_recording_id,
-                window.order_index,
-                1,
-                exclude_ids={window.id, left_window.id, right_window.id},
-            )
-            left_variant = self._create_review_window_variant_from_bytes(
-                session,
-                left_window,
-                left_bytes,
-                generator_model="split-view",
-                is_original=True,
-            )
-            right_variant = self._create_review_window_variant_from_bytes(
-                session,
-                right_window,
-                right_bytes,
-                generator_model="split-view",
-                is_original=True,
-            )
-            inherited_tags = self._review_window_tag_payloads(active_revision)
-            self._append_review_window_revision(
-                session,
-                left_window,
-                transcript_text=left_text,
-                status=ReviewStatus.UNRESOLVED,
-                tags=inherited_tags,
-                edl_operations=[],
-                active_variant_id=left_variant.id,
-                message="Split review window (left)",
-            )
-            self._append_review_window_revision(
-                session,
-                right_window,
-                transcript_text=right_text,
-                status=ReviewStatus.UNRESOLVED,
-                tags=inherited_tags,
-                edl_operations=[],
-                active_variant_id=right_variant.id,
-                message="Split review window (right)",
-            )
-            session.delete(window)
-            session.commit()
-            return self._list_recording_review_window_views(session, recording.id)
-
-    def merge_with_next_review_window(self, review_window_id: str) -> list[ReviewWindowView]:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            current_windows = self._list_recording_review_windows(session, recording.id)
-            next_window = None
-            for index, candidate in enumerate(current_windows):
-                if candidate.id == review_window_id and index + 1 < len(current_windows):
-                    next_window = current_windows[index + 1]
-                    break
-            if next_window is None:
-                raise ValueError("No next review window is available for merge")
-            self._ensure_review_window_baseline(session, window, recording)
-            self._ensure_review_window_baseline(session, next_window, recording)
-            first_revision = self._get_active_review_window_revision(session, window)
-            second_revision = self._get_active_review_window_revision(session, next_window)
-            merged_bytes = self._merge_wav_bytes(
-                self._render_review_window_audio_bytes(session, window),
-                self._render_review_window_audio_bytes(session, next_window),
-            )
-            merged_window = ReviewWindow(
-                id=self._new_id("review-window"),
-                source_recording_id=window.source_recording_id,
-                start_seconds=min(window.start_seconds, next_window.start_seconds),
-                end_seconds=max(window.end_seconds, next_window.end_seconds),
-                rough_transcript=self._merge_transcript_text(first_revision.transcript_text, second_revision.transcript_text),
-                order_index=min(window.order_index, next_window.order_index),
-                window_metadata={
-                    **dict(window.window_metadata or {}),
-                    "merged_review_window_ids": [window.id, next_window.id],
-                    "merge_boundary_mode": "concatenate_current_rendered_audio",
-                },
-                created_at=utc_now(),
-            )
-            session.add(merged_window)
-            session.flush()
-            merged_variant = self._create_review_window_variant_from_bytes(
-                session,
-                merged_window,
-                merged_bytes,
-                generator_model="merge",
-                is_original=True,
-            )
-            merged_tags_map = {
-                tag.name.lower(): tag
-                for tag in [*self._review_window_tag_payloads(first_revision), *self._review_window_tag_payloads(second_revision)]
-            }
-            self._append_review_window_revision(
-                session,
-                merged_window,
-                transcript_text=self._merge_transcript_text(first_revision.transcript_text, second_revision.transcript_text),
-                status=ReviewStatus.UNRESOLVED,
-                tags=list(merged_tags_map.values()),
-                edl_operations=[],
-                active_variant_id=merged_variant.id,
-                message="Merged review window baseline",
-            )
-            session.delete(window)
-            session.delete(next_window)
-            self._shift_review_window_order_indices(
-                session,
-                recording.id,
-                next_window.order_index,
-                -1,
-                exclude_ids={merged_window.id},
-            )
-            session.commit()
-            return self._list_recording_review_window_views(session, recording.id)
-
     def get_export_preview(self, project_id: str) -> ExportPreview:
         with self._session() as session:
             batch = self._get_batch(session, project_id)
@@ -1143,18 +869,6 @@ class SQLiteRepository:
             media_path = self._materialize_slice_media_path(session, slice_row)
             return self._ensure_waveform_peaks_cache(slice_row, media_path, safe_bins)
 
-    def get_clip_lab_waveform_peaks(self, item_kind: str, item_id: str, bins: int = 120) -> WaveformPeaks:
-        safe_bins = max(32, min(bins, 2048))
-        if item_kind == "slice":
-            return self.get_waveform_peaks(item_id, safe_bins)
-        if item_kind != "review_window":
-            raise ValueError(f"Unsupported Clip Lab item kind: {item_kind}")
-
-        with self._session() as session:
-            window = self._get_review_window(session, item_id)
-            audio_bytes = self._render_review_window_audio_bytes(session, window)
-            return WaveformPeaks(clip_id=item_id, bins=safe_bins, peaks=self._extract_waveform_peaks_from_bytes(audio_bytes, safe_bins))
-
     def get_clip_audio_bytes(self, slice_id: str) -> bytes:
         with self._session() as session:
             slice_row = self._get_loaded_slice(session, slice_id)
@@ -1173,12 +887,7 @@ class SQLiteRepository:
     ) -> Path:
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
-            return self._materialize_review_window_media_path(recording, start_seconds, end_seconds)
-
-    def get_review_window_media_path(self, review_window_id: str) -> Path:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            return self._materialize_review_window_render_path(session, window)
+            return self._materialize_source_window_media_path(recording, start_seconds, end_seconds)
 
     def get_variant_media_path(self, variant_id: str) -> Path:
         with self._session() as session:
@@ -1205,6 +914,8 @@ class SQLiteRepository:
             self._validate_audio_asset(Path(payload.file_path), payload.sample_rate, payload.num_channels, payload.num_samples)
             recording = SourceRecording(**payload.model_dump())
             session.add(recording)
+            session.flush()
+            self._ensure_source_recording_artifact(session, recording)
             session.commit()
             session.refresh(recording)
             return recording
@@ -1224,85 +935,192 @@ class SQLiteRepository:
                 processing_recipe=payload.processing_recipe,
             )
             session.add(recording)
+            session.flush()
+            self._ensure_source_recording_artifact(session, recording)
             session.commit()
             session.refresh(recording)
             return recording
 
-    def register_slicer_chunks(self, recording_id: str, payload: SlicerHandoffRequest) -> list[ReviewWindowView]:
-        with self._session() as session:
-            recording = self._get_source_recording(session, recording_id)
-            normalized_windows = self._normalize_review_window_chunks(recording, payload)
-            session.exec(delete(ReviewWindow).where(ReviewWindow.source_recording_id == recording.id))
-            created_windows: list[ReviewWindow] = []
-            for chunk in normalized_windows:
-                window = ReviewWindow(
-                    id=self._new_id("review-window"),
-                    source_recording_id=recording.id,
-                    start_seconds=float(chunk["start_seconds"]),
-                    end_seconds=float(chunk["end_seconds"]),
-                    rough_transcript=str(chunk["rough_transcript"]),
-                    order_index=int(chunk["order_index"]),
-                    window_metadata=dict(chunk["window_metadata"] or {}),
-                )
-                session.add(window)
-                created_windows.append(window)
-            session.flush()
-            for window in created_windows:
-                self._ensure_review_window_baseline(session, window, recording)
-            session.commit()
-            return [self._review_window_view(window, session) for window in created_windows]
-
-    def enqueue_forced_align_and_pack(
+    def _ensure_source_recording_artifact(
         self,
-        recording_id: str,
-        payload: ForcedAlignAndPackRequest,
-    ) -> ProcessingJobView:
-        with self._session() as session:
-            recording = self._get_source_recording(session, recording_id)
-            self._validate_forced_align_request(payload)
-            self._load_forced_align_review_windows(session, recording, payload.review_window_ids)
-            job = ProcessingJob(
-                id=self._new_id("job"),
-                kind=JobKind.FORCED_ALIGN_AND_PACK,
-                status=JobStatus.PENDING,
-                source_recording_id=recording.id,
-                input_payload=payload.model_dump(mode="json"),
-            )
-            session.add(job)
-            session.commit()
-            session.refresh(job)
-            return self._processing_job_view(job)
+        session: Session,
+        recording: SourceRecording,
+    ) -> SourceRecordingArtifact:
+        artifact = session.get(SourceRecordingArtifact, recording.id)
+        if artifact is not None:
+            return artifact
+        artifact = SourceRecordingArtifact(
+            source_recording_id=recording.id,
+            transcript_status="missing",
+            alignment_status="missing",
+            artifact_metadata={},
+        )
+        session.add(artifact)
+        session.flush()
+        return artifact
 
-    def enqueue_review_window_asr(
+    def _source_recording_transcript_base_path(self, recording_id: str) -> Path:
+        return self._source_recording_artifact_dir(recording_id) / "transcript.base.txt"
+
+    def _source_recording_transcript_effective_path(self, recording_id: str) -> Path:
+        return self._source_recording_artifact_dir(recording_id) / "transcript.txt"
+
+    def _source_recording_alignment_path(self, recording_id: str) -> Path:
+        return self._source_recording_artifact_dir(recording_id) / "alignment.json"
+
+    def _source_recording_alignment_summary_path(self, recording_id: str) -> Path:
+        return self._source_recording_artifact_dir(recording_id) / "alignment.summary.json"
+
+    def _source_artifact_metadata(self, artifact: SourceRecordingArtifact) -> dict[str, Any]:
+        return dict(artifact.artifact_metadata or {})
+
+    def _source_artifact_patches(self, artifact: SourceRecordingArtifact) -> list[dict[str, Any]]:
+        metadata = self._source_artifact_metadata(artifact)
+        raw_patches = metadata.get("transcript_patches")
+        if not isinstance(raw_patches, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for patch in raw_patches:
+            if not isinstance(patch, dict):
+                continue
+            try:
+                start_index = int(patch["start_word_index"])
+                end_index = int(patch["end_word_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            normalized.append(
+                {
+                    "slice_id": str(patch.get("slice_id") or ""),
+                    "start_word_index": start_index,
+                    "end_word_index": end_index,
+                    "text": str(patch.get("text") or ""),
+                    "updated_at": str(patch.get("updated_at") or ""),
+                }
+            )
+        normalized.sort(key=lambda item: (item["start_word_index"], item["end_word_index"], item["slice_id"]))
+        return normalized
+
+    def _render_effective_source_transcript(
         self,
+        artifact: SourceRecordingArtifact,
+    ) -> tuple[str, int]:
+        metadata = self._source_artifact_metadata(artifact)
+        base_path_raw = metadata.get("base_transcript_text_path") or artifact.transcript_text_path
+        if not base_path_raw:
+            raise ValueError("Source transcript artifact is missing a base transcript path")
+        base_path = Path(str(base_path_raw)).expanduser().resolve()
+        if not base_path.exists():
+            raise ValueError(f"Source transcript base file not found: {base_path}")
+
+        base_tokens = base_path.read_text(encoding="utf-8").split()
+        patches = self._source_artifact_patches(artifact)
+        if not patches:
+            rendered = " ".join(base_tokens).strip()
+            return rendered, len(base_tokens)
+
+        output_tokens: list[str] = []
+        cursor = 0
+        for patch in patches:
+            start_index = max(0, min(int(patch["start_word_index"]), len(base_tokens)))
+            end_index = max(start_index, min(int(patch["end_word_index"]), len(base_tokens) - 1))
+            if start_index < cursor:
+                continue
+            output_tokens.extend(base_tokens[cursor:start_index])
+            replacement_tokens = str(patch.get("text") or "").split()
+            output_tokens.extend(replacement_tokens)
+            cursor = end_index + 1
+        output_tokens.extend(base_tokens[cursor:])
+        rendered = " ".join(token for token in output_tokens if token).strip()
+        return rendered, len(output_tokens)
+
+    def _persist_effective_source_transcript(
+        self,
+        artifact: SourceRecordingArtifact,
+    ) -> tuple[str, int]:
+        rendered_text, token_count = self._render_effective_source_transcript(artifact)
+        target_path = self._source_recording_transcript_effective_path(artifact.source_recording_id)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text((rendered_text + "\n") if rendered_text else "", encoding="utf-8")
+        artifact.transcript_text_path = str(target_path)
+        artifact.transcript_word_count = token_count
+        artifact.transcript_updated_at = utc_now()
+        return rendered_text, token_count
+
+    def _patch_source_transcript_for_slice(
+        self,
+        session: Session,
+        slice_row: Slice,
+        modified_text: str,
+        *,
+        remove_patch: bool = False,
+    ) -> None:
+        metadata = self._slice_metadata(slice_row)
+        try:
+            start_index = int(metadata["source_word_start_index"])
+            end_index = int(metadata["source_word_end_index"])
+        except (KeyError, TypeError, ValueError):
+            return
+
+        recording = slice_row.source_recording or self._get_source_recording(session, slice_row.source_recording_id)
+        artifact = self._ensure_source_recording_artifact(session, recording)
+        artifact_metadata = self._source_artifact_metadata(artifact)
+        if not artifact_metadata.get("base_transcript_text_path") and artifact.transcript_text_path:
+            current_path = Path(str(artifact.transcript_text_path)).expanduser().resolve()
+            if current_path.exists():
+                base_path = self._source_recording_transcript_base_path(recording.id)
+                base_path.parent.mkdir(parents=True, exist_ok=True)
+                if current_path != base_path:
+                    shutil.copyfile(current_path, base_path)
+                artifact_metadata["base_transcript_text_path"] = str(base_path)
+        patches = [
+            patch
+            for patch in self._source_artifact_patches(artifact)
+            if str(patch.get("slice_id") or "") != slice_row.id
+        ]
+        if not remove_patch:
+            patches.append(
+                {
+                    "slice_id": slice_row.id,
+                    "start_word_index": start_index,
+                    "end_word_index": end_index,
+                    "text": modified_text,
+                    "updated_at": utc_now().isoformat(),
+                }
+            )
+        patches.sort(key=lambda item: (item["start_word_index"], item["end_word_index"], item["slice_id"]))
+        artifact_metadata["transcript_patches"] = patches
+        artifact_metadata["last_transcript_patch_slice_id"] = slice_row.id
+        artifact.artifact_metadata = artifact_metadata
+        self._persist_effective_source_transcript(artifact)
+        artifact.transcript_status = "patched"
+        artifact.alignment_status = "stale"
+        session.add(artifact)
+
+    def _active_recording_slices(
+        self,
+        session: Session,
         recording_id: str,
-        payload: ReviewWindowAsrRequest,
-    ) -> ProcessingJobView:
-        with self._session() as session:
-            recording = self._get_source_recording(session, recording_id)
-            ordered_windows = self._load_selected_review_windows_for_recording(
-                session,
-                recording,
-                payload.review_window_ids,
-                empty_selection_message="ReviewWindow ASR job requires at least one review window",
+    ) -> list[Slice]:
+        slices = session.exec(
+            select(Slice)
+            .where(Slice.source_recording_id == recording_id)
+            .options(
+                selectinload(Slice.source_recording),
+                selectinload(Slice.transcript),
+                selectinload(Slice.tags),
+                selectinload(Slice.variants),
+                selectinload(Slice.commits),
+                selectinload(Slice.active_variant),
+                selectinload(Slice.active_commit),
             )
-            job = ProcessingJob(
-                id=self._new_id("job"),
-                kind=JobKind.REVIEW_WINDOW_ASR,
-                status=JobStatus.PENDING,
-                source_recording_id=recording.id,
-                input_payload={
-                    "target_kind": "review_window",
-                    "review_window_ids": [window.id for window in ordered_windows],
-                    "model_name": payload.model_name,
-                    "model_version": payload.model_version,
-                    "language_hint": payload.language_hint,
-                },
-            )
-            session.add(job)
-            session.commit()
-            session.refresh(job)
-            return self._processing_job_view(job)
+        ).all()
+        return sorted(
+            [slice_row for slice_row in slices if not self._slice_metadata(slice_row).get("is_superseded", False)],
+            key=lambda slice_row: (
+                int(self._slice_metadata(slice_row).get("order_index", 0)),
+                self._as_utc(slice_row.created_at),
+            ),
+        )
 
     def fail_stale_processing_jobs(
         self,
@@ -1509,70 +1327,6 @@ class SQLiteRepository:
         self._warm_slice_artifacts_for_id(slice_id)
         return detail
 
-    def run_review_window_variant(
-        self,
-        review_window_id: str,
-        payload: AudioVariantRunRequest,
-    ) -> ClipLabItemView:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            active_revision = self._get_active_review_window_revision(session, window)
-            audio_bytes = self._render_review_window_audio_bytes(session, window)
-            variant = self._create_review_window_variant_from_bytes(
-                session,
-                window,
-                audio_bytes,
-                generator_model=payload.generator_model,
-                is_original=False,
-            )
-            self._append_review_window_revision(
-                session,
-                window,
-                transcript_text=active_revision.transcript_text,
-                status=active_revision.status,
-                tags=self._review_window_tag_payloads(active_revision),
-                edl_operations=list(active_revision.edl_operations or []),
-                active_variant_id=variant.id,
-                message=f"Ran {payload.generator_model}",
-            )
-            session.commit()
-            session.expire_all()
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            return self._to_clip_lab_item_from_review_window(window, recording, session)
-
-    def set_active_review_window_variant(
-        self,
-        review_window_id: str,
-        payload: ActiveVariantUpdate,
-    ) -> ClipLabItemView:
-        with self._session() as session:
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            self._ensure_review_window_baseline(session, window, recording)
-            variants = self._get_review_window_variants(session, window.id)
-            matching_variant = next((variant for variant in variants if variant.id == payload.active_variant_id), None)
-            if matching_variant is None:
-                raise KeyError(payload.active_variant_id)
-            active_revision = self._get_active_review_window_revision(session, window)
-            self._append_review_window_revision(
-                session,
-                window,
-                transcript_text=active_revision.transcript_text,
-                status=active_revision.status,
-                tags=self._review_window_tag_payloads(active_revision),
-                edl_operations=list(active_revision.edl_operations or []),
-                active_variant_id=matching_variant.id,
-                message=f"Activated variant {matching_variant.generator_model or matching_variant.id}",
-            )
-            session.commit()
-            session.expire_all()
-            window = self._get_review_window(session, review_window_id)
-            recording = self._get_source_recording(session, window.source_recording_id)
-            return self._to_clip_lab_item_from_review_window(window, recording, session)
-
     def create_reference_asset(self, payload: ReferenceAssetCreate) -> ReferenceAsset:
         with self._session() as session:
             if session.get(AudioVariant, payload.audio_variant_id) is None:
@@ -1604,7 +1358,6 @@ class SQLiteRepository:
         now: datetime | None = None,
     ) -> ProcessingJobView:
         now = self._as_utc(now) if now is not None else utc_now()
-        dataset_processing_run_id: str | None = None
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             if job.status != JobStatus.RUNNING:
@@ -1615,14 +1368,10 @@ class SQLiteRepository:
                 job.output_payload = output_payload
             job.heartbeat_at = now
             job.completed_at = now
-            dataset_processing_run_id = job.dataset_processing_run_id
             session.add(job)
             session.commit()
             session.refresh(job)
-            result = self._processing_job_view(job)
-        if dataset_processing_run_id is not None:
-            self._refresh_dataset_processing_run(dataset_processing_run_id)
-        return result
+            return self._processing_job_view(job)
 
     def _fail_processing_job(
         self,
@@ -1632,144 +1381,22 @@ class SQLiteRepository:
         now: datetime | None = None,
     ) -> ProcessingJobView:
         now = self._as_utc(now) if now is not None else utc_now()
-        dataset_processing_run_id: str | None = None
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             job.status = JobStatus.FAILED
             job.error_message = error_message
             job.heartbeat_at = now
             job.completed_at = now
-            dataset_processing_run_id = job.dataset_processing_run_id
             session.add(job)
             session.commit()
             session.refresh(job)
-            result = self._processing_job_view(job)
-        if dataset_processing_run_id is not None:
-            self._refresh_dataset_processing_run(dataset_processing_run_id)
-        return result
+            return self._processing_job_view(job)
 
     def _processing_job_reference_time(self, job: ProcessingJob) -> datetime | None:
         reference = job.heartbeat_at or job.started_at or job.created_at
         if reference is None:
             return None
         return self._as_utc(reference)
-
-    def _refresh_dataset_processing_run(self, run_id: str) -> DatasetProcessingRunView:
-        with self._session() as session:
-            run = session.get(DatasetProcessingRun, run_id)
-            if run is None:
-                raise KeyError(run_id)
-            jobs = session.exec(
-                select(ProcessingJob)
-                .where(ProcessingJob.dataset_processing_run_id == run.id)
-                .order_by(ProcessingJob.created_at, ProcessingJob.id)
-            ).all()
-            asr_jobs = [job for job in jobs if job.kind == JobKind.REVIEW_WINDOW_ASR]
-            alignment_jobs = [job for job in jobs if job.kind == JobKind.FORCED_ALIGN_AND_PACK]
-
-            run.asr_completed = sum(1 for job in asr_jobs if job.status == JobStatus.COMPLETED)
-            run.asr_failed = sum(1 for job in asr_jobs if job.status == JobStatus.FAILED)
-            run.alignment_completed = sum(1 for job in alignment_jobs if job.status == JobStatus.COMPLETED)
-            run.alignment_failed = sum(1 for job in alignment_jobs if job.status == JobStatus.FAILED)
-
-            asr_terminal = len(asr_jobs) > 0 and (run.asr_completed + run.asr_failed == len(asr_jobs))
-            alignment_terminal = len(alignment_jobs) > 0 and (
-                run.alignment_completed + run.alignment_failed == len(alignment_jobs)
-            )
-
-            if not asr_terminal:
-                run.status = "asr_running"
-                run.phase = "asr"
-                run.completed_at = None
-                run.current_message = (
-                    f"ASR {run.asr_completed}/{run.total_review_windows} completed, "
-                    f"{run.asr_failed} failed"
-                )
-            elif not alignment_jobs:
-                successful_asr_jobs = [job for job in asr_jobs if job.status == JobStatus.COMPLETED]
-                if not successful_asr_jobs:
-                    run.status = "failed"
-                    run.phase = "done"
-                    run.completed_at = utc_now()
-                    run.current_message = "ASR failed for all selected review windows"
-                else:
-                    source_recording = self._get_source_recording(session, run.source_recording_id)
-                    for asr_job in successful_asr_jobs:
-                        if asr_job.target_review_window_id is None:
-                            continue
-                        transcript_text = self._dataset_processing_alignment_transcript(
-                            session,
-                            asr_job.target_review_window_id,
-                        )
-                        session.add(
-                            ProcessingJob(
-                                id=self._new_id("job"),
-                                kind=JobKind.FORCED_ALIGN_AND_PACK,
-                                status=JobStatus.PENDING,
-                                source_recording_id=source_recording.id,
-                                dataset_processing_run_id=run.id,
-                                target_review_window_id=asr_job.target_review_window_id,
-                                input_payload={
-                                    "review_window_ids": [asr_job.target_review_window_id],
-                                    "transcript_text": transcript_text,
-                                    "minimum_duration_seconds": 6.0,
-                                    "orchestrated_by_dataset_processing_run_id": run.id,
-                                },
-                            )
-                        )
-                    run.alignment_total = len(successful_asr_jobs)
-                    run.status = "alignment_running"
-                    run.phase = "alignment"
-                    run.completed_at = None
-                    run.current_message = (
-                        f"Alignment queued for {len(successful_asr_jobs)}/{run.total_review_windows} review windows"
-                    )
-            elif not alignment_terminal:
-                run.status = "alignment_running"
-                run.phase = "alignment"
-                run.completed_at = None
-                run.current_message = (
-                    f"Alignment {run.alignment_completed}/{len(alignment_jobs)} completed, "
-                    f"{run.alignment_failed} failed"
-                )
-            else:
-                run.phase = "done"
-                run.completed_at = utc_now()
-                any_failures = run.asr_failed > 0 or run.alignment_failed > 0
-                any_successes = run.alignment_completed > 0 or run.asr_completed > 0
-                if not any_failures:
-                    run.status = "completed"
-                elif any_successes:
-                    run.status = "partially_failed"
-                else:
-                    run.status = "failed"
-                run.current_message = (
-                    f"Alignment finished with {run.alignment_completed} completed and {run.alignment_failed} failed; "
-                    f"ASR failures: {run.asr_failed}"
-                )
-
-            session.add(run)
-            session.commit()
-            session.refresh(run)
-            return self._dataset_processing_run_view(run)
-
-    def _dataset_processing_alignment_transcript(
-        self,
-        session: Session,
-        review_window_id: str,
-    ) -> str:
-        window = self._get_review_window(session, review_window_id)
-        active_revision = self._get_active_review_window_revision(session, window, allow_transient=True)
-        if active_revision.transcript_text != window.rough_transcript:
-            transcript_text = active_revision.transcript_text
-        elif window.asr_draft_transcript:
-            transcript_text = window.asr_draft_transcript
-        else:
-            transcript_text = window.rough_transcript
-        transcript_text = transcript_text.strip()
-        if not transcript_text:
-            raise ValueError(f"ReviewWindow {review_window_id} does not have transcript text for alignment")
-        return transcript_text
 
     def _run_data_migrations(self) -> None:
         version = self._get_data_version()
@@ -1827,43 +1454,123 @@ class SQLiteRepository:
                 connection.exec_driver_sql("ALTER TABLE processingjob ADD COLUMN claimed_by TEXT")
             if "heartbeat_at" not in columns:
                 connection.exec_driver_sql("ALTER TABLE processingjob ADD COLUMN heartbeat_at TIMESTAMP")
-            if "dataset_processing_run_id" not in columns:
-                connection.exec_driver_sql("ALTER TABLE processingjob ADD COLUMN dataset_processing_run_id TEXT")
-            if "target_review_window_id" not in columns:
-                connection.exec_driver_sql("ALTER TABLE processingjob ADD COLUMN target_review_window_id TEXT")
 
-    def _migrate_dataset_processing_run_schema(self) -> None:
+    def _purge_legacy_review_window_schema(self) -> None:
+        with self.engine.begin() as connection:
+            table_names = {
+                row[0]
+                for row in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "processingjob" in table_names:
+                connection.exec_driver_sql(
+                    "DELETE FROM processingjob WHERE kind IN ('review_window_asr', 'forced_align_and_pack')"
+                )
+                columns = [
+                    row[1]
+                    for row in connection.exec_driver_sql("PRAGMA table_info(processingjob)").fetchall()
+                ]
+                if "dataset_processing_run_id" in columns or "target_review_window_id" in columns:
+                    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                    connection.exec_driver_sql(
+                        """
+                        CREATE TABLE processingjob_new (
+                            id TEXT PRIMARY KEY NOT NULL,
+                            kind VARCHAR(20),
+                            status VARCHAR(20),
+                            source_recording_id TEXT,
+                            input_payload JSON,
+                            output_payload JSON,
+                            error_message TEXT,
+                            claimed_by TEXT,
+                            created_at TIMESTAMP NOT NULL,
+                            started_at TIMESTAMP,
+                            heartbeat_at TIMESTAMP,
+                            completed_at TIMESTAMP,
+                            FOREIGN KEY(source_recording_id) REFERENCES sourcerecording (id)
+                        )
+                        """
+                    )
+                    connection.exec_driver_sql(
+                        """
+                        INSERT INTO processingjob_new (
+                            id, kind, status, source_recording_id, input_payload, output_payload,
+                            error_message, claimed_by, created_at, started_at, heartbeat_at, completed_at
+                        )
+                        SELECT
+                            id, kind, status, source_recording_id, input_payload, output_payload,
+                            error_message, claimed_by, created_at, started_at, heartbeat_at, completed_at
+                        FROM processingjob
+                        """
+                    )
+                    connection.exec_driver_sql("DROP TABLE processingjob")
+                    connection.exec_driver_sql("ALTER TABLE processingjob_new RENAME TO processingjob")
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS ix_processingjob_kind ON processingjob (kind)"
+                    )
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS ix_processingjob_status ON processingjob (status)"
+                    )
+                    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            if "datasetprocessingrun" in table_names:
+                connection.exec_driver_sql("DROP TABLE datasetprocessingrun")
+            if "reviewwindowrevision" in table_names:
+                connection.exec_driver_sql("DROP TABLE reviewwindowrevision")
+            if "reviewwindowvariant" in table_names:
+                connection.exec_driver_sql("DROP TABLE reviewwindowvariant")
+            if "reviewwindow" in table_names:
+                connection.exec_driver_sql("DROP TABLE reviewwindow")
+
+    def _migrate_slice_schema(self) -> None:
         with self.engine.begin() as connection:
             columns = {
                 row[1]
-                for row in connection.exec_driver_sql("PRAGMA table_info(datasetprocessingrun)").fetchall()
+                for row in connection.exec_driver_sql("PRAGMA table_info(slice)").fetchall()
             }
             if not columns:
                 return
-            if "alignment_total" not in columns:
+            if "is_locked" not in columns:
                 connection.exec_driver_sql(
-                    "ALTER TABLE datasetprocessingrun ADD COLUMN alignment_total INTEGER NOT NULL DEFAULT 0"
+                    "ALTER TABLE slice ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0"
                 )
 
-    def _migrate_reviewwindow_schema(self) -> None:
+    def _migrate_source_recording_artifact_rows(self) -> None:
         with self.engine.begin() as connection:
-            columns = {
-                row[1]
-                for row in connection.exec_driver_sql("PRAGMA table_info(reviewwindow)").fetchall()
+            table_names = {
+                row[0]
+                for row in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
             }
-            if not columns:
+            if "sourcerecordingartifact" not in table_names:
                 return
-            additions = {
-                "asr_draft_transcript": "TEXT",
-                "last_asr_job_id": "TEXT",
-                "last_asr_at": "TIMESTAMP",
-                "asr_model_name": "TEXT",
-                "asr_model_version": "TEXT",
-                "asr_language": "TEXT",
+            recording_ids = [
+                row[0]
+                for row in connection.exec_driver_sql("SELECT id FROM sourcerecording").fetchall()
+            ]
+            existing_artifact_ids = {
+                row[0]
+                for row in connection.exec_driver_sql(
+                    "SELECT source_recording_id FROM sourcerecordingartifact"
+                ).fetchall()
             }
-            for column_name, column_sql in additions.items():
-                if column_name not in columns:
-                    connection.exec_driver_sql(f"ALTER TABLE reviewwindow ADD COLUMN {column_name} {column_sql}")
+            for recording_id in recording_ids:
+                if recording_id in existing_artifact_ids:
+                    continue
+                connection.exec_driver_sql(
+                    """
+                    INSERT INTO sourcerecordingartifact (
+                        source_recording_id,
+                        transcript_status,
+                        alignment_status,
+                        transcript_word_count,
+                        alignment_word_count,
+                        artifact_metadata
+                    ) VALUES (?, 'missing', 'missing', 0, 0, '{}')
+                    """,
+                    (recording_id,),
+                )
 
     def _migrate_enum_storage(self) -> None:
         replacements = {
@@ -2123,23 +1830,6 @@ class SQLiteRepository:
         )
         session.add(recording)
         session.commit()
-        self.register_slicer_chunks(
-            recording.id,
-            SlicerHandoffRequest(
-                windows=[
-                    {
-                        "start_seconds": 12.4,
-                        "end_seconds": 15.68,
-                        "rough_transcript": "The workstation should make this painless.",
-                        "order_index": 10,
-                    }
-                ],
-                pre_padding_ms=0,
-                post_padding_ms=0,
-                merge_gap_threshold_ms=0,
-                minimum_window_duration_ms=100,
-            ),
-        )
         with self._session() as seed_session:
             seeded_recording = self._get_source_recording(seed_session, recording.id)
             self._create_slice_from_source_span(
@@ -2192,254 +1882,6 @@ class SQLiteRepository:
             raise KeyError(recording_id)
         return recording
 
-    def _get_review_window(self, session: Session, review_window_id: str) -> ReviewWindow:
-        window = session.get(ReviewWindow, review_window_id)
-        if window is None:
-            raise KeyError(review_window_id)
-        return window
-
-    def _get_review_window_revision(
-        self,
-        session: Session,
-        revision_id: str,
-    ) -> ReviewWindowRevision:
-        revision = session.get(ReviewWindowRevision, revision_id)
-        if revision is None:
-            raise KeyError(revision_id)
-        return revision
-
-    def _get_review_window_variants(
-        self,
-        session: Session,
-        review_window_id: str,
-    ) -> list[ReviewWindowVariant]:
-        return session.exec(
-            select(ReviewWindowVariant)
-            .where(ReviewWindowVariant.review_window_id == review_window_id)
-            .order_by(ReviewWindowVariant.created_at, ReviewWindowVariant.id)
-        ).all()
-
-    def _list_recording_review_windows(
-        self,
-        session: Session,
-        recording_id: str,
-    ) -> list[ReviewWindow]:
-        return session.exec(
-            select(ReviewWindow)
-            .where(ReviewWindow.source_recording_id == recording_id)
-            .order_by(ReviewWindow.order_index, ReviewWindow.created_at)
-        ).all()
-
-    def _list_recording_review_window_views(
-        self,
-        session: Session,
-        recording_id: str,
-    ) -> list[ReviewWindowView]:
-        return [self._review_window_view(window, session) for window in self._list_recording_review_windows(session, recording_id)]
-
-    def _get_active_review_window_revision(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        *,
-        allow_transient: bool = False,
-    ) -> ReviewWindowRevision:
-        revision = session.exec(
-            select(ReviewWindowRevision)
-            .where(
-                ReviewWindowRevision.review_window_id == window.id,
-                ReviewWindowRevision.is_active.is_(True),
-            )
-            .order_by(ReviewWindowRevision.created_at.desc())
-        ).first()
-        if revision is None:
-            if allow_transient:
-                return self._transient_review_window_revision(window)
-            raise ValueError(f"Review window {window.id} has no active revision")
-        return revision
-
-    def _transient_review_window_revision(self, window: ReviewWindow) -> ReviewWindowRevision:
-        return ReviewWindowRevision(
-            id=f"transient-review-window-{window.id}",
-            review_window_id=window.id,
-            parent_revision_id=None,
-            transcript_text=window.rough_transcript,
-            status=ReviewStatus.UNRESOLVED,
-            tags_payload=[],
-            edl_operations=[],
-            active_variant_id_snapshot=None,
-            message="Transient review window baseline",
-            is_milestone=False,
-            is_active=True,
-            created_at=window.created_at,
-        )
-
-    def _get_review_window_redo_target(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-    ) -> ReviewWindowRevision | None:
-        return session.exec(
-            select(ReviewWindowRevision)
-            .where(ReviewWindowRevision.parent_revision_id == active_revision.id)
-            .order_by(ReviewWindowRevision.created_at.desc())
-        ).first()
-
-    def _set_active_review_window_revision(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        target_revision: ReviewWindowRevision,
-    ) -> None:
-        revisions = session.exec(
-            select(ReviewWindowRevision).where(ReviewWindowRevision.review_window_id == window.id)
-        ).all()
-        for revision in revisions:
-            revision.is_active = revision.id == target_revision.id
-            session.add(revision)
-
-    def _review_window_variant_path(self, variant_id: str) -> Path:
-        return self._managed_media_path("review-window-variants", variant_id)
-
-    def _create_review_window_variant_from_bytes(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        audio_bytes: bytes,
-        *,
-        generator_model: str | None,
-        is_original: bool,
-    ) -> ReviewWindowVariant:
-        variant_id = self._new_id("review-variant")
-        target_path = self._review_window_variant_path(variant_id)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(audio_bytes)
-        sample_rate, _channels, num_samples = self._wav_metadata(audio_bytes)
-        variant = ReviewWindowVariant(
-            id=variant_id,
-            review_window_id=window.id,
-            file_path=str(target_path),
-            is_original=is_original,
-            generator_model=generator_model,
-            sample_rate=sample_rate,
-            num_samples=num_samples,
-        )
-        session.add(variant)
-        session.flush()
-        return variant
-
-    def _ensure_review_window_baseline(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        recording: SourceRecording,
-    ) -> bool:
-        existing_revision = session.exec(
-            select(ReviewWindowRevision)
-            .where(ReviewWindowRevision.review_window_id == window.id)
-            .order_by(ReviewWindowRevision.created_at)
-        ).first()
-        if existing_revision is not None:
-            if not session.exec(
-                select(ReviewWindowRevision)
-                .where(
-                    ReviewWindowRevision.review_window_id == window.id,
-                    ReviewWindowRevision.is_active.is_(True),
-                )
-            ).first():
-                existing_revision.is_active = True
-                session.add(existing_revision)
-                session.flush()
-                return True
-            return False
-
-        baseline_bytes = self._extract_source_window_wav_bytes(
-            recording,
-            window.start_seconds,
-            window.end_seconds,
-        )
-        baseline_variant = self._create_review_window_variant_from_bytes(
-            session,
-            window,
-            baseline_bytes,
-            generator_model="review-window-source",
-            is_original=True,
-        )
-        self._append_review_window_revision(
-            session,
-            window,
-            transcript_text=window.rough_transcript,
-            status=ReviewStatus.UNRESOLVED,
-            tags=[],
-            edl_operations=[],
-            active_variant_id=baseline_variant.id,
-            message="Imported review window baseline",
-        )
-        session.flush()
-        return True
-
-    def _validate_forced_align_request(self, payload: ForcedAlignAndPackRequest | dict[str, Any]) -> None:
-        minimum_duration = payload.minimum_duration_seconds if isinstance(payload, ForcedAlignAndPackRequest) else float(payload.get("minimum_duration_seconds", 6.0))
-        if not math.isclose(float(minimum_duration), 6.0, rel_tol=0.0, abs_tol=1e-9):
-            raise ValueError("minimum_duration_seconds is fixed at 6.0 in the current packer and cannot be overridden")
-
-    def _load_selected_review_windows_for_recording(
-        self,
-        session: Session,
-        recording: SourceRecording,
-        requested_window_ids: list[str] | None,
-        *,
-        empty_selection_message: str,
-    ) -> list[ReviewWindow]:
-        if requested_window_ids is not None and len(set(requested_window_ids)) != len(requested_window_ids):
-            raise ValueError("review_window_ids cannot contain duplicates")
-        if not requested_window_ids:
-            raise ValueError(empty_selection_message)
-        ordered_windows: list[ReviewWindow] = []
-        for review_window_id in requested_window_ids:
-            window = self._get_review_window(session, review_window_id)
-            if window.source_recording_id != recording.id:
-                raise ValueError("One or more review windows do not belong to the source recording")
-            ordered_windows.append(window)
-        ordered_windows.sort(key=lambda window: (window.order_index, window.created_at, window.id))
-        return ordered_windows
-
-    def _load_forced_align_review_windows(
-        self,
-        session: Session,
-        recording: SourceRecording,
-        requested_window_ids: list[str] | None,
-    ) -> list[ReviewWindow]:
-        if requested_window_ids:
-            windows = self._load_selected_review_windows_for_recording(
-                session,
-                recording,
-                requested_window_ids,
-                empty_selection_message="Forced align and pack job requires at least one review window",
-            )
-        else:
-            windows = session.exec(
-                select(ReviewWindow)
-                .where(ReviewWindow.source_recording_id == recording.id)
-                .order_by(ReviewWindow.order_index, ReviewWindow.created_at)
-            ).all()
-        ordered_windows = list(sorted(windows, key=lambda window: (window.order_index, window.created_at)))
-        if not ordered_windows:
-            raise ValueError("Forced align and pack job requires at least one review window")
-        self._validate_contiguous_review_windows(ordered_windows)
-        return ordered_windows
-
-    def _validate_contiguous_review_windows(self, windows: list[ReviewWindow]) -> None:
-        tolerance_seconds = 0.01
-        for current_window, next_window in zip(windows, windows[1:]):
-            gap_seconds = next_window.start_seconds - current_window.end_seconds
-            if abs(gap_seconds) > tolerance_seconds:
-                relation = "gap" if gap_seconds > 0 else "overlap"
-                raise ValueError(
-                    f"Forced align and pack currently requires contiguous review windows; found {relation} of {gap_seconds:.3f}s between {current_window.id} and {next_window.id}"
-                )
-
     def _get_processing_job(self, session: Session, job_id: str) -> ProcessingJob:
         job = session.get(ProcessingJob, job_id)
         if job is None:
@@ -2452,162 +1894,18 @@ class SQLiteRepository:
             raise KeyError(slice_id)
         return transcript
 
-    def _validate_review_window_bounds(
+    def _validate_source_window_bounds(
         self,
         recording: SourceRecording,
         start_seconds: float,
         end_seconds: float,
     ) -> None:
         if start_seconds < 0:
-            raise ValueError("Review window start must be non-negative")
+            raise ValueError("Source span start must be non-negative")
         if end_seconds <= start_seconds:
-            raise ValueError("Review window end must be greater than the start")
+            raise ValueError("Source span end must be greater than the start")
         if end_seconds > recording.duration_s:
-            raise ValueError("Review window end exceeds the source recording duration")
-
-    def _validate_review_window_generation_policy(self, payload: SlicerHandoffRequest) -> None:
-        if payload.pre_padding_ms < 0:
-            raise ValueError("pre_padding_ms must be non-negative")
-        if payload.post_padding_ms < 0:
-            raise ValueError("post_padding_ms must be non-negative")
-        if payload.merge_gap_threshold_ms < 0:
-            raise ValueError("merge_gap_threshold_ms must be non-negative")
-        if payload.minimum_window_duration_ms <= 0:
-            raise ValueError("minimum_window_duration_ms must be positive")
-
-    def _normalize_review_window_chunks(
-        self,
-        recording: SourceRecording,
-        payload: SlicerHandoffRequest,
-    ) -> list[dict[str, Any]]:
-        # ReviewWindows are coarse, conservative review/ASR decode spans, not final train/export slices.
-        self._validate_review_window_generation_policy(payload)
-        if not payload.windows:
-            return []
-
-        pre_padding_seconds = payload.pre_padding_ms / 1000.0
-        post_padding_seconds = payload.post_padding_ms / 1000.0
-        merge_gap_seconds = payload.merge_gap_threshold_ms / 1000.0
-        minimum_window_duration_seconds = payload.minimum_window_duration_ms / 1000.0
-
-        ordered_inputs = sorted(
-            list(enumerate(payload.windows)),
-            key=lambda item: (
-                float(item[1].start_seconds),
-                float(item[1].end_seconds),
-                int(item[1].order_index),
-                item[0],
-            ),
-        )
-        normalized: list[dict[str, Any]] = []
-
-        for original_position, chunk in ordered_inputs:
-            raw_start = float(chunk.start_seconds)
-            raw_end = float(chunk.end_seconds)
-            self._validate_review_window_bounds(recording, raw_start, raw_end)
-            normalized_start = max(0.0, raw_start - pre_padding_seconds)
-            normalized_end = min(recording.duration_s, raw_end + post_padding_seconds)
-            self._validate_review_window_bounds(recording, normalized_start, normalized_end)
-            candidate = {
-                "start_seconds": normalized_start,
-                "end_seconds": normalized_end,
-                "rough_transcript": str(chunk.rough_transcript or "").strip(),
-                "source_order_indices": [int(chunk.order_index)],
-                "source_start_seconds": raw_start,
-                "source_end_seconds": raw_end,
-                "merged_input_count": 1,
-                "coalesced_tiny_window": False,
-                "boundary_mode": "coarse_review_window_padded",
-                "generation_mode": "slicer_handoff_normalized",
-                "seed_metadata": dict(chunk.model_metadata or {}),
-                "original_positions": [original_position],
-            }
-            if normalized:
-                previous = normalized[-1]
-                gap_seconds = normalized_start - float(previous["end_seconds"])
-                if normalized_start < float(previous["end_seconds"]) or gap_seconds < merge_gap_seconds:
-                    previous["start_seconds"] = min(float(previous["start_seconds"]), normalized_start)
-                    previous["end_seconds"] = max(float(previous["end_seconds"]), normalized_end)
-                    previous["rough_transcript"] = self._merge_transcript_text(
-                        str(previous["rough_transcript"]),
-                        str(candidate["rough_transcript"]),
-                    )
-                    previous["source_start_seconds"] = min(float(previous["source_start_seconds"]), raw_start)
-                    previous["source_end_seconds"] = max(float(previous["source_end_seconds"]), raw_end)
-                    previous["source_order_indices"] = [
-                        *list(previous["source_order_indices"]),
-                        int(chunk.order_index),
-                    ]
-                    previous["merged_input_count"] = int(previous["merged_input_count"]) + 1
-                    previous["seed_metadata"] = self._merge_review_window_seed_metadata(
-                        dict(previous["seed_metadata"]),
-                        candidate["seed_metadata"],
-                    )
-                    previous["original_positions"] = [*list(previous["original_positions"]), original_position]
-                    continue
-            normalized.append(candidate)
-
-        for index, window in enumerate(normalized):
-            duration_seconds = float(window["end_seconds"]) - float(window["start_seconds"])
-            if duration_seconds < minimum_window_duration_seconds:
-                raise ValueError(
-                    "Review window normalization produced a pathological tiny window; "
-                    "increase padding or merge the upstream VAD segments first"
-                )
-
-            window["order_index"] = index
-            window["window_metadata"] = self._build_review_window_generation_metadata(
-                window,
-                payload,
-            )
-            del window["seed_metadata"]
-            del window["original_positions"]
-
-        for previous, current in zip(normalized, normalized[1:]):
-            if float(previous["end_seconds"]) > float(current["start_seconds"]):
-                raise ValueError("Review window normalization produced overlapping windows")
-        return normalized
-
-    def _merge_review_window_seed_metadata(
-        self,
-        first: dict[str, Any],
-        second: dict[str, Any],
-    ) -> dict[str, Any]:
-        merged: dict[str, Any] = dict(first)
-        for key, value in second.items():
-            if key not in merged:
-                merged[key] = value
-                continue
-            if merged[key] == value:
-                continue
-            merged.pop(key, None)
-        return merged
-
-    def _build_review_window_generation_metadata(
-        self,
-        window: dict[str, Any],
-        payload: SlicerHandoffRequest,
-    ) -> dict[str, Any]:
-        metadata = dict(window["seed_metadata"])
-        metadata.update(
-            {
-                "generation_mode": str(window["generation_mode"]),
-                "boundary_mode": str(window["boundary_mode"]),
-                "pre_padding_ms": int(payload.pre_padding_ms),
-                "post_padding_ms": int(payload.post_padding_ms),
-                "merged_gap_threshold_ms": int(payload.merge_gap_threshold_ms),
-                "minimum_window_duration_ms": int(payload.minimum_window_duration_ms),
-                "source_start_seconds": round(float(window["source_start_seconds"]), 6),
-                "source_end_seconds": round(float(window["source_end_seconds"]), 6),
-                "was_merged": int(window["merged_input_count"]) > 1,
-                "merged_input_count": int(window["merged_input_count"]),
-                "coalesced_tiny_window": bool(window["coalesced_tiny_window"]),
-                "source_order_indices": list(window["source_order_indices"]),
-            }
-        )
-        if len(metadata["source_order_indices"]) == 1:
-            metadata["source_order_index"] = metadata["source_order_indices"][0]
-        return metadata
+            raise ValueError("Source span end exceeds the source recording duration")
 
     def _create_slice_from_source_span(
         self,
@@ -2622,9 +1920,10 @@ class SQLiteRepository:
         speaker_name: str = "speaker_a",
         language: str = "en",
         alignment_data: dict[str, Any] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
         created_at: datetime | None = None,
     ) -> Slice:
-        self._validate_review_window_bounds(recording, start_seconds, end_seconds)
+        self._validate_source_window_bounds(recording, start_seconds, end_seconds)
         variant_id = self._new_id("variant")
         variant_path = self._managed_variant_path(variant_id)
         variant_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2648,6 +1947,7 @@ class SQLiteRepository:
                 "language": language,
                 "is_superseded": False,
                 "updated_at": now.isoformat(),
+                **dict(extra_metadata or {}),
             },
             created_at=now,
         )
@@ -2795,12 +2095,6 @@ class SQLiteRepository:
             for tag in self._get_slice_tags(session, slice_row.id)
         ]
 
-    def _review_window_tag_payloads(self, revision: ReviewWindowRevision) -> list[TagPayload]:
-        return [
-            TagPayload.model_validate(tag)
-            for tag in sorted(revision.tags_payload or [], key=lambda item: str(item.get("name", "")).lower())
-        ]
-
     def _normalized_tag_payloads(self, tags: list[TagPayload] | None) -> list[dict[str, str]]:
         return [
             {"name": tag.name, "color": tag.color}
@@ -2836,48 +2130,6 @@ class SQLiteRepository:
         session.flush()
         slice_row.active_commit_id = revision.id
         session.add(slice_row)
-        return revision
-
-    def _append_review_window_revision(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        *,
-        transcript_text: str,
-        status: ReviewStatus,
-        tags: list[TagPayload],
-        edl_operations: list[dict[str, Any]],
-        active_variant_id: str | None,
-        message: str | None = None,
-        is_milestone: bool = False,
-        created_at: datetime | None = None,
-    ) -> ReviewWindowRevision:
-        previous_revisions = session.exec(
-            select(ReviewWindowRevision)
-            .where(ReviewWindowRevision.review_window_id == window.id)
-        ).all()
-        parent_revision_id = None
-        for revision in previous_revisions:
-            if revision.is_active:
-                parent_revision_id = revision.id
-            revision.is_active = False
-            session.add(revision)
-        revision = ReviewWindowRevision(
-            id=self._new_id("review-edit"),
-            review_window_id=window.id,
-            parent_revision_id=parent_revision_id,
-            transcript_text=transcript_text,
-            status=status,
-            tags_payload=[tag.model_dump(mode="json") for tag in tags],
-            edl_operations=list(edl_operations),
-            active_variant_id_snapshot=active_variant_id,
-            message=message,
-            is_milestone=is_milestone,
-            is_active=True,
-            created_at=created_at or utc_now(),
-        )
-        session.add(revision)
-        session.flush()
         return revision
 
     def _restore_slice_from_revision(self, session: Session, slice_row: Slice, revision: EditCommit) -> None:
@@ -2980,26 +2232,6 @@ class SQLiteRepository:
             alignment_data=transcript.alignment_data,
         )
 
-    def _clip_lab_transcript_from_review_window(
-        self,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-    ) -> ClipLabTranscriptView:
-        modified_text = (
-            active_revision.transcript_text
-            if active_revision.transcript_text != window.rough_transcript
-            else None
-        )
-        return ClipLabTranscriptView(
-            id=active_revision.id,
-            original_text=window.rough_transcript,
-            modified_text=modified_text,
-            is_modified=modified_text is not None,
-            draft_text=window.asr_draft_transcript,
-            draft_source="review_window_asr" if window.asr_draft_transcript else None,
-            alignment_data=None,
-        )
-
     def _transcript_summary_view(self, transcript: Transcript | None) -> TranscriptSummaryView | None:
         if transcript is None:
             return None
@@ -3023,47 +2255,6 @@ class SQLiteRepository:
             num_samples=variant.num_samples,
         )
 
-    def _review_window_variant_view(
-        self,
-        variant: ReviewWindowVariant | None,
-    ) -> ClipLabVariantView | None:
-        if variant is None:
-            return None
-        return ClipLabVariantView(
-            id=variant.id,
-            is_original=variant.is_original,
-            generator_model=variant.generator_model,
-            sample_rate=variant.sample_rate,
-            num_samples=variant.num_samples,
-        )
-
-    def _get_active_review_window_variant(
-        self,
-        session: Session,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-    ) -> ReviewWindowVariant | None:
-        active_variant_id = active_revision.active_variant_id_snapshot
-        if active_variant_id is None:
-            return None
-        return session.get(ReviewWindowVariant, active_variant_id)
-
-    def _review_window_transcript_source(
-        self,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-    ) -> str:
-        metadata = dict(window.window_metadata or {})
-        explicit_source = metadata.get("transcript_source")
-        if isinstance(explicit_source, str) and explicit_source.strip():
-            return explicit_source
-        if active_revision.transcript_text != window.rough_transcript:
-            return "manual"
-        return "review_window_seed"
-
-    def _review_window_asr_status(self, window: ReviewWindow) -> str:
-        return "draft_available" if window.asr_draft_transcript else "not_started"
-
     def _source_recording_view(self, recording: SourceRecording | None) -> SourceRecordingView:
         if recording is None:
             raise ValueError("Slice is missing its source recording")
@@ -3077,51 +2268,114 @@ class SQLiteRepository:
             processing_recipe=recording.processing_recipe,
         )
 
-    def _review_window_view(
+    def _source_recording_artifact_view(
         self,
-        window: ReviewWindow,
-        session: Session | None = None,
-    ) -> ReviewWindowView:
-        if session is None:
-            with self._session() as owned_session:
-                session_window = self._get_review_window(owned_session, window.id)
-                return self._review_window_view(session_window, owned_session)
-
-        session_window = self._get_review_window(session, window.id)
-        active_revision = session.exec(
-            select(ReviewWindowRevision)
-            .where(
-                ReviewWindowRevision.review_window_id == window.id,
-                ReviewWindowRevision.is_active.is_(True),
-            )
-            .order_by(ReviewWindowRevision.created_at.desc())
-        ).first()
-        tags = [
-            self._tag_view(Tag(id=f"review-tag-{tag.name.lower()}", name=tag.name, color=tag.color))
-            for tag in (self._review_window_tag_payloads(active_revision) if active_revision is not None else [])
-        ]
-        return ReviewWindowView(
-            id=session_window.id,
-            source_recording_id=session_window.source_recording_id,
-            start_seconds=session_window.start_seconds,
-            end_seconds=session_window.end_seconds,
-            rough_transcript=session_window.rough_transcript,
-            reviewed_transcript=active_revision.transcript_text if active_revision is not None else session_window.rough_transcript,
-            asr_draft_transcript=session_window.asr_draft_transcript,
-            transcript_source=self._review_window_transcript_source(session_window, active_revision) if active_revision is not None else "review_window_seed",
-            last_asr_job_id=session_window.last_asr_job_id,
-            last_asr_at=self._as_utc(session_window.last_asr_at) if session_window.last_asr_at is not None else None,
-            asr_model_name=session_window.asr_model_name,
-            asr_model_version=session_window.asr_model_version,
-            asr_language=session_window.asr_language,
-            review_status=active_revision.status if active_revision is not None else ReviewStatus.UNRESOLVED,
-            tags=tags,
-            order_index=session_window.order_index,
-            window_metadata=session_window.window_metadata,
-            can_undo=active_revision.parent_revision_id is not None if active_revision is not None else False,
-            can_redo=self._get_review_window_redo_target(session, session_window, active_revision) is not None if active_revision is not None else False,
-            created_at=self._as_utc(session_window.created_at),
+        artifact: SourceRecordingArtifact | None,
+    ) -> SourceRecordingArtifactView | None:
+        if artifact is None:
+            return None
+        return SourceRecordingArtifactView(
+            source_recording_id=artifact.source_recording_id,
+            transcript_text_path=artifact.transcript_text_path,
+            transcript_json_path=artifact.transcript_json_path,
+            alignment_json_path=artifact.alignment_json_path,
+            transcript_status=artifact.transcript_status,
+            alignment_status=artifact.alignment_status,
+            transcript_word_count=artifact.transcript_word_count,
+            alignment_word_count=artifact.alignment_word_count,
+            transcript_updated_at=self._as_utc(artifact.transcript_updated_at)
+            if artifact.transcript_updated_at is not None
+            else None,
+            aligned_at=self._as_utc(artifact.aligned_at) if artifact.aligned_at is not None else None,
+            alignment_backend=artifact.alignment_backend,
+            artifact_metadata=artifact.artifact_metadata,
         )
+
+    def _source_recording_queue_view(
+        self,
+        recording: SourceRecording,
+        *,
+        slice_count: int,
+    ) -> SourceRecordingQueueView:
+        active_job = self._select_active_source_recording_job(recording.processing_jobs)
+        latest_source_job = self._select_latest_source_recording_job(recording.processing_jobs)
+        processing_state, processing_message = self._derive_source_recording_processing_state(
+            recording.source_artifact,
+            active_job=active_job,
+            latest_source_job=latest_source_job,
+            slice_count=slice_count,
+        )
+        return SourceRecordingQueueView(
+            id=recording.id,
+            batch_id=recording.batch_id,
+            parent_recording_id=recording.parent_recording_id,
+            sample_rate=recording.sample_rate,
+            num_channels=recording.num_channels,
+            num_samples=recording.num_samples,
+            processing_recipe=recording.processing_recipe,
+            duration_seconds=recording.duration_s,
+            slice_count=slice_count,
+            processing_state=processing_state,
+            processing_message=processing_message,
+            active_job=self._processing_job_view(active_job) if active_job is not None else None,
+            artifact=self._source_recording_artifact_view(recording.source_artifact),
+        )
+
+    def _select_active_source_recording_job(
+        self,
+        jobs: list[ProcessingJob],
+    ) -> ProcessingJob | None:
+        source_jobs = [
+            job
+            for job in jobs
+            if job.kind in {JobKind.SOURCE_TRANSCRIPTION, JobKind.SOURCE_ALIGNMENT, JobKind.SOURCE_SLICING}
+            and job.status in {JobStatus.PENDING, JobStatus.RUNNING}
+        ]
+        source_jobs.sort(key=lambda job: (self._as_utc(job.created_at), job.id), reverse=True)
+        return source_jobs[0] if source_jobs else None
+
+    def _select_latest_source_recording_job(
+        self,
+        jobs: list[ProcessingJob],
+    ) -> ProcessingJob | None:
+        source_jobs = [
+            job
+            for job in jobs
+            if job.kind in {JobKind.SOURCE_TRANSCRIPTION, JobKind.SOURCE_ALIGNMENT, JobKind.SOURCE_SLICING}
+        ]
+        source_jobs.sort(key=lambda job: (self._as_utc(job.created_at), job.id), reverse=True)
+        return source_jobs[0] if source_jobs else None
+
+    def _derive_source_recording_processing_state(
+        self,
+        artifact: SourceRecordingArtifact | None,
+        *,
+        active_job: ProcessingJob | None,
+        latest_source_job: ProcessingJob | None,
+        slice_count: int,
+    ) -> tuple[str, str | None]:
+        if active_job is not None:
+            if active_job.kind == JobKind.SOURCE_TRANSCRIPTION:
+                return ("transcribing", "Transcribing audio...")
+            if active_job.kind == JobKind.SOURCE_ALIGNMENT:
+                return ("aligning", "Aligning transcript...")
+            if active_job.kind == JobKind.SOURCE_SLICING:
+                return ("slicing", "Generating slices...")
+        if latest_source_job is not None and latest_source_job.status == JobStatus.FAILED:
+            return (
+                "failed",
+                latest_source_job.error_message
+                or f"{latest_source_job.kind.value.replace('_', ' ').title()} failed.",
+            )
+        if artifact is not None and artifact.alignment_status == "stale":
+            return ("alignment_stale", "Transcript changed. Re-run alignment before reslicing.")
+        if slice_count > 0:
+            return ("sliced", f"{slice_count} slice{'s' if slice_count != 1 else ''} ready for review.")
+        if artifact is not None and artifact.alignment_status == "ok":
+            return ("aligned", "Alignment is ready. Run slicing to generate review clips.")
+        if artifact is not None and artifact.transcript_status in {"ok", "patched"}:
+            return ("transcribed", "Transcript is ready. Run alignment next.")
+        return ("idle", "Recording is ready for transcription.")
 
     def _processing_job_view(self, job: ProcessingJob) -> ProcessingJobView:
         return ProcessingJobView(
@@ -3137,29 +2391,6 @@ class SQLiteRepository:
             started_at=self._as_utc(job.started_at) if job.started_at is not None else None,
             heartbeat_at=self._as_utc(job.heartbeat_at) if job.heartbeat_at is not None else None,
             completed_at=self._as_utc(job.completed_at) if job.completed_at is not None else None,
-        )
-
-    def _dataset_processing_run_view(self, run: DatasetProcessingRun) -> DatasetProcessingRunView:
-        health_page_ready = bool(
-            run.phase == "done"
-            and (run.alignment_completed > 0 or run.alignment_failed > 0)
-        )
-        return DatasetProcessingRunView(
-            id=run.id,
-            source_recording_id=run.source_recording_id,
-            status=run.status,
-            phase=run.phase,
-            total_review_windows=run.total_review_windows,
-            asr_total=run.total_review_windows,
-            alignment_total=run.alignment_total,
-            asr_completed=run.asr_completed,
-            asr_failed=run.asr_failed,
-            alignment_completed=run.alignment_completed,
-            alignment_failed=run.alignment_failed,
-            current_message=run.current_message,
-            started_at=self._as_utc(run.started_at),
-            completed_at=self._as_utc(run.completed_at) if run.completed_at is not None else None,
-            health_page_ready=health_page_ready,
         )
 
     def _revision_view(self, commit: EditCommit) -> SliceRevision:
@@ -3180,20 +2411,6 @@ class SQLiteRepository:
             created_at=self._as_utc(commit.created_at),
         )
 
-    def _review_window_commit_view(self, commit: ReviewWindowRevision) -> ClipLabCommitView:
-        return ClipLabCommitView(
-            id=commit.id,
-            parent_commit_id=commit.parent_revision_id,
-            edl_operations=list(commit.edl_operations or []),
-            transcript_text=commit.transcript_text,
-            status=commit.status,
-            tags=self._review_window_tag_payloads(commit),
-            active_variant_id=commit.active_variant_id_snapshot,
-            message=commit.message,
-            is_milestone=commit.is_milestone,
-            created_at=self._as_utc(commit.created_at),
-        )
-
     def _to_slice_summary(self, slice_row: Slice) -> SliceSummary:
         active_commit = slice_row.active_commit
         return SliceSummary.model_validate(
@@ -3203,6 +2420,7 @@ class SQLiteRepository:
                 "active_variant_id": slice_row.active_variant_id,
                 "active_commit_id": slice_row.active_commit_id,
                 "status": slice_row.status,
+                "is_locked": slice_row.is_locked,
                 "duration_seconds": self._slice_duration(slice_row),
                 "model_metadata": self._slice_metadata(slice_row),
                 "created_at": self._as_utc(slice_row.created_at),
@@ -3242,23 +2460,8 @@ class SQLiteRepository:
             can_edit_tags=True,
             can_set_status=True,
             can_save=True,
-            can_split=True,
-            can_merge=True,
-            can_edit_waveform=True,
-            can_run_processing=True,
-            can_switch_variants=True,
-            can_export=False,
-            can_finalize=False,
-        )
-
-    def _review_window_clip_lab_capabilities(self) -> ClipLabCapabilitiesView:
-        return ClipLabCapabilitiesView(
-            can_edit_transcript=True,
-            can_edit_tags=True,
-            can_set_status=True,
-            can_save=True,
-            can_split=True,
-            can_merge=True,
+            can_split=False,
+            can_merge=False,
             can_edit_waveform=True,
             can_run_processing=True,
             can_switch_variants=True,
@@ -3271,10 +2474,6 @@ class SQLiteRepository:
         active_variant_id = slice_row.active_variant_id or "source"
         return f"/media/slices/{slice_row.id}.wav?rev={active_variant_id}:{active_commit_id}"
 
-    def _review_window_audio_url(self, window: ReviewWindow, active_revision: ReviewWindowRevision) -> str:
-        active_variant_id = active_revision.active_variant_id_snapshot or "source"
-        return f"/media/review-windows/{window.id}.wav?rev={active_variant_id}:{active_revision.id}"
-
     def _to_clip_lab_item_from_slice(self, slice_row: Slice) -> ClipLabItemView:
         detail = self._to_slice_detail(slice_row)
         return ClipLabItemView(
@@ -3286,6 +2485,7 @@ class SQLiteRepository:
             end_seconds=float((detail.model_metadata or {}).get("original_end_time", detail.duration_seconds)),
             duration_seconds=detail.duration_seconds,
             status=detail.status,
+            is_locked=slice_row.is_locked,
             created_at=detail.created_at,
             transcript=self._clip_lab_transcript_from_transcript(slice_row.transcript),
             tags=detail.tags,
@@ -3312,57 +2512,6 @@ class SQLiteRepository:
             active_commit=detail.active_commit,
         )
 
-    def _to_clip_lab_item_from_review_window(
-        self,
-        window: ReviewWindow,
-        recording: SourceRecording,
-        session: Session,
-    ) -> ClipLabItemView:
-        metadata = dict(window.window_metadata or {})
-        session_window = self._get_review_window(session, window.id)
-        active_revision = self._get_active_review_window_revision(session, session_window, allow_transient=True)
-        variants = self._get_review_window_variants(session, session_window.id)
-        active_variant = self._get_active_review_window_variant(session, session_window, active_revision)
-        commits = session.exec(
-            select(ReviewWindowRevision)
-            .where(ReviewWindowRevision.review_window_id == session_window.id)
-            .order_by(ReviewWindowRevision.created_at)
-        ).all()
-        return ClipLabItemView(
-            id=window.id,
-            kind="review_window",
-            source_recording_id=window.source_recording_id,
-            source_recording=self._source_recording_view(recording),
-            start_seconds=window.start_seconds,
-            end_seconds=window.end_seconds,
-            duration_seconds=self._review_window_duration(session_window, active_revision, active_variant),
-            status=active_revision.status,
-            created_at=self._as_utc(window.created_at),
-            transcript=self._clip_lab_transcript_from_review_window(session_window, active_revision),
-            tags=[self._tag_view(Tag(id=f"review-tag-{tag.name.lower()}", name=tag.name, color=tag.color)) for tag in self._review_window_tag_payloads(active_revision)],
-            speaker_name=str(metadata.get("speaker_name")) if metadata.get("speaker_name") is not None else None,
-            language=str(metadata.get("language")) if metadata.get("language") is not None else None,
-            audio_url=self._review_window_audio_url(session_window, active_revision),
-            item_metadata=metadata or None,
-            transcript_source=self._review_window_transcript_source(session_window, active_revision),
-            can_run_asr=True,
-            asr_placeholder_message="ASR runs per ReviewWindow and stores a draft transcript candidate without overwriting reviewed text.",
-            asr_draft_transcript=session_window.asr_draft_transcript,
-            last_asr_job_id=session_window.last_asr_job_id,
-            last_asr_at=self._as_utc(session_window.last_asr_at) if session_window.last_asr_at is not None else None,
-            asr_model_name=session_window.asr_model_name,
-            asr_model_version=session_window.asr_model_version,
-            asr_language=session_window.asr_language,
-            active_variant_generator_model=active_variant.generator_model if active_variant is not None else None,
-            can_undo=active_revision.parent_revision_id is not None,
-            can_redo=self._get_review_window_redo_target(session, session_window, active_revision) is not None,
-            capabilities=self._review_window_clip_lab_capabilities(),
-            variants=[self._review_window_variant_view(variant) for variant in variants],
-            commits=[self._review_window_commit_view(commit) for commit in commits],
-            active_variant=self._review_window_variant_view(active_variant),
-            active_commit=self._review_window_commit_view(active_revision),
-        )
-
     def _touch_slice(self, slice_row: Slice, when: datetime | None = None) -> None:
         metadata = self._slice_metadata(slice_row)
         metadata["updated_at"] = self._as_utc(when or utc_now()).isoformat()
@@ -3385,18 +2534,6 @@ class SQLiteRepository:
         else:
             base_duration = slice_row.source_recording.duration_s if slice_row.source_recording is not None else 0.0
         return round(self._apply_edl_to_duration(base_duration, self._collect_edl_operations(slice_row)), 2)
-
-    def _review_window_duration(
-        self,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-        active_variant: ReviewWindowVariant | None,
-    ) -> float:
-        if active_variant is not None:
-            base_duration = active_variant.num_samples / max(active_variant.sample_rate, 1)
-        else:
-            base_duration = max(window.end_seconds - window.start_seconds, 0.0)
-        return round(self._apply_edl_to_duration(base_duration, list(active_revision.edl_operations or [])), 2)
 
     def _legacy_status_to_storage(self, status: str) -> ReviewStatus:
         mapping = {
@@ -3556,7 +2693,7 @@ class SQLiteRepository:
         start_seconds: float,
         end_seconds: float,
     ) -> bytes:
-        self._validate_review_window_bounds(recording, start_seconds, end_seconds)
+        self._validate_source_window_bounds(recording, start_seconds, end_seconds)
         source_path = Path(recording.file_path).expanduser().resolve(strict=False)
         self._validate_audio_asset(
             source_path,
@@ -3706,7 +2843,7 @@ class SQLiteRepository:
     def _managed_variant_path(self, variant_id: str) -> Path:
         return self._managed_media_path("variants", variant_id)
 
-    def _review_window_cache_path(
+    def _source_window_cache_path(
         self,
         recording_id: str,
         start_seconds: float,
@@ -3721,15 +2858,15 @@ class SQLiteRepository:
             sort_keys=True,
         )
         identifier = hashlib.sha1(fingerprint_input.encode("utf-8")).hexdigest()[:16]
-        return self._managed_media_path("review-windows", f"{recording_id}-{identifier}")
+        return self._managed_media_path("source-windows", f"{recording_id}-{identifier}")
 
-    def _materialize_review_window_media_path(
+    def _materialize_source_window_media_path(
         self,
         recording: SourceRecording,
         start_seconds: float,
         end_seconds: float,
     ) -> Path:
-        target_path = self._review_window_cache_path(recording.id, start_seconds, end_seconds)
+        target_path = self._source_window_cache_path(recording.id, start_seconds, end_seconds)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if not target_path.exists():
             target_path.write_bytes(
@@ -3737,79 +2874,18 @@ class SQLiteRepository:
             )
         return target_path
 
-    def _review_window_audio_cache_identifier(
-        self,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-    ) -> str:
-        state_key = json.dumps(
-            {
-                "review_window_id": window.id,
-                "active_variant_id": active_revision.active_variant_id_snapshot,
-                "edl_operations": list(active_revision.edl_operations or []),
-            },
-            sort_keys=True,
-        )
-        fingerprint = hashlib.sha1(state_key.encode("utf-8")).hexdigest()[:12]
-        return f"{window.id}-{fingerprint}"
-
-    def _review_window_render_cache_path(
-        self,
-        window: ReviewWindow,
-        active_revision: ReviewWindowRevision,
-    ) -> Path:
-        return self._managed_media_path(
-            "review-window-renders",
-            self._review_window_audio_cache_identifier(window, active_revision),
-        )
-
-    def _render_review_window_audio_bytes(
-        self,
-        session: Session,
-        window: ReviewWindow,
-    ) -> bytes:
-        recording = self._get_source_recording(session, window.source_recording_id)
-        active_revision = self._get_active_review_window_revision(session, window, allow_transient=True)
-        active_variant = self._get_active_review_window_variant(session, window, active_revision)
-        if active_variant is None:
-            base_bytes = self._extract_source_window_wav_bytes(recording, window.start_seconds, window.end_seconds)
-        else:
-            variant_path = self._resolve_variant_media_path(Path(active_variant.file_path))
-            base_bytes = variant_path.read_bytes()
-        return self._apply_edl_to_wav_bytes(base_bytes, list(active_revision.edl_operations or []))
-
-    def _materialize_review_window_render_path(
-        self,
-        session: Session,
-        window: ReviewWindow,
-    ) -> Path:
-        active_revision = self._get_active_review_window_revision(session, window, allow_transient=True)
-        target_path = self._review_window_render_cache_path(window, active_revision)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_bytes(self._render_review_window_audio_bytes(session, window))
-        return target_path
-
     def _prune_derived_media_cache(self) -> int:
         with self._session() as session:
             slices = session.exec(select(Slice)).all()
             keep_cache_ids = {self._slice_audio_cache_identifier(slice_row) for slice_row in slices}
-            review_windows = session.exec(select(ReviewWindow)).all()
-            keep_review_window_render_ids: set[str] = set()
-            for window in review_windows:
-                active_revision = self._get_active_review_window_revision(session, window, allow_transient=True)
-                keep_review_window_render_ids.add(self._review_window_audio_cache_identifier(window, active_revision))
-            retained_review_window_variant_paths = set()
-            for raw_path in session.exec(select(ReviewWindowVariant.file_path)).all():
-                try:
-                    retained_review_window_variant_paths.add(self._resolve_variant_media_path(Path(raw_path)))
-                except (FileNotFoundError, ValueError):
-                    continue
         deleted_count = 0
         slices_root = self.media_root / "slices"
         peaks_root = self.media_root / "peaks"
-        review_window_renders_root = self.media_root / "review-window-renders"
-        review_window_variants_root = self.media_root / "review-window-variants"
+        legacy_roots = [
+            self.media_root / "review-window-renders",
+            self.media_root / "review-window-variants",
+            self.media_root / "review-windows",
+        ]
         for path in slices_root.glob("*.wav"):
             cache_id = path.stem
             if cache_id in keep_cache_ids:
@@ -3822,24 +2898,12 @@ class SQLiteRepository:
                 continue
             path.unlink()
             deleted_count += 1
-        for path in review_window_renders_root.glob("*.wav"):
-            cache_id = path.stem
-            if cache_id in keep_review_window_render_ids:
+        for root in legacy_roots:
+            if not root.exists():
                 continue
-            path.unlink()
-            deleted_count += 1
-        for path in review_window_variants_root.glob("*.wav"):
-            try:
-                resolved_path = self._resolve_variant_media_path(path)
-            except (FileNotFoundError, ValueError):
-                if path.exists():
-                    path.unlink()
-                    deleted_count += 1
-                continue
-            if resolved_path in retained_review_window_variant_paths:
-                continue
-            path.unlink()
-            deleted_count += 1
+            for path in root.glob("*.wav"):
+                path.unlink()
+                deleted_count += 1
         return deleted_count
 
     def _ingest_variant_asset(self, path: Path, variant_id: str) -> Path:
@@ -3999,176 +3063,464 @@ class SQLiteRepository:
                 slice_row.model_metadata = metadata
                 session.add(slice_row)
 
-    def _shift_review_window_order_indices(
-        self,
-        session: Session,
-        recording_id: str,
-        from_index: int,
-        amount: int,
-        exclude_ids: set[str] | None = None,
-    ) -> None:
-        exclude_ids = exclude_ids or set()
-        for window in self._list_recording_review_windows(session, recording_id):
-            if window.id in exclude_ids:
-                continue
-            if window.order_index > from_index:
-                window.order_index = window.order_index + amount
-                session.add(window)
-
     def _dispatch_processing_job(self, job_id: str) -> dict[str, Any] | None:
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             job_kind = job.kind
-        if job_kind == JobKind.REVIEW_WINDOW_ASR:
-            return self._run_review_window_asr_job(job_id)
-        if job_kind == JobKind.FORCED_ALIGN_AND_PACK:
-            return self._run_forced_align_and_pack_job(job_id)
+        if job_kind == JobKind.SOURCE_TRANSCRIPTION:
+            return self._run_source_transcription_job(job_id)
+        if job_kind == JobKind.SOURCE_ALIGNMENT:
+            return self._run_source_alignment_job(job_id)
+        if job_kind == JobKind.SOURCE_SLICING:
+            return self._run_source_slicing_job(job_id)
         raise ValueError(f"Unsupported processing job kind: {job_kind}")
 
-    def _run_review_window_asr_job(self, job_id: str) -> dict[str, Any]:
+    def _run_source_transcription_job(self, job_id: str) -> dict[str, Any]:
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             if job.source_recording_id is None:
-                raise ValueError("ReviewWindow ASR job is missing its source recording")
+                raise ValueError("Source transcription job is missing its source recording")
             recording = self._get_source_recording(session, job.source_recording_id)
             payload = dict(job.input_payload or {})
-            if payload.get("target_kind") != "review_window":
-                raise ValueError("ReviewWindow ASR job target_kind must be review_window")
-            ordered_windows = self._load_selected_review_windows_for_recording(
-                session,
-                recording,
-                payload.get("review_window_ids"),
-                empty_selection_message="ReviewWindow ASR job requires at least one review window",
-            )
-            adapter_config = self._review_window_asr_backend_config(payload)
+            adapter_config = self._source_asr_backend_config(payload)
             language_hint = payload.get("language_hint")
             completed_at = utc_now()
-            window_results: list[dict[str, Any]] = []
-            backend_client = self._create_review_window_asr_backend_client(adapter_config)
+            backend_client = self._create_source_asr_backend_client(adapter_config)
+            draft_result = self._run_source_recording_asr_adapter(
+                recording,
+                adapter_config=adapter_config,
+                backend_client=backend_client,
+                language_hint=str(language_hint) if language_hint is not None else None,
+            )
 
-            for window in ordered_windows:
-                active_revision = self._get_active_review_window_revision(session, window, allow_transient=True)
-                draft_result = self._run_review_window_asr_adapter(
-                    window,
-                    adapter_config=adapter_config,
-                    backend_client=backend_client,
-                    language_hint=str(language_hint) if language_hint is not None else None,
-                )
-                reviewed_transcript_protected = active_revision.transcript_text != window.rough_transcript
-                window.asr_draft_transcript = draft_result["transcript_text"]
-                window.last_asr_job_id = job.id
-                window.last_asr_at = completed_at
-                window.asr_model_name = draft_result["model_name"]
-                window.asr_model_version = draft_result["model_version"]
-                window.asr_language = draft_result["language"]
-                session.add(window)
-                window_results.append(
+            artifact_dir = self._source_recording_artifact_dir(recording.id)
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            transcript_base_path = artifact_dir / "transcript.base.txt"
+            transcript_text_path = artifact_dir / "transcript.txt"
+            transcript_json_path = artifact_dir / "transcript.json"
+            transcript_base_path.write_text(draft_result["transcript_text"] + "\n", encoding="utf-8")
+            transcript_text_path.write_text(draft_result["transcript_text"] + "\n", encoding="utf-8")
+            transcript_json_path.write_text(
+                json.dumps(
                     {
-                        "review_window_id": window.id,
-                        "transcript_text": draft_result["transcript_text"],
-                        "stored_as": "review_window_asr_draft",
-                        "reviewed_transcript_protected": reviewed_transcript_protected,
                         "backend": draft_result["backend"],
                         "model_name": draft_result["model_name"],
                         "model_version": draft_result["model_version"],
                         "language": draft_result["language"],
                         "segments": list(draft_result["segments"]),
-                    }
-                )
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
+            artifact = self._ensure_source_recording_artifact(session, recording)
+            artifact.transcript_text_path = str(transcript_text_path)
+            artifact.transcript_json_path = str(transcript_json_path)
+            artifact.transcript_status = "ok"
+            artifact.alignment_status = "stale" if artifact.alignment_json_path else artifact.alignment_status
+            artifact.transcript_word_count = len(str(draft_result["transcript_text"]).split())
+            artifact.transcript_updated_at = completed_at
+            metadata = dict(artifact.artifact_metadata or {})
+            metadata["base_transcript_text_path"] = str(transcript_base_path)
+            metadata["transcript_patches"] = []
+            metadata["last_transcription_job_id"] = job.id
+            metadata["language"] = draft_result["language"]
+            artifact.artifact_metadata = metadata
+            session.add(artifact)
             session.commit()
 
         return {
-            "target_kind": "review_window",
+            "target_kind": "source_recording",
             "backend": adapter_config["backend"],
-            "processed_review_window_count": len(window_results),
-            "review_window_results": window_results,
-            "stored_as": "review_window_asr_draft",
+            "source_recording_id": recording.id,
+            "transcript_text": draft_result["transcript_text"],
+            "transcript_text_path": str(transcript_text_path),
+            "transcript_json_path": str(transcript_json_path),
+            "transcript_word_count": len(str(draft_result["transcript_text"]).split()),
+            "language": draft_result["language"],
+            "stored_as": "source_recording_transcript_artifact",
         }
 
-    def _run_forced_align_and_pack_job(self, job_id: str) -> dict[str, Any]:
+    def _run_source_alignment_job(self, job_id: str) -> dict[str, Any]:
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             if job.source_recording_id is None:
-                raise ValueError("Forced align and pack job is missing its source recording")
+                raise ValueError("Source alignment job is missing its source recording")
             recording = self._get_source_recording(session, job.source_recording_id)
-            payload = job.input_payload or {}
-            self._validate_forced_align_request(payload)
-            requested_window_ids = payload.get("review_window_ids")
-            windows = self._load_forced_align_review_windows(session, recording, requested_window_ids)
-            master_transcript = " ".join(
-                self._get_active_review_window_revision(session, window, allow_transient=True).transcript_text.strip()
-                for window in windows
-                if self._get_active_review_window_revision(session, window, allow_transient=True).transcript_text.strip()
+            artifact = self._ensure_source_recording_artifact(session, recording)
+            payload = dict(job.input_payload or {})
+
+            if payload.get("transcript_text_path"):
+                artifact.transcript_text_path = str(payload["transcript_text_path"])
+            if payload.get("transcript_json_path"):
+                artifact.transcript_json_path = str(payload["transcript_json_path"])
+
+            transcript_text_path = (
+                Path(str(artifact.transcript_text_path)).expanduser().resolve()
+                if artifact.transcript_text_path
+                else None
             )
-            explicit_transcript = str(payload.get("transcript_text", "")).strip()
-            if explicit_transcript:
-                master_transcript = explicit_transcript
-            if not master_transcript:
-                raise ValueError("Forced align and pack job requires transcript_text")
-
-            absolute_start = windows[0].start_seconds
-            absolute_end = windows[-1].end_seconds
-            recording_id = recording.id
-            batch_id = recording.batch_id
-            selected_window_ids = [window.id for window in windows]
-
-        audio_bytes = self._extract_source_window_wav_bytes(recording, absolute_start, absolute_end)
-        audio_samples, sample_rate = self._wav_bytes_to_mono_samples(audio_bytes)
-        if sample_rate <= 0:
-            raise ValueError("Forced align and pack job produced invalid sample rate")
-
-        alignment_units = self._run_forced_align_worker(audio_bytes, master_transcript)
-        packed_slices = list(pack_aligned_words(alignment_units, audio_samples, sample_rate))
-
-        with self._session() as session:
-            recording = self._get_source_recording(session, recording_id)
-            existing_slices = self._get_batch_slices(session, batch_id)
-            next_order_index = (
-                max(int(self._slice_metadata(slice_row).get("order_index", 0)) for slice_row in existing_slices) + 1
-                if existing_slices
-                else 0
+            transcript_json_path = (
+                Path(str(artifact.transcript_json_path)).expanduser().resolve()
+                if artifact.transcript_json_path
+                else None
             )
-            created_slice_ids: list[str] = []
+            if transcript_text_path is None or not transcript_text_path.exists():
+                raise ValueError("Source alignment requires a transcript_text_path artifact")
 
-            for packed_slice in packed_slices:
-                slice_row = self._create_slice_from_source_span(
-                    session,
-                    recording,
-                    slice_id=self._new_id("slice"),
-                    start_seconds=absolute_start + float(packed_slice["start_s"]),
-                    end_seconds=absolute_start + float(packed_slice["end_s"]),
-                    transcript_text=str(packed_slice["transcript_text"]),
-                    order_index=next_order_index,
-                    alignment_data={
-                        "source": "torchaudio_forced_align_worker",
-                        "relative_start_seconds": float(packed_slice["start_s"]),
-                        "relative_end_seconds": float(packed_slice["end_s"]),
-                    },
-                )
-                created_slice_ids.append(slice_row.id)
-                next_order_index += 1
+            transcript_json_payload: dict[str, Any] | None = None
+            transcript_patches = self._source_artifact_patches(artifact)
+            if transcript_json_path is not None and transcript_json_path.exists() and not transcript_patches:
+                transcript_json_payload = json.loads(transcript_json_path.read_text(encoding="utf-8"))
 
+            alignment_backend = str(
+                payload.get("alignment_backend")
+                or artifact.alignment_backend
+                or "torchaudio_forced_align_worker"
+            ).strip() or "torchaudio_forced_align_worker"
+
+            if transcript_json_payload is not None:
+                alignment_units, summary = self._run_segmented_source_alignment(recording, transcript_json_payload)
+                alignment_mode = "segmented_transcript_json"
+            else:
+                transcript_text = transcript_text_path.read_text(encoding="utf-8").strip()
+                if not transcript_text:
+                    raise ValueError("Source alignment transcript artifact is empty")
+                alignment_units = self._run_forced_align_worker_on_file(Path(recording.file_path), transcript_text)
+                summary = {
+                    "segment_count": 1,
+                    "processed_segments": 1,
+                    "skipped_segments": 0,
+                }
+                alignment_mode = "full_transcript_text"
+
+            completed_at = utc_now()
+            alignment_path = self._source_recording_alignment_path(recording.id)
+            summary_path = self._source_recording_alignment_summary_path(recording.id)
+            alignment_path.parent.mkdir(parents=True, exist_ok=True)
+            alignment_path.write_text(json.dumps(alignment_units, indent=2), encoding="utf-8")
+            summary_payload = {
+                "source_recording_id": recording.id,
+                "status": "ok",
+                "alignment_backend": alignment_backend,
+                "alignment_mode": alignment_mode,
+                "alignment_word_count": len(alignment_units),
+                **summary,
+            }
+            summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
+            artifact.alignment_json_path = str(alignment_path)
+            artifact.alignment_status = "ok"
+            artifact.alignment_word_count = len(alignment_units)
+            artifact.aligned_at = completed_at
+            artifact.alignment_backend = alignment_backend
+            metadata = self._source_artifact_metadata(artifact)
+            metadata["alignment_summary_path"] = str(summary_path)
+            metadata["last_alignment_job_id"] = job.id
+            metadata["alignment_mode"] = alignment_mode
+            artifact.artifact_metadata = metadata
+            session.add(artifact)
             session.commit()
 
         return {
-            "created_slice_count": len(created_slice_ids),
-            "created_slice_ids": created_slice_ids,
-            "selected_review_window_ids": selected_window_ids,
-            "selection_mode": "contiguous_review_windows_only",
-            "packing_policy": {
-                "minimum_duration_seconds": 6.0,
-                "configured_minimum_duration_seconds": float(payload.get("minimum_duration_seconds", 6.0)),
-            },
-            "window_span": {
-                "start_seconds": absolute_start,
-                "end_seconds": absolute_end,
-            },
+            "target_kind": "source_recording",
+            "source_recording_id": recording.id,
+            "alignment_json_path": str(alignment_path),
+            "alignment_summary_path": str(summary_path),
+            "alignment_word_count": len(alignment_units),
+            "alignment_backend": alignment_backend,
+            "alignment_mode": alignment_mode,
         }
 
-    def _run_review_window_asr_adapter(
+    def _run_source_slicing_job(self, job_id: str) -> dict[str, Any]:
+        with self._session() as session:
+            job = self._get_processing_job(session, job_id)
+            if job.source_recording_id is None:
+                raise ValueError("Source slicing job is missing its source recording")
+            recording = self._get_source_recording(session, job.source_recording_id)
+            artifact = self._ensure_source_recording_artifact(session, recording)
+            payload = dict(job.input_payload or {})
+            if artifact.alignment_status != "ok":
+                raise ValueError("Source slicing requires an up-to-date alignment artifact")
+            if not artifact.alignment_json_path:
+                raise ValueError("Source slicing requires an alignment_json_path artifact")
+            alignment_path = Path(str(artifact.alignment_json_path)).expanduser().resolve()
+            if not alignment_path.exists():
+                raise ValueError(f"Source alignment artifact not found: {alignment_path}")
+            alignment_units = json.loads(alignment_path.read_text(encoding="utf-8"))
+            if not isinstance(alignment_units, list) or not alignment_units:
+                raise ValueError("Source slicing requires non-empty alignment data")
+
+            config_overrides = payload.get("config_overrides") or {}
+            if not isinstance(config_overrides, dict):
+                raise ValueError("config_overrides must be an object")
+            config = SlicerConfig(**config_overrides)
+            full_audio_bytes = self._extract_source_window_wav_bytes(recording, 0.0, recording.duration_s)
+            audio_samples, sample_rate = self._wav_bytes_to_mono_samples(full_audio_bytes)
+            slicer_result = plan_slices(alignment_units, audio_samples, sample_rate, config)
+            generated_slices = list(slicer_result["slices"])
+
+            active_slices = self._active_recording_slices(session, recording.id)
+            locked_slices = [slice_row for slice_row in active_slices if slice_row.is_locked] if payload.get("preserve_locked_slices", True) else []
+            replaced_slices = [slice_row for slice_row in active_slices if slice_row not in locked_slices]
+
+            if payload.get("replace_unlocked_slices", True):
+                for slice_row in replaced_slices:
+                    metadata = self._slice_metadata(slice_row)
+                    metadata["is_superseded"] = True
+                    metadata["superseded_by_job_id"] = job.id
+                    metadata["updated_at"] = utc_now().isoformat()
+                    slice_row.model_metadata = metadata
+                    session.add(slice_row)
+
+            kept_locked_ids = {slice_row.id for slice_row in locked_slices}
+            dropped_overlap_count = 0
+            created_slice_rows: list[Slice] = []
+            language = str(self._source_artifact_metadata(artifact).get("language") or "en")
+            for slice_payload in generated_slices:
+                if self._candidate_overlaps_locked_slice(slice_payload, locked_slices):
+                    dropped_overlap_count += 1
+                    continue
+                created_slice_rows.append(
+                    self._create_generated_source_slice(
+                        session,
+                        recording,
+                        slice_payload=slice_payload,
+                        source_alignment_backend=artifact.alignment_backend,
+                        language=language,
+                    )
+                )
+
+            final_active_slices = [*locked_slices, *created_slice_rows]
+            self._reindex_recording_slice_block(
+                session,
+                recording=recording,
+                previous_active_slices=active_slices,
+                final_active_slices=final_active_slices,
+            )
+            for locked_slice in locked_slices:
+                self._update_locked_slice_alignment_drift(locked_slice, alignment_units, job_id=job.id)
+                session.add(locked_slice)
+            session.commit()
+
+        return {
+            "target_kind": "source_recording",
+            "source_recording_id": recording.id,
+            "created_slice_count": len(created_slice_rows),
+            "preserved_locked_slice_count": len(kept_locked_ids),
+            "dropped_overlap_count": dropped_overlap_count,
+            "replace_unlocked_slices": bool(payload.get("replace_unlocked_slices", True)),
+            "preserve_locked_slices": bool(payload.get("preserve_locked_slices", True)),
+            "slicer_stats": slicer_result["stats"],
+        }
+
+    def _run_segmented_source_alignment(
         self,
-        window: ReviewWindow,
+        recording: SourceRecording,
+        transcript_json_payload: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        segments = transcript_json_payload.get("segments")
+        if not isinstance(segments, list):
+            raise ValueError("Transcript JSON missing segments array for segmented alignment")
+
+        merged_alignment: list[dict[str, Any]] = []
+        processed_segments = 0
+        skipped_segments = 0
+        for segment in segments:
+            if not isinstance(segment, dict):
+                skipped_segments += 1
+                continue
+            text = str(segment.get("text") or "").strip()
+            start = max(0.0, float(segment.get("start") or 0.0))
+            end = min(recording.duration_s, float(segment.get("end") or 0.0))
+            if not text or end <= start:
+                skipped_segments += 1
+                continue
+            chunk_bytes = self._extract_source_window_wav_bytes(recording, start, end)
+            alignment = self._run_forced_align_worker(chunk_bytes, text)
+            for word in alignment:
+                merged_alignment.append(
+                    {
+                        "word": str(word["word"]),
+                        "start": round(start + float(word["start"]), 6),
+                        "end": round(start + float(word["end"]), 6),
+                        **({"confidence": float(word["confidence"])} if word.get("confidence") is not None else {}),
+                        **({"interpolated": True} if bool(word.get("interpolated")) else {}),
+                    }
+                )
+            processed_segments += 1
+
+        return merged_alignment, {
+            "segment_count": len(segments),
+            "processed_segments": processed_segments,
+            "skipped_segments": skipped_segments,
+        }
+
+    def _create_generated_source_slice(
+        self,
+        session: Session,
+        recording: SourceRecording,
+        *,
+        slice_payload: dict[str, Any],
+        source_alignment_backend: str | None,
+        language: str = "en",
+    ) -> Slice:
+        extra_metadata = {
+            "generation_mode": "source_slicer_v2",
+            "raw_start": float(slice_payload["raw_start"]),
+            "raw_end": float(slice_payload["raw_end"]),
+            "snapped_start": float(slice_payload["snapped_start"]),
+            "snapped_end": float(slice_payload["snapped_end"]),
+            "training_start": float(slice_payload["training_start"]),
+            "training_end": float(slice_payload["training_end"]),
+            "padded_start": float(slice_payload["padded_start"]),
+            "padded_end": float(slice_payload["padded_end"]),
+            "source_word_start_index": int(slice_payload["start_word_index"]),
+            "source_word_end_index": int(slice_payload["end_word_index"]),
+            "boundary_type": str(slice_payload["boundary_type"]),
+            "boundary_gap_s": float(slice_payload["boundary_gap_s"]),
+            "avg_alignment_confidence": float(slice_payload["avg_alignment_confidence"]),
+            "relative_word_offsets_from": str(slice_payload["relative_word_offsets_from"]),
+            "is_flagged": bool(slice_payload["is_flagged"]),
+            "flag_reason": str(slice_payload["flag_reason"] or ""),
+            "flag_reasons": list(slice_payload["flag_reasons"] or []),
+            "breath_at_start": bool(slice_payload["breath_at_start"]),
+            "breath_at_end": bool(slice_payload["breath_at_end"]),
+            "edge_start_energy": float(slice_payload["edge_start_energy"]),
+            "edge_end_energy": float(slice_payload["edge_end_energy"]),
+            "forced_cut": bool(slice_payload["forced_cut"]),
+            "source_alignment_backend": source_alignment_backend,
+        }
+        transcript_alignment_data = {
+            "kind": "source_slicer_alignment",
+            "relative_word_offsets_from": str(slice_payload["relative_word_offsets_from"]),
+            "words": list(slice_payload["words"]),
+            "source_word_start_index": int(slice_payload["start_word_index"]),
+            "source_word_end_index": int(slice_payload["end_word_index"]),
+            "raw_start": float(slice_payload["raw_start"]),
+            "raw_end": float(slice_payload["raw_end"]),
+            "snapped_start": float(slice_payload["snapped_start"]),
+            "snapped_end": float(slice_payload["snapped_end"]),
+            "training_start": float(slice_payload["training_start"]),
+            "training_end": float(slice_payload["training_end"]),
+            "padded_start": float(slice_payload["padded_start"]),
+            "padded_end": float(slice_payload["padded_end"]),
+            "flag_reasons": list(slice_payload["flag_reasons"] or []),
+        }
+        return self._create_slice_from_source_span(
+            session,
+            recording,
+            slice_id=self._new_id("slice"),
+            start_seconds=float(slice_payload["training_start"]),
+            end_seconds=float(slice_payload["training_end"]),
+            transcript_text=str(slice_payload["transcript"]),
+            order_index=0,
+            language=language,
+            alignment_data=transcript_alignment_data,
+            extra_metadata=extra_metadata,
+        )
+
+    def _slice_training_interval(self, slice_row: Slice) -> tuple[float, float]:
+        metadata = self._slice_metadata(slice_row)
+        start = float(metadata.get("training_start", metadata.get("original_start_time", 0.0)))
+        end = float(metadata.get("training_end", metadata.get("original_end_time", start)))
+        return start, end
+
+    def _candidate_overlaps_locked_slice(
+        self,
+        candidate_slice: dict[str, Any],
+        locked_slices: list[Slice],
+    ) -> bool:
+        candidate_start = float(candidate_slice["training_start"])
+        candidate_end = float(candidate_slice["training_end"])
+        candidate_duration = max(candidate_end - candidate_start, 1e-6)
+        for locked_slice in locked_slices:
+            locked_start, locked_end = self._slice_training_interval(locked_slice)
+            overlap = max(0.0, min(candidate_end, locked_end) - max(candidate_start, locked_start))
+            if overlap <= 0:
+                continue
+            locked_duration = max(locked_end - locked_start, 1e-6)
+            overlap_ratio = overlap / min(candidate_duration, locked_duration)
+            if overlap_ratio >= LOCKED_SLICE_OVERLAP_RATIO_THRESHOLD:
+                return True
+        return False
+
+    def _reindex_recording_slice_block(
+        self,
+        session: Session,
+        *,
+        recording: SourceRecording,
+        previous_active_slices: list[Slice],
+        final_active_slices: list[Slice],
+    ) -> None:
+        batch_slices = self._get_batch_slices(session, recording.batch_id)
+        previous_orders = [
+            int(self._slice_metadata(slice_row).get("order_index", 0))
+            for slice_row in previous_active_slices
+        ]
+        base_order = min(previous_orders) if previous_orders else (
+            max((int(self._slice_metadata(slice_row).get("order_index", 0)) for slice_row in batch_slices), default=-1) + 1
+        )
+        old_count = len(previous_active_slices)
+        new_count = len(final_active_slices)
+        tail_start = base_order + old_count
+        delta = new_count - old_count
+        if delta != 0:
+            for slice_row in batch_slices:
+                if slice_row.source_recording_id == recording.id:
+                    continue
+                metadata = self._slice_metadata(slice_row)
+                order_index = int(metadata.get("order_index", 0))
+                if order_index < tail_start:
+                    continue
+                metadata["order_index"] = order_index + delta
+                slice_row.model_metadata = metadata
+                session.add(slice_row)
+
+        final_active_slices.sort(key=lambda slice_row: self._slice_training_interval(slice_row))
+        for index, slice_row in enumerate(final_active_slices):
+            metadata = self._slice_metadata(slice_row)
+            metadata["order_index"] = base_order + index
+            slice_row.model_metadata = metadata
+            session.add(slice_row)
+
+    def _update_locked_slice_alignment_drift(
+        self,
+        slice_row: Slice,
+        alignment_units: list[dict[str, Any]],
+        *,
+        job_id: str,
+    ) -> None:
+        metadata = self._slice_metadata(slice_row)
+        try:
+            start_index = int(metadata["source_word_start_index"])
+            end_index = int(metadata["source_word_end_index"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if start_index < 0 or end_index >= len(alignment_units) or end_index < start_index:
+            return
+        old_start = float(metadata.get("raw_start", metadata.get("original_start_time", 0.0)))
+        old_end = float(metadata.get("raw_end", metadata.get("original_end_time", old_start)))
+        new_start = float(alignment_units[start_index]["start"])
+        new_end = float(alignment_units[end_index]["end"])
+        drift_seconds = max(abs(new_start - old_start), abs(new_end - old_end))
+        if drift_seconds >= LOCKED_SLICE_DRIFT_WARNING_SECONDS:
+            metadata["alignment_drift_warning"] = {
+                "drift_seconds": round(drift_seconds, 4),
+                "checked_by_job_id": job_id,
+                "previous_raw_start": round(old_start, 4),
+                "previous_raw_end": round(old_end, 4),
+                "current_raw_start": round(new_start, 4),
+                "current_raw_end": round(new_end, 4),
+            }
+        else:
+            metadata.pop("alignment_drift_warning", None)
+        slice_row.model_metadata = metadata
+
+    def _run_source_recording_asr_adapter(
+        self,
+        recording: SourceRecording,
         *,
         adapter_config: dict[str, str],
         backend_client: Any = None,
@@ -4176,15 +3528,15 @@ class SQLiteRepository:
     ) -> dict[str, Any]:
         backend = adapter_config["backend"]
         if backend == "stub":
-            return self._run_review_window_asr_stub_adapter(
-                window,
+            return self._run_source_recording_asr_stub_adapter(
+                recording,
                 model_name=adapter_config["model_name"],
                 model_version=adapter_config["model_version"],
                 language_hint=language_hint,
             )
         if backend == "faster_whisper":
-            return self._run_review_window_asr_faster_whisper_adapter(
-                window,
+            return self._run_source_recording_asr_faster_whisper_adapter(
+                recording,
                 model=backend_client,
                 model_name=adapter_config["model_name"],
                 model_version=adapter_config["model_version"],
@@ -4192,7 +3544,7 @@ class SQLiteRepository:
             )
         raise ValueError(f"Unsupported ASR backend: {backend}")
 
-    def _create_review_window_asr_backend_client(self, adapter_config: dict[str, str]) -> Any:
+    def _create_source_asr_backend_client(self, adapter_config: dict[str, str]) -> Any:
         backend = adapter_config["backend"]
         if backend == "stub":
             return None
@@ -4204,7 +3556,7 @@ class SQLiteRepository:
             )
         raise ValueError(f"Unsupported ASR backend: {backend}")
 
-    def _review_window_asr_backend_config(self, payload: dict[str, Any]) -> dict[str, str]:
+    def _source_asr_backend_config(self, payload: dict[str, Any]) -> dict[str, str]:
         # Dev/local smoke path:
         # ASR_BACKEND=faster_whisper ASR_MODEL_PATH=/abs/path/to/local/model
         # ASR_DEVICE=cpu|cuda ASR_COMPUTE_TYPE=int8|float16 uv run --directory backend python -m app.worker --once
@@ -4214,7 +3566,7 @@ class SQLiteRepository:
         if backend == "stub":
             return {
                 "backend": "stub",
-                "model_name": requested_model_name or "stub-review-window-asr",
+                "model_name": requested_model_name or "stub-source-recording-asr",
                 "model_version": requested_model_version or "stub-v1",
             }
         if backend == "faster_whisper":
@@ -4234,23 +3586,16 @@ class SQLiteRepository:
             }
         raise ValueError(f"Unsupported ASR_BACKEND: {backend}")
 
-    def _run_review_window_asr_stub_adapter(
+    def _run_source_recording_asr_stub_adapter(
         self,
-        window: ReviewWindow,
+        recording: SourceRecording,
         *,
         model_name: str,
         model_version: str,
         language_hint: str | None,
     ) -> dict[str, Any]:
-        transcript_text = window.rough_transcript.strip()
-        if not transcript_text:
-            transcript_text = (
-                f"stub asr review window {window.order_index} "
-                f"{window.start_seconds:.2f}-{window.end_seconds:.2f}"
-            )
-        metadata = dict(window.window_metadata or {})
-        language = language_hint or window.asr_language or str(metadata.get("language") or "")
-        duration_seconds = max(window.end_seconds - window.start_seconds, 0.0)
+        transcript_text = f"stub asr source recording {recording.id}"
+        language = language_hint or "en"
         return {
             "backend": "stub",
             "transcript_text": transcript_text,
@@ -4260,24 +3605,23 @@ class SQLiteRepository:
             "segments": [
                 {
                     "start": 0.0,
-                    "end": round(duration_seconds, 6),
+                    "end": round(recording.duration_s, 6),
                     "text": transcript_text,
                 }
             ],
         }
 
-    def _run_review_window_asr_faster_whisper_adapter(
+    def _run_source_recording_asr_faster_whisper_adapter(
         self,
-        window: ReviewWindow,
+        recording: SourceRecording,
         *,
         model: Any,
         model_name: str,
         model_version: str,
         language_hint: str | None,
     ) -> dict[str, Any]:
-        audio_path = self.get_review_window_media_path(window.id)
         segments_iter, info = model.transcribe(
-            str(audio_path),
+            str(Path(recording.file_path)),
             language=language_hint or None,
             condition_on_previous_text=False,
         )
@@ -4302,6 +3646,9 @@ class SQLiteRepository:
             "segments": segments,
         }
 
+    def _source_recording_artifact_dir(self, recording_id: str) -> Path:
+        return self.exports_root / "recording-artifacts" / recording_id
+
     def _load_faster_whisper_model(
         self,
         *,
@@ -4325,13 +3672,26 @@ class SQLiteRepository:
         if not transcript_text.strip():
             raise ValueError("Forced align worker requires transcript_text")
 
-        worker_python, worker_script = self._resolve_forced_align_worker_paths()
         with tempfile.TemporaryDirectory(prefix="speechcraft-aligner-") as temp_dir_raw:
             temp_dir = Path(temp_dir_raw)
             audio_path = temp_dir / "input.wav"
-            output_path = temp_dir / "alignment.json"
             audio_path.write_bytes(audio_bytes)
+            return self._run_forced_align_worker_on_file(audio_path, transcript_text)
 
+    def _run_forced_align_worker_on_file(
+        self,
+        audio_path: Path,
+        transcript_text: str,
+    ) -> list[dict[str, Any]]:
+        if not transcript_text.strip():
+            raise ValueError("Forced align worker requires transcript_text")
+
+        worker_python, worker_script = self._resolve_forced_align_worker_paths()
+        with tempfile.TemporaryDirectory(prefix="speechcraft-aligner-") as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            output_path = temp_dir / "alignment.json"
+            transcript_path = temp_dir / "transcript.txt"
+            transcript_path.write_text(transcript_text, encoding="utf-8")
             try:
                 completed = subprocess.run(
                     [
@@ -4340,7 +3700,7 @@ class SQLiteRepository:
                         "--audio",
                         str(audio_path),
                         "--text",
-                        transcript_text,
+                        str(transcript_path),
                         "--output",
                         str(output_path),
                     ],

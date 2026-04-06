@@ -32,8 +32,9 @@ class JobKind(str, Enum):
     IMPORT = "import"
     PREPROCESS = "preprocess"
     SLICE = "slice"
-    REVIEW_WINDOW_ASR = "review_window_asr"
-    FORCED_ALIGN_AND_PACK = "forced_align_and_pack"
+    SOURCE_TRANSCRIPTION = "source_transcription"
+    SOURCE_ALIGNMENT = "source_alignment"
+    SOURCE_SLICING = "source_slicing"
     INFERENCE = "inference"
     EXPORT = "export"
 
@@ -86,9 +87,12 @@ class SourceRecording(SQLModel, table=True):
     processing_recipe: str | None = None  # e.g., 'uvr_v5' if derived
 
     batch: ImportBatch = Relationship(back_populates="recordings")
-    review_windows: list["ReviewWindow"] = Relationship(back_populates="source_recording", cascade_delete=True)
+    source_artifact: "SourceRecordingArtifact" = Relationship(
+        back_populates="source_recording",
+        sa_relationship_kwargs={"uselist": False},
+        cascade_delete=True,
+    )
     processing_jobs: list["ProcessingJob"] = Relationship(back_populates="source_recording", cascade_delete=True)
-    dataset_processing_runs: list["DatasetProcessingRun"] = Relationship(back_populates="source_recording", cascade_delete=True)
     slices: list["Slice"] = Relationship(back_populates="source_recording", cascade_delete=True)
 
     @property
@@ -96,27 +100,23 @@ class SourceRecording(SQLModel, table=True):
         return self.num_samples / self.sample_rate if self.sample_rate else 0.0
 
 
-class ReviewWindow(SQLModel, table=True):
-    """Coarse review-only source spans. These are not canonical slices."""
+class SourceRecordingArtifact(SQLModel, table=True):
+    """Recording-level transcript and alignment artifact metadata."""
 
-    id: str = Field(primary_key=True)
-    source_recording_id: str = Field(foreign_key="sourcerecording.id")
-    start_seconds: float
-    end_seconds: float
-    rough_transcript: str = ""
-    asr_draft_transcript: str | None = None
-    last_asr_job_id: str | None = None
-    last_asr_at: datetime | None = None
-    asr_model_name: str | None = None
-    asr_model_version: str | None = None
-    asr_language: str | None = None
-    order_index: int = 0
-    window_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=utc_now)
+    source_recording_id: str = Field(primary_key=True, foreign_key="sourcerecording.id")
+    transcript_text_path: str | None = None
+    transcript_json_path: str | None = None
+    alignment_json_path: str | None = None
+    transcript_status: str | None = None
+    alignment_status: str | None = None
+    transcript_word_count: int = 0
+    alignment_word_count: int = 0
+    transcript_updated_at: datetime | None = None
+    aligned_at: datetime | None = None
+    alignment_backend: str | None = None
+    artifact_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
 
-    source_recording: SourceRecording = Relationship(back_populates="review_windows")
-    revisions: list["ReviewWindowRevision"] = Relationship(back_populates="review_window", cascade_delete=True)
-    variants: list["ReviewWindowVariant"] = Relationship(back_populates="review_window", cascade_delete=True)
+    source_recording: SourceRecording | None = Relationship(back_populates="source_artifact")
 
 
 class ProcessingJob(SQLModel, table=True):
@@ -126,8 +126,6 @@ class ProcessingJob(SQLModel, table=True):
     kind: JobKind = Field(sa_column=Column(sql_enum(JobKind), index=True))
     status: JobStatus = Field(default=JobStatus.PENDING, sa_column=Column(sql_enum(JobStatus), index=True))
     source_recording_id: str | None = Field(default=None, foreign_key="sourcerecording.id")
-    dataset_processing_run_id: str | None = Field(default=None, foreign_key="datasetprocessingrun.id", index=True)
-    target_review_window_id: str | None = Field(default=None, foreign_key="reviewwindow.id", index=True)
     input_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     output_payload: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     error_message: str | None = None
@@ -138,54 +136,6 @@ class ProcessingJob(SQLModel, table=True):
     completed_at: datetime | None = None
 
     source_recording: SourceRecording | None = Relationship(back_populates="processing_jobs")
-
-
-class DatasetProcessingRun(SQLModel, table=True):
-    id: str = Field(primary_key=True)
-    source_recording_id: str = Field(foreign_key="sourcerecording.id", index=True)
-    status: str = Field(index=True)
-    phase: str = Field(index=True)
-    total_review_windows: int = 0
-    alignment_total: int = 0
-    asr_completed: int = 0
-    asr_failed: int = 0
-    alignment_completed: int = 0
-    alignment_failed: int = 0
-    current_message: str | None = None
-    started_at: datetime = Field(default_factory=utc_now)
-    completed_at: datetime | None = None
-
-    source_recording: SourceRecording | None = Relationship(back_populates="dataset_processing_runs")
-
-
-class ReviewWindowVariant(SQLModel, table=True):
-    id: str = Field(primary_key=True)
-    review_window_id: str = Field(foreign_key="reviewwindow.id")
-    file_path: str
-    is_original: bool = False
-    generator_model: str | None = None
-    sample_rate: int
-    num_samples: int
-    created_at: datetime = Field(default_factory=utc_now)
-
-    review_window: ReviewWindow | None = Relationship(back_populates="variants")
-
-
-class ReviewWindowRevision(SQLModel, table=True):
-    id: str = Field(primary_key=True)
-    review_window_id: str = Field(foreign_key="reviewwindow.id", index=True)
-    parent_revision_id: str | None = None
-    transcript_text: str = ""
-    status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED, sa_column=Column(sql_enum(ReviewStatus)))
-    tags_payload: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
-    edl_operations: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
-    active_variant_id_snapshot: str | None = None
-    message: str | None = None
-    is_milestone: bool = False
-    is_active: bool = False
-    created_at: datetime = Field(default_factory=utc_now)
-
-    review_window: ReviewWindow | None = Relationship(back_populates="revisions")
 
 
 # ==========================================
@@ -278,6 +228,7 @@ class Slice(SQLModel, table=True):
     active_commit_id: str | None = Field(default=None, foreign_key="editcommit.id")
 
     status: ReviewStatus = Field(default=ReviewStatus.UNRESOLVED, sa_column=Column(sql_enum(ReviewStatus)))
+    is_locked: bool = False
 
     # Escape hatch for weird model-specific config
     model_metadata: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
@@ -350,27 +301,35 @@ class SourceRecordingView(SQLModel):
     processing_recipe: str | None = None
 
 
-class ReviewWindowView(SQLModel):
-    id: str
+class SourceRecordingArtifactView(SQLModel):
     source_recording_id: str
-    start_seconds: float
-    end_seconds: float
-    rough_transcript: str = ""
-    reviewed_transcript: str = ""
-    asr_draft_transcript: str | None = None
-    transcript_source: str | None = None
-    last_asr_job_id: str | None = None
-    last_asr_at: datetime | None = None
-    asr_model_name: str | None = None
-    asr_model_version: str | None = None
-    asr_language: str | None = None
-    review_status: ReviewStatus = ReviewStatus.UNRESOLVED
-    tags: list[TagView] = Field(default_factory=list)
-    order_index: int = 0
-    window_metadata: dict[str, Any] | None = None
-    can_undo: bool = False
-    can_redo: bool = False
-    created_at: datetime
+    transcript_text_path: str | None = None
+    transcript_json_path: str | None = None
+    alignment_json_path: str | None = None
+    transcript_status: str | None = None
+    alignment_status: str | None = None
+    transcript_word_count: int = 0
+    alignment_word_count: int = 0
+    transcript_updated_at: datetime | None = None
+    aligned_at: datetime | None = None
+    alignment_backend: str | None = None
+    artifact_metadata: dict[str, Any] | None = None
+
+
+class SourceRecordingQueueView(SQLModel):
+    id: str
+    batch_id: str
+    parent_recording_id: str | None = None
+    sample_rate: int
+    num_channels: int
+    num_samples: int
+    processing_recipe: str | None = None
+    duration_seconds: float = 0.0
+    slice_count: int = 0
+    processing_state: str = "idle"
+    processing_message: str | None = None
+    active_job: "ProcessingJobView | None" = None
+    artifact: SourceRecordingArtifactView | None = None
 
 
 class ProcessingJobView(SQLModel):
@@ -388,29 +347,22 @@ class ProcessingJobView(SQLModel):
     completed_at: datetime | None = None
 
 
-class DatasetProcessingRunRequest(SQLModel):
-    review_window_ids: list[str] | None = None
+class SourceTranscriptionRequest(SQLModel):
     model_name: str | None = None
     model_version: str | None = None
     language_hint: str | None = None
 
 
-class DatasetProcessingRunView(SQLModel):
-    id: str
-    source_recording_id: str
-    status: str
-    phase: str
-    total_review_windows: int = 0
-    asr_total: int = 0
-    alignment_total: int = 0
-    asr_completed: int = 0
-    asr_failed: int = 0
-    alignment_completed: int = 0
-    alignment_failed: int = 0
-    current_message: str | None = None
-    started_at: datetime
-    completed_at: datetime | None = None
-    health_page_ready: bool = False
+class SourceAlignmentRequest(SQLModel):
+    transcript_text_path: str | None = None
+    transcript_json_path: str | None = None
+    alignment_backend: str | None = None
+
+
+class SourceSlicingRequest(SQLModel):
+    replace_unlocked_slices: bool = True
+    preserve_locked_slices: bool = True
+    config_overrides: dict[str, Any] | None = None
 
 
 class ClipLabCapabilitiesView(SQLModel):
@@ -478,6 +430,7 @@ class SliceSummary(SQLModel):
     active_variant_id: str | None = None
     active_commit_id: str | None = None
     status: ReviewStatus
+    is_locked: bool = False
     duration_seconds: float = 0.0
     model_metadata: dict[str, Any] | None = None
     created_at: datetime
@@ -499,13 +452,14 @@ class SliceDetail(SliceSummary):
 
 class ClipLabItemView(SQLModel):
     id: str
-    kind: Literal["slice", "review_window"]
+    kind: Literal["slice"]
     source_recording_id: str
     source_recording: SourceRecordingView
     start_seconds: float
     end_seconds: float
     duration_seconds: float = 0.0
     status: ReviewStatus | None = None
+    is_locked: bool = False
     created_at: datetime
     transcript: ClipLabTranscriptView | None = None
     tags: list[TagView] = Field(default_factory=list)
@@ -653,35 +607,6 @@ class RecordingDerivativeCreate(SQLModel):
     num_channels: int
     num_samples: int
     processing_recipe: str
-
-
-class SlicerChunkInput(SQLModel):
-    start_seconds: float
-    end_seconds: float
-    rough_transcript: str = ""
-    order_index: int
-    model_metadata: dict[str, Any] | None = None
-
-
-class SlicerHandoffRequest(SQLModel):
-    windows: list[SlicerChunkInput]
-    pre_padding_ms: int = 150
-    post_padding_ms: int = 250
-    merge_gap_threshold_ms: int = 200
-    minimum_window_duration_ms: int = 750
-
-
-class ForcedAlignAndPackRequest(SQLModel):
-    transcript_text: str
-    review_window_ids: list[str] | None = None
-    minimum_duration_seconds: float = 6.0
-
-
-class ReviewWindowAsrRequest(SQLModel):
-    review_window_ids: list[str]
-    model_name: str | None = None
-    model_version: str | None = None
-    language_hint: str | None = None
 
 
 class AudioVariantCreate(SQLModel):
