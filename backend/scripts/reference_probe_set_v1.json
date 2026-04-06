@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "name": "reference_probe_set_v1",
+  "description": "Manual listening probe set for the first real-model reference-space checkpoint. Fill anchor and expected candidate ids from a mined candidate catalog; do not infer style from transcript alone.",
+  "project_id": "emmawatson-train",
+  "candidate_count_cap": 200,
+  "top_k": 5,
+  "probes": [
+    {
+      "id": "emma_neutral_1",
+      "label": "Emma Neutral 1",
+      "speaker": "Emma Watson",
+      "style_bucket": "neutral_narrator",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a calm, controlled narrator-style clip by ear."
+    },
+    {
+      "id": "emma_neutral_2",
+      "label": "Emma Neutral 2",
+      "speaker": "Emma Watson",
+      "style_bucket": "neutral_narrator",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a second calm narrator clip from a different recording if possible."
+    },
+    {
+      "id": "emma_neutral_3",
+      "label": "Emma Neutral 3",
+      "speaker": "Emma Watson",
+      "style_bucket": "neutral_narrator",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a third calm narrator clip that still sounds like the same desired mode."
+    },
+    {
+      "id": "emma_high_energy_1",
+      "label": "Emma High Energy 1",
+      "speaker": "Emma Watson",
+      "style_bucket": "high_energy_shouting",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a clearly high-energy, sharp, shouted, or emotionally intense clip by ear."
+    },
+    {
+      "id": "emma_high_energy_2",
+      "label": "Emma High Energy 2",
+      "speaker": "Emma Watson",
+      "style_bucket": "high_energy_shouting",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a second high-energy Emma clip from a different recording if possible."
+    },
+    {
+      "id": "emma_high_energy_3",
+      "label": "Emma High Energy 3",
+      "speaker": "Emma Watson",
+      "style_bucket": "high_energy_shouting",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a third high-energy Emma clip that still belongs in the same mode bucket."
+    },
+    {
+      "id": "billie_reference_1",
+      "label": "Billie Rae 1",
+      "speaker": "Hey Billie Rae",
+      "style_bucket": "cross_speaker_negative",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a stable Billie Rae clip for cross-speaker negative pressure."
+    },
+    {
+      "id": "billie_reference_2",
+      "label": "Billie Rae 2",
+      "speaker": "Hey Billie Rae",
+      "style_bucket": "cross_speaker_negative",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a second Billie Rae clip from a different recording."
+    },
+    {
+      "id": "billie_reference_3",
+      "label": "Billie Rae 3",
+      "speaker": "Hey Billie Rae",
+      "style_bucket": "cross_speaker_negative",
+      "anchor_candidate_id": "",
+      "expected_positive_candidate_ids": [],
+      "expected_negative_candidate_ids": [],
+      "notes": "Pick a third Billie Rae clip with clearly different speaker identity."
+    }
+  ]
+}

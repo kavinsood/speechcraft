@@ -1,4 +1,5 @@
-import type { ExportRun, ReviewStatus, Slice } from "../types";
+import { useEffect, useState, type FormEvent } from "react";
+import type { ClipLabItem, ExportRun, ReferenceAssetSummary, ReviewStatus } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatDurationCompact,
@@ -21,7 +22,7 @@ type StatusDurationMap = Record<ReviewStatus, number>;
 type InspectorPaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
-  activeClip: Slice | null;
+  activeClip: ClipLabItem | null;
   totalClipCount: number;
   totalDurationSeconds: number;
   datasetStatusCounts: {
@@ -35,6 +36,10 @@ type InspectorPaneProps = {
   onRetryLoad: () => void;
   onStatusChange: (status: ReviewStatus) => void;
   onVariantSelect: (variantId: string) => void;
+  existingReferenceForCurrentState: ReferenceAssetSummary | null;
+  onOpenExistingReference: (assetId: string) => void;
+  onSaveAsReference: (options?: { name?: string | null; mood_label?: string | null }) => void;
+  isSavingReference: boolean;
 };
 
 export default function InspectorPane({
@@ -51,13 +56,38 @@ export default function InspectorPane({
   onRetryLoad,
   onStatusChange,
   onVariantSelect,
+  existingReferenceForCurrentState,
+  onOpenExistingReference,
+  onSaveAsReference,
+  isSavingReference,
 }: InspectorPaneProps) {
+  const [showSaveAnotherForm, setShowSaveAnotherForm] = useState(false);
+  const [referenceName, setReferenceName] = useState("");
+  const [referenceMoodLabel, setReferenceMoodLabel] = useState("");
+
+  useEffect(() => {
+    setShowSaveAnotherForm(false);
+    setReferenceName("");
+    setReferenceMoodLabel("");
+  }, [activeClip?.id, activeClip?.active_commit?.id, existingReferenceForCurrentState?.id]);
+
+  function handleSaveAnotherSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onSaveAsReference({
+      name: referenceName.trim() || null,
+      mood_label: referenceMoodLabel.trim() || null,
+    });
+    setShowSaveAnotherForm(false);
+    setReferenceName("");
+    setReferenceMoodLabel("");
+  }
+
   return (
     <aside className="inspector-column panel">
       <div className="panel-header">
         <div>
           <p className="eyebrow">Inspector</p>
-          <h2>Slice Review</h2>
+          <h2>Clip Review</h2>
         </div>
       </div>
 
@@ -74,18 +104,22 @@ export default function InspectorPane({
         <>
           <section className="inspector-block">
             <h3>Pipeline Status</h3>
-            <div className="status-group">
-              {queuePriorityOrder.map((status) => (
-                <button
-                  key={status}
-                  className={`status-button ${activeClip.status === status ? "selected" : ""}`}
-                  type="button"
-                  onClick={() => onStatusChange(status)}
-                >
-                  {statusLabels[status]}
-                </button>
-              ))}
-            </div>
+            {activeClip.capabilities.can_set_status && activeClip.status ? (
+              <div className="status-group">
+                {queuePriorityOrder.map((status) => (
+                  <button
+                    key={status}
+                    className={`status-button ${activeClip.status === status ? "selected" : ""}`}
+                    type="button"
+                    onClick={() => onStatusChange(status)}
+                  >
+                    {statusLabels[status]}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="muted-copy">Status controls are unavailable for this Clip Lab item.</p>
+            )}
           </section>
 
           <section className="inspector-block">
@@ -98,7 +132,7 @@ export default function InspectorPane({
                   </span>
                 ))
               ) : (
-                <p className="muted-copy">No tags on this slice yet.</p>
+                <p className="muted-copy">No tags on this item yet.</p>
               )}
             </div>
           </section>
@@ -174,7 +208,7 @@ export default function InspectorPane({
           </section>
 
           <section className="inspector-block">
-            <h3>Slice History</h3>
+            <h3>Revision History</h3>
             {activeClip.commits.length > 0 ? (
               <div className="commit-list">
                 {[...activeClip.commits].reverse().map((commitEntry) => (
@@ -193,7 +227,7 @@ export default function InspectorPane({
                 ))}
               </div>
             ) : (
-              <p className="muted-copy">No saved slice history yet.</p>
+              <p className="muted-copy">No saved history for this Clip Lab item.</p>
             )}
           </section>
 
@@ -205,12 +239,13 @@ export default function InspectorPane({
                   <button
                     key={variant.id}
                     type="button"
-                    className={`commit-card ${variant.id === activeClip.active_variant_id ? "selected" : ""}`}
+                    className={`commit-card ${variant.id === activeClip.active_variant?.id ? "selected" : ""}`}
                     onClick={() => onVariantSelect(variant.id)}
+                    disabled={!activeClip.capabilities.can_switch_variants}
                   >
                     <div className="commit-row">
                       <strong>{variant.generator_model ?? "variant"}</strong>
-                      <span>{variant.id === activeClip.active_variant_id ? "active" : "available"}</span>
+                      <span>{variant.id === activeClip.active_variant?.id ? "active" : "available"}</span>
                     </div>
                     <p>{variant.is_original ? "Original slicer output" : "Derived variant"}</p>
                     <span className="commit-time">
@@ -220,8 +255,89 @@ export default function InspectorPane({
                 ))}
               </div>
             ) : (
-              <p className="muted-copy">No variants attached to this slice.</p>
+              <p className="muted-copy">No variants attached to this Clip Lab item.</p>
             )}
+          </section>
+
+          <section className="inspector-block">
+            <h3>Reference Library</h3>
+            <p className="muted-copy">
+              Saves the current rendered slice audio, including active edits.
+            </p>
+            {existingReferenceForCurrentState ? (
+              <>
+                <div className="commit-card selected">
+                  <div className="commit-row">
+                    <strong>{existingReferenceForCurrentState.name}</strong>
+                    <span>{existingReferenceForCurrentState.status}</span>
+                  </div>
+                  <p>
+                    This current slice state is already saved in the reference library.
+                  </p>
+                </div>
+                <div className="button-row">
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => onOpenExistingReference(existingReferenceForCurrentState.id)}
+                  >
+                    Open Existing
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowSaveAnotherForm((current) => !current)}
+                    disabled={isSavingReference}
+                  >
+                    {showSaveAnotherForm ? "Cancel" : "Save Another..."}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => onSaveAsReference()}
+                disabled={isSavingReference}
+              >
+                {isSavingReference ? "Saving reference..." : "Save Current Slice State"}
+              </button>
+            )}
+            {showSaveAnotherForm ? (
+              <form className="selection-panel reference-save-form" onSubmit={handleSaveAnotherSubmit}>
+                <label>
+                  <span>Name</span>
+                  <input
+                    className="search-input"
+                    type="text"
+                    value={referenceName}
+                    onChange={(event) => setReferenceName(event.target.value)}
+                    placeholder="Optional custom name"
+                  />
+                </label>
+                <label>
+                  <span>Mood Label</span>
+                  <input
+                    className="search-input"
+                    type="text"
+                    value={referenceMoodLabel}
+                    onChange={(event) => setReferenceMoodLabel(event.target.value)}
+                    placeholder="Optional mood or use-case"
+                  />
+                </label>
+                <div className="button-row">
+                  <button className="primary-button" type="submit" disabled={isSavingReference}>
+                    {isSavingReference ? "Saving reference..." : "Save Another Reference"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowSaveAnotherForm(false)}
+                    disabled={isSavingReference}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : null}
           </section>
 
           <section className="inspector-block">
@@ -278,7 +394,7 @@ export default function InspectorPane({
         </>
       ) : (
         <div className="empty-state">
-          {workspacePhase === "empty" ? "No project selected." : "No slice selected."}
+          {workspacePhase === "empty" ? "No project selected." : "No Clip Lab item selected."}
         </div>
       )}
     </aside>

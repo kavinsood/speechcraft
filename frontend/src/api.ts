@@ -1,11 +1,19 @@
 import type {
+  ClipLabItem,
   ExportPreview,
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
+  ReferenceAssetDetail,
+  ReferenceAssetSummary,
+  ReferenceCandidate,
+  ReferenceRunRerankResponse,
+  ReferenceRun,
   ReviewStatus,
   Slice,
   SliceSummary,
+  SourceRecording,
+  SourceRecordingQueue,
   WaveformPeaks,
 } from "./types";
 
@@ -51,12 +59,27 @@ export function buildVariantAudioUrl(variantId: string): string {
   return `${API_BASE}/media/variants/${variantId}.wav`;
 }
 
+export function resolveApiUrl(pathOrUrl: string): string {
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+    return pathOrUrl;
+  }
+  return `${API_BASE}${pathOrUrl}`;
+}
+
 export function buildSliceAudioUrl(sliceId: string, revision?: string): string {
   const url = new URL(`${API_BASE}/media/slices/${sliceId}.wav`);
   if (revision) {
     url.searchParams.set("rev", revision);
   }
   return url.toString();
+}
+
+export function buildReferenceVariantAudioUrl(variantId: string): string {
+  return `${API_BASE}/media/reference-variants/${variantId}.wav`;
+}
+
+export function buildReferenceCandidateAudioUrl(runId: string, candidateId: string): string {
+  return `${API_BASE}/media/reference-candidates/${runId}/${candidateId}.wav`;
 }
 
 export async function fetchHealthStrict(): Promise<{ status: string }> {
@@ -79,9 +102,105 @@ export async function fetchProjectSlices(projectId: string): Promise<SliceSummar
   return await parseJson<SliceSummary[]>(response);
 }
 
+export async function fetchProjectSourceRecordings(projectId: string): Promise<SourceRecording[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/source-recordings`);
+  return await parseJson<SourceRecording[]>(response);
+}
+
+export async function fetchProjectReferenceAssets(
+  projectId: string,
+): Promise<ReferenceAssetSummary[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-assets`);
+  return await parseJson<ReferenceAssetSummary[]>(response);
+}
+
+export async function fetchProjectReferenceRuns(projectId: string): Promise<ReferenceRun[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-runs`);
+  return await parseJson<ReferenceRun[]>(response);
+}
+
+export async function createReferenceRun(
+  projectId: string,
+  payload: {
+    recording_ids: string[];
+    mode?: "zero_shot" | "finetune" | "both";
+    target_durations?: number[] | null;
+    candidate_count_cap?: number;
+  },
+): Promise<ReferenceRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/reference-runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceRun>(response);
+}
+
+export async function fetchReferenceRun(runId: string): Promise<ReferenceRun> {
+  const response = await fetch(`${API_BASE}/api/reference-runs/${runId}`);
+  return await parseJson<ReferenceRun>(response);
+}
+
+export async function fetchReferenceRunCandidates(
+  runId: string,
+  options?: {
+    offset?: number;
+    limit?: number;
+    query?: string;
+  },
+): Promise<ReferenceCandidate[]> {
+  const url = new URL(`${API_BASE}/api/reference-runs/${runId}/candidates`);
+  if (options?.offset !== undefined) {
+    url.searchParams.set("offset", String(options.offset));
+  }
+  if (options?.limit !== undefined) {
+    url.searchParams.set("limit", String(options.limit));
+  }
+  if (options?.query) {
+    url.searchParams.set("query", options.query);
+  }
+  const response = await fetch(url.toString());
+  return await parseJson<ReferenceCandidate[]>(response);
+}
+
+export async function rerankReferenceRunCandidates(
+  runId: string,
+  payload: {
+    positive_candidate_ids: string[];
+    negative_candidate_ids: string[];
+    mode?: string | null;
+  },
+): Promise<ReferenceRunRerankResponse> {
+  const response = await fetch(`${API_BASE}/api/reference-runs/${runId}/rerank`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceRunRerankResponse>(response);
+}
+
+export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAssetDetail> {
+  const response = await fetch(`${API_BASE}/api/reference-assets/${assetId}`);
+  return await parseJson<ReferenceAssetDetail>(response);
+}
+
+export async function fetchProjectRecordings(projectId: string): Promise<SourceRecordingQueue[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/recordings`);
+  return await parseJson<SourceRecordingQueue[]>(response);
+}
+
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/slices/${sliceId}`);
   return await parseJson<Slice>(response);
+}
+
+export async function fetchClipLabItem(sliceId: string): Promise<ClipLabItem> {
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}/clip-lab`);
+  return await parseJson<ClipLabItem>(response);
 }
 
 export async function fetchProjectExports(projectId: string): Promise<ExportRun[]> {
@@ -245,10 +364,43 @@ export async function setActiveVariant(
   return await parseJson<Slice>(response);
 }
 
-export async function fetchWaveformPeaks(
-  clipId: string,
+export async function fetchClipLabWaveformPeaks(
+  sliceId: string,
   bins = 120,
 ): Promise<WaveformPeaks> {
-  const response = await fetch(`${API_BASE}/api/clips/${clipId}/waveform-peaks?bins=${bins}`);
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}/waveform-peaks?bins=${bins}`);
   return await parseJson<WaveformPeaks>(response);
+}
+
+export async function saveCurrentSliceAsReference(payload: {
+  slice_id: string;
+  name?: string | null;
+  mood_label?: string | null;
+}): Promise<ReferenceAssetDetail> {
+  const response = await fetch(`${API_BASE}/api/reference-assets/from-slice`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceAssetDetail>(response);
+}
+
+export async function promoteReferenceCandidate(payload: {
+  run_id: string;
+  candidate_id: string;
+  source_start_seconds?: number | null;
+  source_end_seconds?: number | null;
+  name?: string | null;
+  mood_label?: string | null;
+}): Promise<ReferenceAssetDetail> {
+  const response = await fetch(`${API_BASE}/api/reference-assets/from-candidate`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ReferenceAssetDetail>(response);
 }

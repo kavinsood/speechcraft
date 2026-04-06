@@ -48,6 +48,22 @@ export default function WaveformPane({
   const [audioState, setAudioState] = useState<"loading" | "ready" | "error">("loading");
   const [audioError, setAudioError] = useState<string | null>(null);
 
+  function isAbortLikeError(error: unknown): boolean {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "";
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes("abort") ||
+      normalized.includes("aborted") ||
+      normalized.includes("user aborted") ||
+      normalized.includes("cancel")
+    );
+  }
+
   useEffect(() => {
     selectionChangeRef.current = onSelectionChange;
     cursorChangeRef.current = onCursorChange;
@@ -160,6 +176,9 @@ export default function WaveformPane({
       setAudioError(null);
     });
     waveSurfer.on("error", (error) => {
+      if (isAbortLikeError(error)) {
+        return;
+      }
       const message =
         error instanceof Error
           ? error.message
@@ -294,10 +313,6 @@ export default function WaveformPane({
     setAudioState("loading");
     setAudioError(null);
 
-    if (peaks && peaks.length > 0) {
-      void waveSurfer.load(audioUrl, [peaks], durationSeconds);
-      return;
-    }
     void waveSurfer.load(audioUrl);
   }, [audioUrl, durationSeconds, peaks]);
 

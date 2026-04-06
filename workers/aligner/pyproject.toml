@@ -1,0 +1,23 @@
+[project]
+name = "speechcraft-aligner-worker"
+version = "0.1.0"
+description = "Standalone torchaudio forced-alignment worker for Speechcraft"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "numpy>=2.2.0,<3.0.0",
+  "torch>=2.6.0,<3.0.0",
+  "torchaudio>=2.6.0,<3.0.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

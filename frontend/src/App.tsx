@@ -3,15 +3,17 @@ import { Settings2 } from "lucide-react";
 import { ApiError, fetchProjects } from "./api";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
+import ReferencePage from "./pages/ReferencePage";
 import StepPlaceholderPage from "./pages/StepPlaceholderPage";
-import type { Project } from "./types";
+import type { ClipLabItemRef, Project } from "./types";
 
-type AppStep = "ingest" | "enhance" | "segment" | "label" | "train" | "deploy";
+type AppStep = "ingest" | "enhance" | "segment" | "label" | "reference" | "train" | "deploy";
 type ProjectLoadStatus = "loading" | "ready" | "error";
 
 type AppRoute = {
   step: AppStep;
   projectId: string | null;
+  clipItem: ClipLabItemRef | null;
 };
 
 type StepDefinition = {
@@ -33,6 +35,7 @@ const stepDefinitions: StepDefinition[] = [
   { id: "enhance", label: "Enhance", shortLabel: "En", glyph: "E", tone: "Clean the raw signal" },
   { id: "segment", label: "Segment", shortLabel: "Se", glyph: "S", tone: "Split into candidates" },
   { id: "label", label: "Label", shortLabel: "La", glyph: "L", tone: "Human review and repair" },
+  { id: "reference", label: "Reference", shortLabel: "Re", glyph: "R", tone: "Mine and curate steering clips" },
   { id: "train", label: "Train", shortLabel: "Tr", glyph: "T", tone: "Fine-tune the voice" },
   { id: "deploy", label: "Deploy", shortLabel: "De", glyph: "D", tone: "Ship for inference" },
 ];
@@ -57,11 +60,15 @@ function readRouteFromLocation(): AppRoute {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
   const maybeStep = path.length > 0 ? path : "ingest";
   const step = isAppStep(maybeStep) ? maybeStep : "ingest";
-  const projectId = new URLSearchParams(window.location.search).get("project")?.trim() ?? null;
+  const searchParams = new URLSearchParams(window.location.search);
+  const projectId = searchParams.get("project")?.trim() ?? null;
+  const clipId = searchParams.get("clip_id")?.trim() ?? null;
+  const clipItem = clipId ? ({ id: clipId } satisfies ClipLabItemRef) : null;
 
   return {
     step,
     projectId: projectId && projectId.length > 0 ? projectId : null,
+    clipItem,
   };
 }
 
@@ -72,6 +79,11 @@ function writeRouteToLocation(route: AppRoute, replace = false) {
     url.searchParams.set("project", route.projectId);
   } else {
     url.searchParams.delete("project");
+  }
+  if (route.clipItem) {
+    url.searchParams.set("clip_id", route.clipItem.id);
+  } else {
+    url.searchParams.delete("clip_id");
   }
 
   if (replace) {
@@ -122,16 +134,25 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
     };
   }
 
-  if (step === "train") {
+  if (step === "reference") {
     return {
       eyebrow: "Step 05",
+      title: activeProject?.name ?? "Reference Workstation",
+      description:
+        "Curate reusable steering clips from source recordings and saved slice states without polluting the label queue.",
+    };
+  }
+
+  if (step === "train") {
+    return {
+      eyebrow: "Step 06",
       title: "Training shell",
       description: "Stage the fine-tuning workspace without forcing a job model too early.",
     };
   }
 
   return {
-    eyebrow: "Step 06",
+    eyebrow: "Step 07",
     title: "Deployment shell",
     description: "Hold inference, serving, and release actions in a final workstation stage.",
   };
@@ -208,7 +229,7 @@ export default function App() {
   }, [route.step]);
 
   function navigate(nextStep: AppStep, nextProjectId = route.projectId) {
-    const nextRoute = { step: nextStep, projectId: nextProjectId ?? null };
+    const nextRoute = { step: nextStep, projectId: nextProjectId ?? null, clipItem: route.clipItem };
     setRoute(nextRoute);
     writeRouteToLocation(nextRoute);
   }
@@ -217,6 +238,7 @@ export default function App() {
     const nextRoute = {
       step: route.step,
       projectId: nextProjectId,
+      clipItem: route.clipItem,
     };
     setRoute(nextRoute);
     writeRouteToLocation(nextRoute);
@@ -234,9 +256,22 @@ export default function App() {
   if (route.step === "ingest") {
     pageContent = <IngestPage {...pageProps} />;
   } else if (route.step === "label") {
-    pageContent = <LabelPage {...pageProps} onHeaderActionsChange={setPageHeaderActions} />;
+    pageContent = (
+      <LabelPage
+        {...pageProps}
+        activeClipItem={route.clipItem}
+        onActiveClipItemChange={(clipItem) => {
+          const nextRoute = { ...route, clipItem };
+          setRoute(nextRoute);
+          writeRouteToLocation(nextRoute, true);
+        }}
+        onHeaderActionsChange={setPageHeaderActions}
+      />
+    );
+  } else if (route.step === "reference") {
+    pageContent = <ReferencePage {...pageProps} />;
   } else {
-    const configByStep: Record<Exclude<AppStep, "ingest" | "label">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
+    const configByStep: Record<Exclude<AppStep, "ingest" | "label" | "reference">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
       enhance: {
         leftTitle: "Planned modules",
         rightTitle: "Notes",
