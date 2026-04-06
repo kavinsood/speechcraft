@@ -1,4 +1,5 @@
 import type {
+  ClipLabItem,
   ExportPreview,
   ExportRun,
   ImportBatch,
@@ -12,6 +13,7 @@ import type {
   Slice,
   SliceSummary,
   SourceRecording,
+  SourceRecordingQueue,
   WaveformPeaks,
 } from "./types";
 
@@ -55,6 +57,13 @@ async function parseJson<T>(response: Response): Promise<T> {
 
 export function buildVariantAudioUrl(variantId: string): string {
   return `${API_BASE}/media/variants/${variantId}.wav`;
+}
+
+export function resolveApiUrl(pathOrUrl: string): string {
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+    return pathOrUrl;
+  }
+  return `${API_BASE}${pathOrUrl}`;
 }
 
 export function buildSliceAudioUrl(sliceId: string, revision?: string): string {
@@ -179,9 +188,19 @@ export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAss
   return await parseJson<ReferenceAssetDetail>(response);
 }
 
+export async function fetchProjectRecordings(projectId: string): Promise<SourceRecordingQueue[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/recordings`);
+  return await parseJson<SourceRecordingQueue[]>(response);
+}
+
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
   const response = await fetch(`${API_BASE}/api/slices/${sliceId}`);
   return await parseJson<Slice>(response);
+}
+
+export async function fetchClipLabItem(sliceId: string): Promise<ClipLabItem> {
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}/clip-lab`);
+  return await parseJson<ClipLabItem>(response);
 }
 
 export async function fetchProjectExports(projectId: string): Promise<ExportRun[]> {
@@ -345,11 +364,11 @@ export async function setActiveVariant(
   return await parseJson<Slice>(response);
 }
 
-export async function fetchWaveformPeaks(
-  clipId: string,
+export async function fetchClipLabWaveformPeaks(
+  sliceId: string,
   bins = 120,
 ): Promise<WaveformPeaks> {
-  const response = await fetch(`${API_BASE}/api/clips/${clipId}/waveform-peaks?bins=${bins}`);
+  const response = await fetch(`${API_BASE}/api/slices/${sliceId}/waveform-peaks?bins=${bins}`);
   return await parseJson<WaveformPeaks>(response);
 }
 

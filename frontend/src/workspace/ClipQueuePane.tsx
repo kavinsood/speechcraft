@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { SliceSummary } from "../types";
+import type { ClipLabItemRef, SliceSummary, SourceRecordingQueue } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   clipMatchesFilters,
@@ -17,9 +17,10 @@ type ClipQueuePaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
+  recordings: SourceRecordingQueue[];
   clips: SliceSummary[];
-  activeClipId: string | null;
-  onSelectClip: (clipId: string) => void;
+  activeClipItem: ClipLabItemRef | null;
+  onSelectClipItem: (clipItem: ClipLabItemRef) => void;
   onRetryLoad: () => void;
   onVisibleClipIdsChange: (clipIds: string[]) => void;
 };
@@ -28,9 +29,10 @@ export default function ClipQueuePane({
   workspacePhase,
   workspaceError,
   workspaceEmptyMessage,
+  recordings,
   clips,
-  activeClipId,
-  onSelectClip,
+  activeClipItem,
+  onSelectClipItem,
   onRetryLoad,
   onVisibleClipIdsChange,
 }: ClipQueuePaneProps) {
@@ -67,11 +69,10 @@ export default function ClipQueuePane({
 
   const availableFilterTags = useMemo(() => {
     const statusTagNames = new Set(queuePriorityOrder.map((status) => status.toLowerCase()));
-    const allClipTags = clips.flatMap((clip) =>
-      clip.tags
-        .map((tag) => tag.name.toLowerCase())
-        .filter((tagName) => !statusTagNames.has(tagName)),
-    );
+    const allClipTags = clips
+      .flatMap((clip) => clip.tags)
+      .map((tag) => tag.name.toLowerCase())
+      .filter((tagName) => !statusTagNames.has(tagName));
     return Array.from(new Set(allClipTags)).sort();
   }, [clips]);
 
@@ -91,6 +92,29 @@ export default function ClipQueuePane({
         ? current.filter((entry) => entry !== tagName)
         : [...current, tagName],
     );
+  }
+
+  function getRecordingStatusLabel(recording: SourceRecordingQueue): string {
+    switch (recording.processing_state) {
+      case "transcribing":
+        return "Transcribing";
+      case "aligning":
+        return "Aligning";
+      case "slicing":
+        return "Slicing";
+      case "alignment_stale":
+        return "Needs Realignment";
+      case "failed":
+        return "Failed";
+      case "sliced":
+        return "Sliced";
+      case "aligned":
+        return "Aligned";
+      case "transcribed":
+        return "Transcribed";
+      default:
+        return "Idle";
+    }
   }
 
   return (
@@ -157,20 +181,44 @@ export default function ClipQueuePane({
           />
         ) : null}
         {workspacePhase === "empty" ? (
-          <div className="empty-state">
-            {workspaceEmptyMessage ?? "No projects are available yet."}
+          <div className="workspace-empty-stack">
+            <div className="empty-state">
+              {workspaceEmptyMessage ?? "No projects are available yet."}
+            </div>
+            {recordings.length > 0 ? (
+              <div className="recording-status-list">
+                <p className="eyebrow">Recordings</p>
+                {recordings.map((recording) => (
+                  <div key={recording.id} className="recording-status-card">
+                    <div className="clip-list-row">
+                      <strong>{recording.id}</strong>
+                      <span className={`review-chip status-${recording.processing_state === "failed" ? "rejected" : recording.processing_state === "sliced" ? "accepted" : "unresolved"}`}>
+                        {getRecordingStatusLabel(recording)}
+                      </span>
+                    </div>
+                    <p>{recording.processing_message ?? "Recording is idle."}</p>
+                    <div className="clip-list-meta">
+                      <span>{formatSeconds(recording.duration_seconds)}</span>
+                      <span>{recording.slice_count} slice{recording.slice_count === 1 ? "" : "s"}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         ) : null}
         {workspacePhase === "ready" && queueClips.length === 0 ? (
-          <div className="empty-state">No clips match the current filters.</div>
+          <div className="empty-state">No items match the current filters.</div>
         ) : null}
-        {workspacePhase === "ready"
-          ? queueClips.map((clip, index) => (
+        {workspacePhase === "ready" ? (
+          <>
+            {queueClips.length > 0 ? <p className="eyebrow">Slices</p> : null}
+            {queueClips.map((clip, index) => (
               <button
                 key={clip.id}
-                className={`clip-list-item ${clip.id === activeClipId ? "active" : ""}`}
+                className={`clip-list-item ${clip.id === activeClipItem?.id ? "active" : ""}`}
                 type="button"
-                onClick={() => onSelectClip(clip.id)}
+                onClick={() => onSelectClipItem({ id: clip.id })}
               >
                 <div className="clip-list-row">
                   <strong>
@@ -186,8 +234,9 @@ export default function ClipQueuePane({
                   <span>{clip.active_variant_generator_model ?? "source"}</span>
                 </div>
               </button>
-            ))
-          : null}
+            ))}
+          </>
+        ) : null}
       </div>
     </aside>
   );

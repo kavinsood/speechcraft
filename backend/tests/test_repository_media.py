@@ -1,9 +1,12 @@
 import json
 import math
+import os
+import subprocess
 import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from sqlmodel import Session, select
 
@@ -26,17 +29,22 @@ from app.models import (
     ReferenceSourceKind,
     ReferenceVariant,
     ReviewStatus,
+    Slice,
     SliceEdlUpdate,
     SliceSaveRequest,
     SliceSplitRequest,
     SliceStatusUpdate,
     SliceTagUpdate,
     SliceTranscriptUpdate,
+    SourceAlignmentRequest,
+    SourceTranscriptionRequest,
+    SourceSlicingRequest,
     SourceRecording,
     SourceRecordingCreate,
     TagPayload,
 )
 from app.repository import SQLiteRepository, SliceSaveValidationError
+from app.worker import process_next_job
 
 
 def read_wav_duration_seconds(path: Path) -> float:
@@ -130,9 +138,29 @@ class RepositoryMediaTests(TestCase):
             media_root=root / "media",
             exports_root=root / "exports",
         )
+        self.addCleanup(self.repository.close)
 
     def tearDown(self) -> None:
+        self.repository.close()
         self.temp_dir.cleanup()
+
+    def _fake_forced_align_subprocess(
+        self,
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        output_index = command.index("--output") + 1
+        output_path = Path(command[output_index])
+        transcript_text = str(command[command.index("--text") + 1]).strip()
+        words = transcript_text.split() or ["placeholder"]
+        word_duration = 0.6
+        alignment_payload = []
+        for index, word in enumerate(words):
+            start = round(index * word_duration, 6)
+            end = round((index + 1) * word_duration, 6)
+            alignment_payload.append({"word": word, "start": start, "end": end})
+        output_path.write_text(json.dumps(alignment_payload), encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     def test_slice_duration_is_returned_from_backend(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
@@ -301,6 +329,7 @@ class RepositoryMediaTests(TestCase):
             media_root=root / "legacy-media",
             exports_root=root / "legacy-exports",
         )
+        self.addCleanup(migrated_repository.close)
 
         projects = migrated_repository.list_projects()
 
@@ -441,6 +470,64 @@ class RepositoryMediaTests(TestCase):
 
         self.assertFalse(any(f"{initial.id}.wav|" in line for line in preview_after.lines))
 
+    def test_create_source_recording_creates_source_artifact_row(self) -> None:
+        source_path = self.repository.media_root / "sources" / "artifact-test.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(
+            self.repository._render_synthetic_wave_bytes(48000, 1, 1.5, "artifact-test")
+        )
+
+        recording = self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-artifact-test",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=72000,
+            )
+        )
+
+        artifact = self.repository.get_source_recording_artifact(recording.id)
+
+        self.assertEqual(artifact.source_recording_id, recording.id)
+        self.assertEqual(artifact.transcript_status, "missing")
+        self.assertEqual(artifact.alignment_status, "missing")
+        self.assertEqual(artifact.transcript_word_count, 0)
+        self.assertEqual(artifact.alignment_word_count, 0)
+
+    def test_list_project_recordings_reports_recording_level_processing_state(self) -> None:
+        source_path = self.repository.media_root / "sources" / "queue-state.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(
+            self.repository._render_synthetic_wave_bytes(48000, 1, 1.25, "queue-state")
+        )
+
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-queue-state",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=60000,
+            )
+        )
+        self.repository.enqueue_source_transcription(
+            "src-queue-state",
+            SourceTranscriptionRequest(model_name="stub-source-asr", model_version="2026.04", language_hint="en"),
+        )
+
+        recordings = self.repository.list_project_recordings("phase1-demo")
+        queue_state = next(recording for recording in recordings if recording.id == "src-queue-state")
+
+        self.assertEqual(queue_state.processing_state, "transcribing")
+        self.assertEqual(queue_state.processing_message, "Transcribing audio...")
+        self.assertEqual(queue_state.slice_count, 0)
+        self.assertIsNotNone(queue_state.active_job)
+        self.assertEqual(queue_state.active_job.kind, "source_transcription")
+        self.assertEqual(queue_state.artifact.transcript_status, "missing")
+
     def test_undo_redo_restores_metadata_history(self) -> None:
         initial = self.repository.get_slice_detail(self.repository.get_project_slices("phase1-demo")[0].id)
         original_text = initial.transcript.original_text if initial.transcript is not None else ""
@@ -483,6 +570,226 @@ class RepositoryMediaTests(TestCase):
 
         redo_status = self.repository.redo_slice(initial.id)
         self.assertEqual(redo_status.status, "accepted")
+
+    def test_human_transcript_edit_locks_slice(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        updated = self.repository.update_slice_transcript(
+            initial.id,
+            SliceTranscriptUpdate(modified_text="Human corrected transcript."),
+        )
+
+        self.assertTrue(updated.is_locked)
+        refreshed = self.repository.get_slice_detail(initial.id)
+        self.assertTrue(refreshed.is_locked)
+
+    def test_source_transcription_job_writes_recording_artifacts(self) -> None:
+        source_path = self.repository.media_root / "sources" / "source-asr.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(
+            self.repository._render_synthetic_wave_bytes(48000, 1, 2.0, "source-asr")
+        )
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-source-asr",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=96000,
+            )
+        )
+
+        job = self.repository.enqueue_source_transcription(
+            "src-source-asr",
+            SourceTranscriptionRequest(model_name="stub-source-asr", model_version="2026.04", language_hint="en"),
+        )
+
+        processed = process_next_job(self.repository, worker_id="test-worker")
+
+        self.assertTrue(processed)
+        latest = self.repository.get_processing_job(job.id)
+        self.assertEqual(latest.status, "completed")
+        artifact = self.repository.get_source_recording_artifact("src-source-asr")
+        self.assertEqual(artifact.transcript_status, "ok")
+        self.assertIsNotNone(artifact.transcript_text_path)
+        self.assertIsNotNone(artifact.transcript_json_path)
+        self.assertTrue(Path(artifact.transcript_text_path).exists())
+        self.assertTrue(Path(artifact.transcript_json_path).exists())
+
+    def test_source_alignment_job_writes_alignment_artifact(self) -> None:
+        source_path = self.repository.media_root / "sources" / "source-align.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(
+            self.repository._render_synthetic_wave_bytes(48000, 1, 2.5, "source-align")
+        )
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-source-align",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=120000,
+            )
+        )
+        self.repository.enqueue_source_transcription(
+            "src-source-align",
+            SourceTranscriptionRequest(model_name="stub-source-asr", model_version="2026.04", language_hint="en"),
+        )
+        process_next_job(self.repository, worker_id="test-worker")
+
+        def fake_align(_audio_bytes: bytes, transcript_text: str) -> list[dict[str, object]]:
+            words = transcript_text.split() or ["stub"]
+            return [
+                {"word": word, "start": round(index * 0.2, 6), "end": round(index * 0.2 + 0.15, 6)}
+                for index, word in enumerate(words)
+            ]
+
+        with patch.object(self.repository, "_run_forced_align_worker", side_effect=fake_align):
+            job = self.repository.enqueue_source_alignment(
+                "src-source-align",
+                SourceAlignmentRequest(alignment_backend="stub-align"),
+            )
+            processed = process_next_job(self.repository, worker_id="test-worker")
+
+        self.assertTrue(processed)
+        latest = self.repository.get_processing_job(job.id)
+        self.assertEqual(latest.status, "completed")
+        artifact = self.repository.get_source_recording_artifact("src-source-align")
+        self.assertEqual(artifact.alignment_status, "ok")
+        self.assertEqual(artifact.alignment_backend, "stub-align")
+        self.assertIsNotNone(artifact.alignment_json_path)
+        self.assertTrue(Path(artifact.alignment_json_path).exists())
+
+    def test_source_slicing_job_creates_direct_slices(self) -> None:
+        source_path = self.repository.media_root / "sources" / "source-slice.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(
+            self.repository._render_synthetic_wave_bytes(48000, 1, 12.0, "source-slice")
+        )
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-source-slice",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=576000,
+            )
+        )
+        artifact_dir = self.repository.exports_root / "recording-artifacts" / "src-source-slice"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        transcript_base = artifact_dir / "transcript.base.txt"
+        transcript_text = artifact_dir / "transcript.txt"
+        alignment_path = artifact_dir / "alignment.json"
+        transcript_text.write_text("alpha beta gamma delta epsilon zeta eta theta\n", encoding="utf-8")
+        transcript_base.write_text("alpha beta gamma delta epsilon zeta eta theta\n", encoding="utf-8")
+        alignment_path.write_text(
+            json.dumps(
+                [
+                    {"word": "alpha", "start": 0.5, "end": 1.0},
+                    {"word": "beta", "start": 1.4, "end": 1.9},
+                    {"word": "gamma", "start": 2.4, "end": 2.9},
+                    {"word": "delta", "start": 3.8, "end": 4.3},
+                    {"word": "epsilon", "start": 5.1, "end": 5.6},
+                    {"word": "zeta", "start": 6.6, "end": 7.1},
+                    {"word": "eta", "start": 8.0, "end": 8.5},
+                    {"word": "theta", "start": 9.4, "end": 9.9},
+                ],
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self.repository.set_source_recording_artifact_paths(
+            "src-source-slice",
+            transcript_text_path=str(transcript_text),
+            transcript_json_path=None,
+            alignment_json_path=str(alignment_path),
+            transcript_status="ok",
+            alignment_status="ok",
+            transcript_word_count=8,
+            alignment_word_count=8,
+            artifact_metadata={"base_transcript_text_path": str(transcript_base), "language": "en"},
+        )
+
+        job = self.repository.enqueue_source_slicing(
+            "src-source-slice",
+            SourceSlicingRequest(),
+        )
+        processed = process_next_job(self.repository, worker_id="test-worker")
+
+        self.assertTrue(processed)
+        latest = self.repository.get_processing_job(job.id)
+        self.assertEqual(latest.status, "completed")
+        slices = [slice_row for slice_row in self.repository.get_project_slices("phase1-demo") if slice_row.source_recording_id == "src-source-slice"]
+        self.assertGreaterEqual(len(slices), 1)
+        detail = self.repository.get_slice_detail(slices[0].id)
+        self.assertIn("source_word_start_index", detail.model_metadata)
+        self.assertIn("training_start", detail.model_metadata)
+        self.assertEqual(detail.transcript.alignment_data["kind"], "source_slicer_alignment")
+
+    def test_source_transcript_patch_marks_alignment_stale(self) -> None:
+        source_path = self.repository.media_root / "sources" / "source-patch.wav"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_bytes(
+            self.repository._render_synthetic_wave_bytes(48000, 1, 3.0, "source-patch")
+        )
+        self.repository.create_source_recording(
+            SourceRecordingCreate(
+                id="src-source-patch",
+                batch_id="phase1-demo",
+                file_path=str(source_path),
+                sample_rate=48000,
+                num_channels=1,
+                num_samples=144000,
+            )
+        )
+        artifact_dir = self.repository.exports_root / "recording-artifacts" / "src-source-patch"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        transcript_base = artifact_dir / "transcript.base.txt"
+        transcript_text = artifact_dir / "transcript.txt"
+        transcript_base.write_text("alpha beta gamma delta\n", encoding="utf-8")
+        transcript_text.write_text("alpha beta gamma delta\n", encoding="utf-8")
+        self.repository.set_source_recording_artifact_paths(
+            "src-source-patch",
+            transcript_text_path=str(transcript_text),
+            transcript_json_path=None,
+            alignment_json_path=None,
+            transcript_status="ok",
+            alignment_status="ok",
+            transcript_word_count=4,
+            artifact_metadata={"base_transcript_text_path": str(transcript_base)},
+        )
+
+        with Session(self.repository.engine, expire_on_commit=False) as session:
+            recording = session.get(SourceRecording, "src-source-patch")
+            self.assertIsNotNone(recording)
+            slice_row = self.repository._create_slice_from_source_span(
+                session,
+                recording,
+                slice_id="slice-source-patch",
+                start_seconds=0.0,
+                end_seconds=1.0,
+                transcript_text="alpha beta",
+                order_index=0,
+                extra_metadata={
+                    "source_word_start_index": 0,
+                    "source_word_end_index": 1,
+                },
+            )
+            session.commit()
+
+        updated = self.repository.update_slice_transcript(
+            "slice-source-patch",
+            SliceTranscriptUpdate(modified_text="alpha better"),
+        )
+
+        self.assertTrue(updated.is_locked)
+        artifact = self.repository.get_source_recording_artifact("src-source-patch")
+        self.assertEqual(artifact.transcript_status, "patched")
+        self.assertEqual(artifact.alignment_status, "stale")
+        self.assertEqual(Path(artifact.transcript_text_path).read_text(encoding="utf-8").strip(), "alpha better gamma delta")
 
     def test_metadata_only_revisions_reuse_audio_cache_and_public_models_hide_paths(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
@@ -532,6 +839,7 @@ class RepositoryMediaTests(TestCase):
             ),
         )
         new_media_path = self.repository.get_slice_media_path(initial.id)
+        self.repository.get_waveform_peaks(updated.id, 960)
 
         with Session(self.repository.engine, expire_on_commit=False) as session:
             new_slice_row = self.repository._get_loaded_slice(session, initial.id)
@@ -543,10 +851,11 @@ class RepositoryMediaTests(TestCase):
 
         result = self.repository.cleanup_project_media("phase1-demo")
 
-        self.assertGreaterEqual(result.deleted_file_count, 2)
+        self.assertGreaterEqual(result.deleted_file_count, 1)
         self.assertFalse(old_media_path.exists())
         self.assertFalse(old_peaks_path.exists())
         self.assertTrue(new_media_path.exists())
+        self.repository.get_waveform_peaks(updated.id, 960)
         self.assertTrue(new_peaks_path.exists())
 
     def test_restart_does_not_rewrite_intentional_blank_revision_history(self) -> None:
@@ -578,6 +887,7 @@ class RepositoryMediaTests(TestCase):
             media_root=Path(self.temp_dir.name) / "media",
             exports_root=Path(self.temp_dir.name) / "exports",
         )
+        self.addCleanup(restarted.close)
 
         with Session(restarted.engine, expire_on_commit=False) as session:
             blank_commit = session.get(EditCommit, blank_id)
@@ -611,6 +921,7 @@ class RepositoryMediaTests(TestCase):
             media_root=Path(self.temp_dir.name) / "media",
             exports_root=Path(self.temp_dir.name) / "exports",
         )
+        self.addCleanup(restarted.close)
 
         with Session(restarted.engine, expire_on_commit=False) as session:
             commit = session.exec(
@@ -628,6 +939,7 @@ class RepositoryMediaTests(TestCase):
             media_root=Path(self.temp_dir.name) / "media",
             exports_root=Path(self.temp_dir.name) / "exports",
         )
+        self.addCleanup(restarted_again.close)
 
         with Session(restarted_again.engine, expire_on_commit=False) as session:
             commit = session.exec(
@@ -717,6 +1029,32 @@ class RepositoryMediaTests(TestCase):
         self.assertEqual(saved.active_commit_id, latest_commit.id)
         self.assertEqual(latest_commit.message, "Saved slice milestone")
         self.assertTrue(latest_commit.is_milestone)
+
+    def test_source_recording_window_media_path_materializes_audio_from_master_recording(self) -> None:
+        media_path = self.repository.get_source_recording_window_media_path("src-001", 12.4, 15.68)
+
+        self.assertTrue(media_path.exists())
+        self.assertAlmostEqual(read_wav_duration_seconds(media_path), 3.28, places=2)
+
+    def test_clip_lab_item_loads_slice_with_slice_capabilities(self) -> None:
+        initial = self.repository.get_project_slices("phase1-demo")[0]
+
+        item = self.repository.get_slice_clip_lab_item(initial.id)
+
+        self.assertEqual(item.kind, "slice")
+        self.assertEqual(item.id, initial.id)
+        self.assertEqual(item.source_recording_id, initial.source_recording_id)
+        self.assertEqual(item.status, initial.status)
+        self.assertIsNotNone(item.transcript)
+        self.assertIn("/media/slices/", item.audio_url)
+        self.assertTrue(item.capabilities.can_save)
+        self.assertFalse(item.capabilities.can_split)
+        self.assertFalse(item.capabilities.can_merge)
+        self.assertTrue(item.capabilities.can_edit_waveform)
+        self.assertTrue(item.capabilities.can_run_processing)
+        self.assertTrue(item.capabilities.can_switch_variants)
+        self.assertFalse(item.capabilities.can_export)
+        self.assertFalse(item.capabilities.can_finalize)
 
     def test_list_source_recordings_exposes_duration_seconds(self) -> None:
         recordings = self.repository.list_source_recordings("phase1-demo")

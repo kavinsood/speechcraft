@@ -538,29 +538,40 @@ button:disabled {
 }
 
 .editor-column {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
   min-height: 0;
-  align-content: start;
+  align-items: stretch;
 }
 
 .waveform-panel,
 .transcript-panel {
   padding: 1rem;
   min-width: 0;
-  align-self: start;
+  align-self: stretch;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .waveform-panel {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
 }
 
 .transcript-panel {
+  flex: 0 0 auto;
   display: grid;
   grid-template-rows: auto auto auto auto;
   gap: 0.75rem;
+}
+
+.transcript-meta-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 0.75rem;
+  align-items: start;
 }
 
 .panel-header {
@@ -847,6 +858,7 @@ button:disabled {
 
 .waveform-shell {
   position: relative;
+  min-height: 15rem;
 }
 
 .wavesurfer-host {
@@ -858,6 +870,11 @@ button:disabled {
     linear-gradient(180deg, rgba(31, 53, 61, 0.96), rgba(20, 33, 37, 0.98)),
     linear-gradient(90deg, rgba(250, 222, 157, 0.08), transparent);
   overflow: hidden;
+}
+
+.waveform-shell-loading .wavesurfer-host,
+.waveform-shell-error .wavesurfer-host {
+  opacity: 0;
 }
 
 .waveform-overlay {
@@ -889,7 +906,7 @@ button:disabled {
 }
 
 .waveform-overlay-error {
-  background: linear-gradient(180deg, rgba(87, 35, 35, 0.68), rgba(58, 18, 18, 0.82));
+  background: linear-gradient(180deg, rgba(58, 28, 28, 0.74), rgba(34, 18, 18, 0.86));
   color: #fff2ee;
 }
 
@@ -1002,8 +1019,12 @@ button:disabled {
   border-radius: 1rem;
   background: rgba(244, 240, 231, 0.88);
   border: 1px solid rgba(97, 91, 74, 0.08);
-  max-height: 14rem;
+  max-height: 11rem;
   overflow-y: auto;
+}
+
+.asr-panel {
+  min-height: 100%;
 }
 
 .tag-filter-bar {
@@ -1555,6 +1576,27 @@ button:disabled {
   text-align: center;
 }
 
+.workspace-empty-stack {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.recording-status-list {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.recording-status-card {
+  border: 1px solid rgba(97, 91, 74, 0.14);
+  border-radius: 1rem;
+  padding: 0.85rem;
+  background: rgba(247, 243, 234, 0.92);
+}
+
+.recording-status-card p {
+  margin: 0.4rem 0 0.55rem;
+}
+
 @media (max-width: 1080px) {
   .shell-header,
   .step-page-header,
@@ -1600,6 +1642,10 @@ button:disabled {
 
   .editor-column {
     grid-template-rows: auto;
+  }
+
+  .transcript-meta-grid {
+    grid-template-columns: 1fr;
   }
 }
 

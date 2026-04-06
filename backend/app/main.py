@@ -10,10 +10,12 @@ from .models import (
     ActiveVariantUpdate,
     AudioVariantCreate,
     AudioVariantRunRequest,
+    ClipLabItemView,
     ExportPreview,
     ExportRun,
     ImportBatchCreate,
     MediaCleanupResult,
+    ProcessingJobView,
     ProjectSummary,
     RecordingDerivativeCreate,
     ReferenceAssetCreateFromCandidate,
@@ -35,10 +37,15 @@ from .models import (
     SliceStatusUpdate,
     SliceTagUpdate,
     SliceTranscriptUpdate,
+    SourceAlignmentRequest,
     SourceRecording,
+    SourceRecordingArtifactView,
+    SourceRecordingQueueView,
     SourceRecordingCreate,
     SourceRecordingView,
     SlicerHandoffRequest,
+    SourceSlicingRequest,
+    SourceTranscriptionRequest,
     WaveformPeaks,
 )
 from .repository import SliceSaveValidationError, repository
@@ -119,12 +126,36 @@ def list_project_slices(project_id: str) -> list[SliceSummary]:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
+@app.get("/api/projects/{project_id}/recordings", response_model=list[SourceRecordingQueueView])
+def list_project_recordings(project_id: str) -> list[SourceRecordingQueueView]:
+    try:
+        return repository.list_project_recordings(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
 @app.get("/api/slices/{slice_id}", response_model=SliceDetail)
 def get_slice_detail(slice_id: str) -> SliceDetail:
     try:
         return repository.get_slice_detail(slice_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.get("/api/slices/{slice_id}/clip-lab", response_model=ClipLabItemView)
+def get_slice_clip_lab_item(slice_id: str) -> ClipLabItemView:
+    try:
+        return repository.get_slice_clip_lab_item(slice_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.get("/api/recordings/{recording_id}/artifacts", response_model=SourceRecordingArtifactView)
+def get_source_recording_artifact(recording_id: str) -> SourceRecordingArtifactView:
+    try:
+        return repository.get_source_recording_artifact(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
 
 
 @app.get("/api/projects/{project_id}/export-preview", response_model=ExportPreview)
@@ -161,6 +192,39 @@ def cleanup_project_media(project_id: str) -> MediaCleanupResult:
         raise HTTPException(status_code=404, detail="Project not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/recordings/{recording_id}/jobs/transcription", response_model=ProcessingJobView)
+def enqueue_source_transcription(
+    recording_id: str,
+    payload: SourceTranscriptionRequest,
+) -> ProcessingJobView:
+    try:
+        return repository.enqueue_source_transcription(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+
+
+@app.post("/api/recordings/{recording_id}/jobs/alignment", response_model=ProcessingJobView)
+def enqueue_source_alignment(
+    recording_id: str,
+    payload: SourceAlignmentRequest,
+) -> ProcessingJobView:
+    try:
+        return repository.enqueue_source_alignment(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+
+
+@app.post("/api/recordings/{recording_id}/jobs/slicing", response_model=ProcessingJobView)
+def enqueue_source_slicing(
+    recording_id: str,
+    payload: SourceSlicingRequest,
+) -> ProcessingJobView:
+    try:
+        return repository.enqueue_source_slicing(recording_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
 
 
 @app.patch("/api/clips/{clip_id}/status", response_model=SliceDetail)
@@ -245,10 +309,10 @@ def merge_with_next_slice(clip_id: str) -> list[SliceSummary]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/clips/{clip_id}/waveform-peaks", response_model=WaveformPeaks)
-def get_waveform_peaks(clip_id: str, bins: int = 120) -> WaveformPeaks:
+@app.get("/api/slices/{slice_id}/waveform-peaks", response_model=WaveformPeaks)
+def get_slice_waveform_peaks(slice_id: str, bins: int = 120) -> WaveformPeaks:
     try:
-        return repository.get_waveform_peaks(clip_id, bins)
+        return repository.get_waveform_peaks(slice_id, bins)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
     except ValueError as exc:
@@ -315,6 +379,23 @@ def get_slice_media(slice_id: str) -> FileResponse:
         path = repository.get_slice_media_path(slice_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
+@app.get("/media/source-recordings/{recording_id}/window.wav")
+def get_source_recording_window_media(
+    recording_id: str,
+    start_seconds: float,
+    end_seconds: float,
+) -> FileResponse:
+    try:
+        path = repository.get_source_recording_window_media_path(recording_id, start_seconds, end_seconds)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
     except ValueError as exc:
@@ -484,3 +565,19 @@ def register_slicer_chunks(recording_id: str, payload: SlicerHandoffRequest) -> 
         raise HTTPException(status_code=404, detail="Source recording not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/source-recordings/{recording_id}/jobs", response_model=list[ProcessingJobView])
+def list_source_recording_jobs(recording_id: str) -> list[ProcessingJobView]:
+    try:
+        return repository.list_source_recording_jobs(recording_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Source recording not found") from exc
+
+
+@app.get("/api/jobs/{job_id}", response_model=ProcessingJobView)
+def get_processing_job(job_id: str) -> ProcessingJobView:
+    try:
+        return repository.get_processing_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Processing job not found") from exc

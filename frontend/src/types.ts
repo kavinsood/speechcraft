@@ -66,12 +66,62 @@ export type SourceRecording = {
   duration_seconds: number;
 };
 
+export type SourceRecordingArtifact = {
+  source_recording_id: string;
+  transcript_text_path?: string | null;
+  transcript_json_path?: string | null;
+  alignment_json_path?: string | null;
+  transcript_status?: string | null;
+  alignment_status?: string | null;
+  transcript_word_count: number;
+  alignment_word_count: number;
+  transcript_updated_at?: string | null;
+  aligned_at?: string | null;
+  alignment_backend?: string | null;
+  artifact_metadata?: Record<string, unknown> | null;
+};
+
+export type ProcessingJob = {
+  id: string;
+  kind:
+    | "import"
+    | "preprocess"
+    | "slice"
+    | "source_transcription"
+    | "source_alignment"
+    | "source_slicing"
+    | "review_window_asr"
+    | "forced_align_and_pack"
+    | "inference"
+    | "export";
+  status: "pending" | "running" | "completed" | "failed";
+  source_recording_id?: string | null;
+  input_payload?: Record<string, unknown> | null;
+  output_payload?: Record<string, unknown> | null;
+  error_message?: string | null;
+  claimed_by?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  heartbeat_at?: string | null;
+  completed_at?: string | null;
+};
+
+export type SourceRecordingQueue = SourceRecording & {
+  duration_seconds: number;
+  slice_count: number;
+  processing_state: string;
+  processing_message?: string | null;
+  active_job?: ProcessingJob | null;
+  artifact?: SourceRecordingArtifact | null;
+};
+
 export type SliceSummary = {
   id: string;
   source_recording_id: string;
   active_variant_id?: string | null;
   active_commit_id?: string | null;
   status: ReviewStatus;
+  is_locked?: boolean;
   duration_seconds: number;
   model_metadata?: Record<string, unknown> | null;
   created_at: string;
@@ -89,6 +139,87 @@ export type Slice = SliceSummary & {
   commits: EditCommit[];
   active_variant?: AudioVariant | null;
   active_commit?: EditCommit | null;
+};
+
+export type ClipLabItemRef = {
+  id: string;
+};
+
+export type ClipLabTranscript = {
+  id: string;
+  original_text: string;
+  modified_text?: string | null;
+  is_modified: boolean;
+  alignment_data?: Record<string, unknown> | null;
+};
+
+export type ClipLabVariant = {
+  id: string;
+  is_original: boolean;
+  generator_model?: string | null;
+  sample_rate: number;
+  num_samples: number;
+};
+
+export type ClipLabCommit = {
+  id: string;
+  parent_commit_id?: string | null;
+  edl_operations: {
+    op: string;
+    range?: ClipRange | null;
+    duration_seconds?: number | null;
+  }[];
+  transcript_text: string;
+  status: ReviewStatus;
+  tags: Tag[];
+  active_variant_id?: string | null;
+  message?: string | null;
+  is_milestone: boolean;
+  created_at: string;
+};
+
+export type ClipLabCapabilities = {
+  can_edit_transcript: boolean;
+  can_edit_tags: boolean;
+  can_set_status: boolean;
+  can_save: boolean;
+  can_split: boolean;
+  can_merge: boolean;
+  can_edit_waveform: boolean;
+  can_run_processing: boolean;
+  can_switch_variants: boolean;
+  can_export: boolean;
+  can_finalize: boolean;
+};
+
+export type ClipLabItem = {
+  id: string;
+  kind: "slice";
+  source_recording_id: string;
+  source_recording: SourceRecording;
+  start_seconds: number;
+  end_seconds: number;
+  duration_seconds: number;
+  status?: ReviewStatus | null;
+  is_locked?: boolean;
+  created_at: string;
+  transcript?: ClipLabTranscript | null;
+  tags: Tag[];
+  speaker_name?: string | null;
+  language?: string | null;
+  audio_url: string;
+  item_metadata?: Record<string, unknown> | null;
+  transcript_source?: string | null;
+  can_run_asr: boolean;
+  asr_placeholder_message?: string | null;
+  active_variant_generator_model?: string | null;
+  can_undo: boolean;
+  can_redo: boolean;
+  capabilities: ClipLabCapabilities;
+  variants: ClipLabVariant[];
+  commits: ClipLabCommit[];
+  active_variant?: ClipLabVariant | null;
+  active_commit?: ClipLabCommit | null;
 };
 
 export type ImportBatch = {
