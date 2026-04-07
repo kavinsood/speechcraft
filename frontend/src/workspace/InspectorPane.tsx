@@ -103,7 +103,7 @@ export default function InspectorPane({
       ) : activeClip ? (
         <>
           <section className="inspector-block">
-            <h3>Pipeline Status</h3>
+            <h3>Tags</h3>
             {activeClip.capabilities.can_set_status && activeClip.status ? (
               <div className="status-group">
                 {queuePriorityOrder.map((status) => (
@@ -120,10 +120,6 @@ export default function InspectorPane({
             ) : (
               <p className="muted-copy">Status controls are unavailable for this Clip Lab item.</p>
             )}
-          </section>
-
-          <section className="inspector-block">
-            <h3>User Tags</h3>
             <div className="tag-list">
               {activeClip.tags.length > 0 ? (
                 activeClip.tags.map((tag) => (
@@ -131,9 +127,7 @@ export default function InspectorPane({
                     {tag.name}
                   </span>
                 ))
-              ) : (
-                <p className="muted-copy">No tags on this item yet.</p>
-              )}
+              ) : null}
             </div>
           </section>
 

@@ -195,9 +195,14 @@ export function clipMatchesFilters(
   slice: SliceSummary,
   query: string,
   selectedFilterTags: string[],
+  selectedFilterStatuses: ReviewStatus[],
   hideResolved: boolean,
 ): boolean {
   if (hideResolved && (slice.status === "accepted" || slice.status === "rejected")) {
+    return false;
+  }
+
+  if (selectedFilterStatuses.length > 0 && !selectedFilterStatuses.includes(slice.status)) {
     return false;
   }
 

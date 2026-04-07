@@ -20,7 +20,6 @@ class SlicerConfig:
     preferred_gap_for_boundary: float = 0.24
     snap_collar_ms: float = 150.0
     rms_frame_ms: float = 10.0
-    padding_ms: float = 150.0
     leading_word_guard_ms: float = 35.0
     trailing_word_guard_ms: float = 45.0
     boundary_context_ms: float = 80.0
@@ -82,8 +81,6 @@ class SliceSpec:
     snapped_end: float = 0.0
     training_start: float = 0.0
     training_end: float = 0.0
-    padded_start: float = 0.0
-    padded_end: float = 0.0
     transcript: str = ""
     transcript_original: str = ""
     word_count: int = 0
@@ -244,7 +241,6 @@ def apply_acoustic_refinement(
         return specs
 
     audio_duration = len(audio) / sample_rate
-    padding_seconds = config.padding_ms / 1000.0
     if rms is None or rms_times is None:
         rms, rms_times = _compute_rms_frames(audio, sample_rate, config.rms_frame_ms)
 
@@ -283,10 +279,6 @@ def apply_acoustic_refinement(
     for spec in specs:
         spec.training_start = spec.snapped_start
         spec.training_end = spec.snapped_end
-        start_pad = padding_seconds * (1.5 if spec.breath_at_start else 1.0)
-        end_pad = padding_seconds * (1.5 if spec.breath_at_end else 1.0)
-        spec.padded_start = max(0.0, spec.snapped_start - start_pad)
-        spec.padded_end = min(audio_duration, spec.snapped_end + end_pad)
         spec.duration = max(0.0, spec.training_end - spec.training_start)
         spec.edge_start_energy = _window_mean_rms(
             spec.training_start,
@@ -343,14 +335,10 @@ def build_slice_entries(
 
         overlap_prev = 0.0
         overlap_next = 0.0
-        review_overlap_prev = 0.0
-        review_overlap_next = 0.0
         if index > 0:
             overlap_prev = max(0.0, specs[index - 1].training_end - spec.training_start)
-            review_overlap_prev = max(0.0, specs[index - 1].padded_end - spec.padded_start)
         if index + 1 < len(specs):
             overlap_next = max(0.0, spec.training_end - specs[index + 1].training_start)
-            review_overlap_next = max(0.0, spec.padded_end - specs[index + 1].padded_start)
 
         slices.append(
             {
@@ -361,7 +349,6 @@ def build_slice_entries(
                 "transcript_original": spec.transcript_original,
                 "duration": round(spec.duration, 4),
                 "training_duration": round(max(0.0, spec.training_end - spec.training_start), 4),
-                "review_duration": round(max(0.0, spec.padded_end - spec.padded_start), 4),
                 "sample_rate": sample_rate,
                 "boundary_type": spec.end_boundary.boundary_type if spec.end_boundary else "end_of_recording",
                 "boundary_gap_s": round(spec.end_boundary.gap_duration, 4) if spec.end_boundary else 0.0,
@@ -372,12 +359,8 @@ def build_slice_entries(
                 "relative_word_offsets_from": "training_start",
                 "training_start": round(spec.training_start, 4),
                 "training_end": round(spec.training_end, 4),
-                "padded_start": round(spec.padded_start, 4),
-                "padded_end": round(spec.padded_end, 4),
                 "overlap_with_previous_s": round(overlap_prev, 4),
                 "overlap_with_next_s": round(overlap_next, 4),
-                "review_overlap_with_previous_s": round(review_overlap_prev, 4),
-                "review_overlap_with_next_s": round(review_overlap_next, 4),
                 "word_count": spec.word_count,
                 "avg_alignment_confidence": round(spec.avg_confidence, 4),
                 "forced_cut": spec.forced_cut,
@@ -403,12 +386,9 @@ def build_slice_stats(
 ) -> dict[str, Any]:
     durations = [float(entry["training_duration"]) for entry in slices]
     intervals = [(float(entry["training_start"]), float(entry["training_end"])) for entry in slices]
-    review_durations = [float(entry["review_duration"]) for entry in slices]
-    review_intervals = [(float(entry["padded_start"]), float(entry["padded_end"])) for entry in slices]
     exported_audio = sum(durations)
     unique_covered = _compute_interval_union(intervals)
     overlap_audio = max(0.0, exported_audio - unique_covered)
-    review_overlap_audio = max(0.0, sum(review_durations) - _compute_interval_union(review_intervals))
 
     def pct_in_range(low: float, high: float) -> float:
         if not durations:
@@ -423,7 +403,6 @@ def build_slice_stats(
         "total_clip_s": round(exported_audio, 2),
         "unique_covered_audio_s": round(unique_covered, 2),
         "overlap_audio_s": round(overlap_audio, 2),
-        "review_overlap_audio_s": round(review_overlap_audio, 2),
         "coverage_pct": round((unique_covered / audio_duration * 100), 1) if audio_duration > 0 else 0.0,
         "exported_vs_source_pct": round((exported_audio / audio_duration * 100), 1) if audio_duration > 0 else 0.0,
         "avg_duration_s": round(sum(durations) / len(durations), 2) if durations else 0.0,

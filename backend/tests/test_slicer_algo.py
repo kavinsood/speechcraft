@@ -135,7 +135,7 @@ class SlicerAlgoTests(TestCase):
     def test_acoustic_refinement_uses_shared_boundary_and_reports_overlap(self) -> None:
         sample_rate = 1000
         audio = np.zeros(13000, dtype=np.float64)
-        config = SlicerConfig(padding_ms=150, min_duration=0.1)
+        config = SlicerConfig(min_duration=0.1)
         alignment = [
             {"word": "one", "start": 0.0, "end": 2.0},
             {"word": "two", "start": 2.05, "end": 4.0},
@@ -158,13 +158,10 @@ class SlicerAlgoTests(TestCase):
 
         self.assertEqual(result["stats"]["total_clips"], 2)
         self.assertEqual(result["stats"]["overlap_audio_s"], 0.0)
-        self.assertGreater(result["stats"]["review_overlap_audio_s"], 0.0)
         self.assertEqual(result["slices"][0]["overlap_with_next_s"], 0.0)
         self.assertEqual(result["slices"][1]["overlap_with_previous_s"], 0.0)
-        self.assertGreater(result["slices"][0]["review_overlap_with_next_s"], 0.0)
-        self.assertGreater(result["slices"][1]["review_overlap_with_previous_s"], 0.0)
 
-    def test_plan_slices_words_are_training_relative_not_padded_relative(self) -> None:
+    def test_plan_slices_words_are_training_relative(self) -> None:
         sample_rate = 1000
         audio = np.zeros(3000, dtype=np.float64)
         result = plan_slices(
@@ -173,18 +170,19 @@ class SlicerAlgoTests(TestCase):
             ],
             audio,
             sample_rate,
-            SlicerConfig(min_duration=0.1, padding_ms=150),
+            SlicerConfig(min_duration=0.1),
         )
 
         self.assertEqual(result["slices"][0]["relative_word_offsets_from"], "training_start")
         self.assertEqual(result["slices"][0]["words"][0]["start"], 0.0)
         self.assertEqual(result["slices"][0]["training_start"], 1.0)
-        self.assertLess(result["slices"][0]["padded_start"], result["slices"][0]["training_start"])
+        self.assertNotIn("padded_start", result["slices"][0])
+        self.assertNotIn("padded_end", result["slices"][0])
 
-    def test_plan_slices_uses_union_for_coverage_not_padded_sum(self) -> None:
+    def test_plan_slices_uses_union_for_training_coverage(self) -> None:
         sample_rate = 1000
         audio = np.zeros(13000, dtype=np.float64)
-        config = SlicerConfig(padding_ms=200, min_duration=0.1)
+        config = SlicerConfig(min_duration=0.1)
         result = plan_slices(
             [
                 {"word": "one", "start": 0.0, "end": 2.0},
@@ -202,7 +200,6 @@ class SlicerAlgoTests(TestCase):
 
         self.assertEqual(result["stats"]["total_clip_s"], result["stats"]["unique_covered_audio_s"])
         self.assertEqual(result["stats"]["overlap_audio_s"], 0.0)
-        self.assertGreater(result["stats"]["review_overlap_audio_s"], 0.0)
 
     def test_plan_slices_normalizes_pause_punctuation(self) -> None:
         result = plan_slices(
@@ -235,7 +232,7 @@ class SlicerAlgoTests(TestCase):
             ],
             audio,
             sample_rate,
-            SlicerConfig(min_duration=0.1, padding_ms=0, min_boundary_acoustic_score=0.0),
+            SlicerConfig(min_duration=0.1, min_boundary_acoustic_score=0.0),
         )
 
         self.assertTrue(result["slices"][0]["is_flagged"])

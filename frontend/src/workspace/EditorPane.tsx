@@ -7,7 +7,6 @@ import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatClipTimestamp,
   formatSeconds,
-  getAlignmentConfidence,
   getAlignmentSource,
   getSliceDuration,
   getSliceTranscriptText,
@@ -599,9 +598,7 @@ export default function EditorPane({
                       {tag.name}
                     </span>
                   ))
-                ) : (
-                  <span className="muted-copy">No tags</span>
-                )}
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -795,14 +792,6 @@ export default function EditorPane({
         <div className="transcript-footer">
           <span>
             Source: <strong>{activeClip ? getAlignmentSource(activeClip) : "n/a"}</strong>
-          </span>
-          <span>
-            Confidence:{" "}
-            <strong>
-              {activeClip && getAlignmentConfidence(activeClip) !== null
-                ? `${Math.round((getAlignmentConfidence(activeClip) ?? 0) * 100)}%`
-                : "n/a"}
-            </strong>
           </span>
           <span>
             Redo: <strong>{activeClip && canRedo ? "available" : "none"}</strong>

@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { ClipLabItemRef, SliceSummary, SourceRecordingQueue } from "../types";
+import type { ClipLabItemRef, ReviewStatus, SliceSummary, SourceRecordingQueue } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   clipMatchesFilters,
@@ -38,6 +38,7 @@ export default function ClipQueuePane({
 }: ClipQueuePaneProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilterTags, setSelectedFilterTags] = useState<string[]>([]);
+  const [selectedFilterStatuses, setSelectedFilterStatuses] = useState<ReviewStatus[]>([]);
   const [isTagFilterMenuOpen, setIsTagFilterMenuOpen] = useState(false);
   const [hideResolved] = useState(false);
   const deferredSearch = useDeferredValue(searchQuery.trim().toLowerCase());
@@ -78,9 +79,9 @@ export default function ClipQueuePane({
 
   const queueClips = useMemo(() => {
     return sortClipsForQueue(clips).filter((clip) =>
-      clipMatchesFilters(clip, deferredSearch, selectedFilterTags, hideResolved),
+      clipMatchesFilters(clip, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved),
     );
-  }, [clips, deferredSearch, selectedFilterTags, hideResolved]);
+  }, [clips, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved]);
 
   useEffect(() => {
     onVisibleClipIdsChange(queueClips.map((clip) => clip.id));
@@ -91,6 +92,14 @@ export default function ClipQueuePane({
       current.includes(tagName)
         ? current.filter((entry) => entry !== tagName)
         : [...current, tagName],
+    );
+  }
+
+  function toggleFilterStatus(status: ReviewStatus) {
+    setSelectedFilterStatuses((current) =>
+      current.includes(status)
+        ? current.filter((entry) => entry !== status)
+        : [...current, status],
     );
   }
 
@@ -133,14 +142,29 @@ export default function ClipQueuePane({
             className="tag-filter-trigger"
             onClick={() => setIsTagFilterMenuOpen((current) => !current)}
           >
-            {selectedFilterTags.length > 0 ? `Tags (${selectedFilterTags.length})` : "Filter Tags"}
+            {selectedFilterTags.length + selectedFilterStatuses.length > 0
+              ? `Filters (${selectedFilterTags.length + selectedFilterStatuses.length})`
+              : "Filter Clips"}
           </button>
           <div className="tag-filter-current">
-            {selectedFilterTags.length > 0 ? selectedFilterTags.join(", ") : "All tags"}
+            {selectedFilterStatuses.length > 0 || selectedFilterTags.length > 0
+              ? [...selectedFilterStatuses.map((status) => statusLabels[status]), ...selectedFilterTags].join(", ")
+              : "All slices"}
           </div>
           {isTagFilterMenuOpen ? (
             <div className="tag-filter-popover">
               <ul className="tag-filter-list">
+                {queuePriorityOrder.map((status) => (
+                  <li key={`filter-status-${status}`}>
+                    <button
+                      type="button"
+                      className={`tag-filter-item ${selectedFilterStatuses.includes(status) ? "selected" : ""}`}
+                      onClick={() => toggleFilterStatus(status)}
+                    >
+                      <span>{statusLabels[status]}</span>
+                    </button>
+                  </li>
+                ))}
                 {availableFilterTags.map((tagName) => (
                   <li key={`filter-${tagName}`}>
                     <button
@@ -153,18 +177,19 @@ export default function ClipQueuePane({
                   </li>
                 ))}
               </ul>
-              <div className="clip-list-meta">
-                <span>
-                  {selectedFilterTags.length > 0
-                    ? `Filtering: ${selectedFilterTags.join(", ")}`
-                    : "No tag filter"}
-                </span>
-                {selectedFilterTags.length > 0 ? (
-                  <button type="button" onClick={() => setSelectedFilterTags([])}>
+              {selectedFilterStatuses.length > 0 || selectedFilterTags.length > 0 ? (
+                <div className="clip-list-meta">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedFilterStatuses([]);
+                      setSelectedFilterTags([]);
+                    }}
+                  >
                     Clear
                   </button>
-                ) : null}
-              </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -212,7 +237,6 @@ export default function ClipQueuePane({
         ) : null}
         {workspacePhase === "ready" ? (
           <>
-            {queueClips.length > 0 ? <p className="eyebrow">Slices</p> : null}
             {queueClips.map((clip, index) => (
               <button
                 key={clip.id}

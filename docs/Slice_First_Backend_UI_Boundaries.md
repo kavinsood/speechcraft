@@ -214,8 +214,8 @@ Response shape:
         "snapped_end": 19.93,
         "training_start": 12.41,
         "training_end": 19.93,
-        "padded_start": 12.26,
-        "padded_end": 20.08
+        "training_start": 12.41,
+        "training_end": 19.93
       },
       "slicer_boundary_type": "safe_gap",
       "slicer_flag_reasons": ["high_end_edge_energy_0.71"],
@@ -283,8 +283,8 @@ Response shape:
       "snapped_end": 19.93,
       "training_start": 12.41,
       "training_end": 19.93,
-      "padded_start": 12.26,
-      "padded_end": 20.08,
+      "training_start": 12.41,
+      "training_end": 19.93,
       "boundary_type": "safe_gap",
       "flag_reasons": [],
       "words": []

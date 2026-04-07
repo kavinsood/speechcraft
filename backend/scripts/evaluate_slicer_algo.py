@@ -23,7 +23,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-dur", type=float, default=2.0)
     parser.add_argument("--max-dur", type=float, default=15.0)
     parser.add_argument("--soft-max", type=float, default=10.0)
-    parser.add_argument("--padding-ms", type=float, default=150.0)
     parser.add_argument("--snap-collar-ms", type=float, default=150.0)
     parser.add_argument("--write-result", help="Optional path to write the full slicer result JSON.")
     return parser.parse_args()
@@ -51,7 +50,6 @@ def main() -> None:
             min_duration=args.min_dur,
             max_duration=args.max_dur,
             soft_max=args.soft_max,
-            padding_ms=args.padding_ms,
             snap_collar_ms=args.snap_collar_ms,
         ),
     )

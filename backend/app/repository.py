@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import audioop
 import hashlib
 import io
 import json
@@ -119,6 +118,33 @@ LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE = "legacy_seed_clip_source"
 
 class SliceSaveValidationError(ValueError):
     """Raised when a slice save request is syntactically valid but semantically invalid."""
+
+
+def _pcm16le_as_float64(raw: bytes) -> np.ndarray:
+    if not raw:
+        return np.zeros(0, dtype=np.float64)
+    return np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32767.0
+
+
+def _pcm16le_rms(raw: bytes) -> float:
+    samples = _pcm16le_as_float64(raw)
+    if len(samples) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples**2)))
+
+
+def _pcm16le_tomono(raw: bytes, channels: int) -> bytes:
+    if channels <= 1 or not raw:
+        return raw
+    samples = np.frombuffer(raw, dtype="<i2")
+    if len(samples) == 0:
+        return raw
+    frame_count = len(samples) // channels
+    if frame_count <= 0:
+        return b""
+    frames = samples[: frame_count * channels].reshape(frame_count, channels).astype(np.float64)
+    mono = np.rint(frames.mean(axis=1)).clip(-32768, 32767).astype("<i2")
+    return mono.tobytes()
 
 
 def _configured_path(env_name: str, fallback: Path) -> Path:
@@ -3703,7 +3729,7 @@ class SQLiteRepository:
             chunk = raw[start_frame * bytes_per_frame : end_frame * bytes_per_frame]
             if not chunk:
                 continue
-            rms = audioop.rms(chunk, sample_width) / 32767.0
+            rms = _pcm16le_rms(chunk)
             rms_windows.append((start_frame / sample_rate, end_frame / sample_rate, rms))
 
         if not rms_windows:
@@ -3770,7 +3796,7 @@ class SQLiteRepository:
 
         mono_raw = raw
         if channels == 2:
-            mono_raw = audioop.tomono(raw, sample_width, 0.5, 0.5)
+            mono_raw = _pcm16le_tomono(raw, channels)
         elif channels > 2:
             frame_values: list[int] = []
             bytes_per_frame = channels * sample_width
@@ -5484,8 +5510,6 @@ class SQLiteRepository:
             "snapped_end": float(slice_payload["snapped_end"]),
             "training_start": float(slice_payload["training_start"]),
             "training_end": float(slice_payload["training_end"]),
-            "padded_start": float(slice_payload["padded_start"]),
-            "padded_end": float(slice_payload["padded_end"]),
             "source_word_start_index": int(slice_payload["start_word_index"]),
             "source_word_end_index": int(slice_payload["end_word_index"]),
             "boundary_type": str(slice_payload["boundary_type"]),
@@ -5514,8 +5538,6 @@ class SQLiteRepository:
             "snapped_end": float(slice_payload["snapped_end"]),
             "training_start": float(slice_payload["training_start"]),
             "training_end": float(slice_payload["training_end"]),
-            "padded_start": float(slice_payload["padded_start"]),
-            "padded_end": float(slice_payload["padded_end"]),
             "flag_reasons": list(slice_payload["flag_reasons"] or []),
         }
         return self._create_slice_from_source_span(

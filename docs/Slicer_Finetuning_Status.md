@@ -83,13 +83,14 @@ Each slice now has multiple boundary concepts:
   - acoustically refined boundary
 - `training_start` / `training_end`
   - canonical non-overlapping export truth
-- `padded_start` / `padded_end`
-  - review-safe audition bounds
+
+Optional review context should now be derived dynamically around `training_*`, not persisted as slicer truth.
 
 Important rule:
 
 - training/export should use `training_*`
-- Clip Lab audition can use a different review-safe policy
+- Clip Lab default playback should use exact `training_*`
+- any extra context playback must be explicit and derived dynamically
 
 Do not treat review bounds as training truth.
 

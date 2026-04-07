@@ -1,7 +1,10 @@
 .PHONY: help setup setup-backend setup-frontend bootstrap dev-backend dev-frontend check check-backend check-frontend backend-docs smoke-backend
 
 UV_CACHE_DIR ?= /tmp/uv-cache
-SMOKE_BACKEND_BASE_URL ?= http://127.0.0.1:8000
+BACKEND_HOST ?= 127.0.0.1
+BACKEND_PORT ?= 8010
+FRONTEND_API_BASE_URL ?= http://$(BACKEND_HOST):$(BACKEND_PORT)
+SMOKE_BACKEND_BASE_URL ?= http://127.0.0.1:8010
 SMOKE_BACKEND_PROJECT_ID ?= phase1-demo
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BACKEND_DIR := $(ROOT_DIR)/backend
@@ -31,12 +34,12 @@ setup-frontend:
 	cd $(FRONTEND_DIR) && npm install
 
 dev-backend:
-	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) uv run uvicorn app.main:app --reload
+	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) uv run uvicorn app.main:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT)
 
 backend-docs: dev-backend
 
 dev-frontend:
-	cd $(FRONTEND_DIR) && npm run dev
+	cd $(FRONTEND_DIR) && VITE_API_BASE_URL=$(FRONTEND_API_BASE_URL) npm run dev
 
 check: check-backend check-frontend
 

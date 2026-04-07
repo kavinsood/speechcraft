@@ -11,14 +11,10 @@ from sqlmodel import Session, delete, select
 
 from app.models import (
     AudioVariant,
-    DatasetProcessingRun,
     EditCommit,
     ExportRun,
     ImportBatch,
     ProcessingJob,
-    ReviewWindow,
-    ReviewWindowRevision,
-    ReviewWindowVariant,
     Slice,
     SliceTagLink,
     SourceRecording,
@@ -45,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slicer-dir", required=True, help="Directory containing one slicer result JSON per WAV stem.")
     parser.add_argument(
         "--bounds-mode",
-        choices=("raw", "snapped", "padded", "review_safe"),
-        default="review_safe",
+        choices=("raw", "snapped", "training", "context"),
+        default="training",
         help="Which slicer timestamps to use for imported clip audio bounds.",
     )
     parser.add_argument(
@@ -184,9 +180,6 @@ def build_alignment_payload(slice_payload: dict[str, Any], source_stem: str) -> 
         "training_start": slice_payload.get("training_start"),
         "training_end": slice_payload.get("training_end"),
         "training_duration": slice_payload.get("training_duration"),
-        "padded_start": slice_payload.get("padded_start"),
-        "padded_end": slice_payload.get("padded_end"),
-        "review_duration": slice_payload.get("review_duration"),
         "forced_cut": bool(slice_payload.get("forced_cut")),
         "is_flagged": bool(slice_payload.get("is_flagged")),
         "flag_reason": slice_payload.get("flag_reason"),
@@ -212,15 +205,15 @@ def resolve_slice_bounds(
             float(slice_payload["raw_end"]),
             recording_duration,
         )
-    if bounds_mode == "padded":
+    if bounds_mode == "training":
         return clamp_bounds(
-            float(slice_payload["padded_start"]),
-            float(slice_payload["padded_end"]),
+            float(slice_payload["training_start"]),
+            float(slice_payload["training_end"]),
             recording_duration,
         )
-    if bounds_mode == "review_safe":
+    if bounds_mode == "context":
         return clamp_bounds(
-            *resolve_review_safe_bounds(
+            *resolve_context_bounds(
             slice_payload,
             audio_path=audio_path,
             audio_cache=audio_cache,
@@ -230,8 +223,8 @@ def resolve_slice_bounds(
             recording_duration,
         )
     return clamp_bounds(
-        float(slice_payload.get("snapped_start", slice_payload["raw_start"])),
-        float(slice_payload.get("snapped_end", slice_payload["raw_end"])),
+        float(slice_payload.get("snapped_start", slice_payload["training_start"])),
+        float(slice_payload.get("snapped_end", slice_payload["training_end"])),
         recording_duration,
     )
 
@@ -244,7 +237,7 @@ def clamp_bounds(start_seconds: float, end_seconds: float, recording_duration: f
     return start_seconds, end_seconds
 
 
-def resolve_review_safe_bounds(
+def resolve_context_bounds(
     slice_payload: dict[str, Any],
     *,
     audio_path: Path,
@@ -254,20 +247,18 @@ def resolve_review_safe_bounds(
 ) -> tuple[float, float]:
     raw_start = float(slice_payload["raw_start"])
     raw_end = float(slice_payload["raw_end"])
-    snapped_start = float(slice_payload.get("snapped_start", raw_start))
-    snapped_end = float(slice_payload.get("snapped_end", raw_end))
-    padded_start = float(slice_payload["padded_start"])
-    padded_end = float(slice_payload["padded_end"])
+    training_start = float(slice_payload["training_start"])
+    training_end = float(slice_payload["training_end"])
 
     breath_at_start = bool(slice_payload.get("breath_at_start"))
     breath_at_end = bool(slice_payload.get("breath_at_end"))
     start_context = BREATH_REVIEW_CONTEXT_SECONDS if breath_at_start else DEFAULT_REVIEW_CONTEXT_SECONDS
     end_context = BREATH_REVIEW_CONTEXT_SECONDS if breath_at_end else DEFAULT_REVIEW_TAIL_SECONDS
-    start_anchor = snapped_start
-    end_anchor = snapped_end
+    start_anchor = training_start
+    end_anchor = training_end
 
-    start_seconds = max(padded_start, start_anchor - start_context)
-    end_seconds = min(padded_end, end_anchor + end_context)
+    start_seconds = start_anchor - start_context
+    end_seconds = end_anchor + end_context
 
     if previous_slice is not None:
         previous_gap = max(float(previous_slice.get("boundary_gap_s") or 0.0), 0.0)
@@ -430,9 +421,6 @@ def delete_batch(session: Session, repository: SQLiteRepository, batch_id: str) 
     slices = session.exec(select(Slice).where(Slice.source_recording_id.in_(recording_ids))).all() if recording_ids else []
     deleted_paths = [variant.file_path for slice_row in slices for variant in slice_row.variants]
     slice_ids = [slice_row.id for slice_row in slices]
-    review_window_ids = session.exec(
-        select(ReviewWindow.id).where(ReviewWindow.source_recording_id.in_(recording_ids))
-    ).all() if recording_ids else []
 
     if slice_ids:
         session.exec(delete(SliceTagLink).where(SliceTagLink.slice_id.in_(slice_ids)))
@@ -440,13 +428,8 @@ def delete_batch(session: Session, repository: SQLiteRepository, batch_id: str) 
         session.exec(delete(Transcript).where(Transcript.slice_id.in_(slice_ids)))
         session.exec(delete(AudioVariant).where(AudioVariant.slice_id.in_(slice_ids)))
         session.exec(delete(Slice).where(Slice.id.in_(slice_ids)))
-    if review_window_ids:
-        session.exec(delete(ReviewWindowRevision).where(ReviewWindowRevision.review_window_id.in_(review_window_ids)))
-        session.exec(delete(ReviewWindowVariant).where(ReviewWindowVariant.review_window_id.in_(review_window_ids)))
-        session.exec(delete(ReviewWindow).where(ReviewWindow.id.in_(review_window_ids)))
     if recording_ids:
         session.exec(delete(ProcessingJob).where(ProcessingJob.source_recording_id.in_(recording_ids)))
-        session.exec(delete(DatasetProcessingRun).where(DatasetProcessingRun.source_recording_id.in_(recording_ids)))
         session.exec(delete(SourceRecording).where(SourceRecording.id.in_(recording_ids)))
     session.exec(delete(ExportRun).where(ExportRun.batch_id == batch_id))
     session.exec(delete(ImportBatch).where(ImportBatch.id == batch_id))

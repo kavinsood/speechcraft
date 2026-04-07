@@ -846,7 +846,7 @@ button:disabled {
   align-items: flex-end;
   gap: 0.25rem;
   padding: 1rem 0.9rem;
-  border-radius: 1.25rem;
+  border-radius: 0;
   background:
     linear-gradient(180deg, rgba(31, 53, 61, 0.96), rgba(20, 33, 37, 0.98)),
     linear-gradient(90deg, rgba(250, 222, 157, 0.08), transparent);
@@ -864,7 +864,7 @@ button:disabled {
 .wavesurfer-host {
   position: relative;
   min-height: 15rem;
-  border-radius: 1.25rem;
+  border-radius: 0;
   padding: 0.35rem;
   background:
     linear-gradient(180deg, rgba(31, 53, 61, 0.96), rgba(20, 33, 37, 0.98)),
@@ -884,7 +884,7 @@ button:disabled {
   place-content: center;
   gap: 0.35rem;
   padding: 1.5rem;
-  border-radius: 1rem;
+  border-radius: 0;
   text-align: center;
   backdrop-filter: blur(3px);
   pointer-events: none;
@@ -915,7 +915,7 @@ button:disabled {
   gap: 0.45rem;
   min-height: 15rem;
   padding: 1.2rem;
-  border-radius: 1.25rem;
+  border-radius: 0;
   background:
     linear-gradient(180deg, rgba(76, 28, 28, 0.94), rgba(44, 16, 16, 0.98)),
     linear-gradient(90deg, rgba(255, 208, 122, 0.08), transparent);

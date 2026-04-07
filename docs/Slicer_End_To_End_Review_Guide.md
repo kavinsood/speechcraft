@@ -484,7 +484,8 @@ What it does:
 4. for each final spec:
    - set `training_start = snapped_start`
    - set `training_end = snapped_end`
-   - build review-only `padded_start` and `padded_end`
+   - persist exact `training_start` and `training_end`
+   - derive optional review context dynamically from training bounds when needed
    - compute edge energies
    - compute leading/trailing silence
    - compute speech ratio
@@ -613,7 +614,8 @@ What it writes for each slice:
 - `raw_start` / `raw_end`
 - `snapped_start` / `snapped_end`
 - `training_start` / `training_end`
-- `padded_start` / `padded_end`
+- exact `training_start` / `training_end`
+- optional context playback should be derived dynamically, not stored
 - relative word offsets from `training_start`
 - overlap metrics
 - boundary type
@@ -625,7 +627,7 @@ What it writes for each slice:
 Important review semantic:
 
 - relative word offsets are now anchored to `training_start`
-- not `padded_start`
+- not any persisted review padding field
 
 This prevents review-only context from acting like canonical training truth.
 
@@ -792,7 +794,7 @@ This distinction must stay explicit:
 
 - `training_start` / `training_end`
   - canonical export truth
-- `padded_start` / `padded_end`
+- exact `training_start` / `training_end`
   - review context
 - `review_safe`
   - audition policy layered on top of slicer output
