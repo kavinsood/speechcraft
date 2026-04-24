@@ -1,12 +1,14 @@
 [project]
 name = "speechcraft-backend"
 version = "0.1.0"
-description = "FastAPI backend for the Speechcraft Phase 1 Clip Prep Workstation"
+description = "FastAPI backend for the Speechcraft speech dataset workstation"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0,<1.0.0",
+  "faster-whisper>=1.1.0,<2.0.0",
   "numpy>=2.0.0,<3.0.0",
   "pydantic>=2.11.0,<3.0.0",
+  "python-multipart>=0.0.20,<1.0.0",
   "sqlmodel>=0.0.24,<1.0.0",
   "uvicorn[standard]>=0.32.0,<1.0.0",
 ]

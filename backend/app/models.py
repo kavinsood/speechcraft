@@ -73,6 +73,12 @@ class ReferenceSourceKind(str, Enum):
     REFERENCE_VARIANT = "reference_variant"
 
 
+class QCBucket(str, Enum):
+    AUTO_KEPT = "auto_kept"
+    NEEDS_REVIEW = "needs_review"
+    AUTO_REJECTED = "auto_rejected"
+
+
 # ==========================================
 # LINK TABLES (MANY-TO-MANY)
 # ==========================================
@@ -92,6 +98,8 @@ class ImportBatch(SQLModel, table=True):
     id: str = Field(primary_key=True)
     name: str
     created_at: datetime = Field(default_factory=utc_now)
+    active_prepared_output_group_id: str | None = None
+    active_preparation_job_id: str | None = None
 
     recordings: list["SourceRecording"] = Relationship(back_populates="batch", cascade_delete=True)
     exports: list["ExportRun"] = Relationship(back_populates="batch", cascade_delete=True)
@@ -163,6 +171,35 @@ class ProcessingJob(SQLModel, table=True):
     completed_at: datetime | None = None
 
     source_recording: SourceRecording | None = Relationship(back_populates="processing_jobs")
+
+
+class QCRun(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    project_id: str = Field(foreign_key="importbatch.id", index=True)
+    slicer_run_id: str = Field(index=True)
+    status: JobStatus = Field(default=JobStatus.COMPLETED, sa_column=Column(sql_enum(JobStatus), index=True))
+    threshold_config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    slice_population_hash: str
+    transcript_basis_hash: str
+    audio_basis_hash: str
+    is_stale: bool = False
+    stale_reason: str | None = None
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+
+class SliceQCResult(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    qc_run_id: str = Field(foreign_key="qcrun.id", index=True)
+    slice_id: str = Field(foreign_key="slice.id", index=True)
+    aggregate_score: float = 0.0
+    bucket: QCBucket = Field(sa_column=Column(sql_enum(QCBucket), index=True))
+    raw_metrics: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    reason_codes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    human_review_status: ReviewStatus | None = Field(default=None, sa_column=Column(sql_enum(ReviewStatus)))
+    is_locked: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 # ==========================================
@@ -375,22 +412,128 @@ class ProcessingJobView(SQLModel):
     completed_at: datetime | None = None
 
 
+class ProjectPreparationRequest(SQLModel):
+    target_sample_rate: int | None = None
+    channel_mode: Literal["original", "mono", "left", "right"] = "original"
+
+
+class ProjectPreparationRun(SQLModel):
+    job: ProcessingJobView
+    created_recordings: list[SourceRecordingView] = Field(default_factory=list)
+    active_prepared_output_group_id: str | None = None
+
+
 class SourceTranscriptionRequest(SQLModel):
+    model_size: Literal["base", "small", "medium", "large-v3", "turbo"] = "turbo"
+    batch_size: int = 8
+    initial_prompt: str | None = None
     model_name: str | None = None
     model_version: str | None = None
     language_hint: str | None = None
 
 
 class SourceAlignmentRequest(SQLModel):
+    acoustic_model: str = "Wav2Vec2-Large-Robust-960h"
+    text_normalization_strategy: Literal["strict", "loose", "spoken_form"] = "loose"
+    batch_size: int = 8
     transcript_text_path: str | None = None
     transcript_json_path: str | None = None
     alignment_backend: str | None = None
+
+
+class ProjectRecordingJobsRun(SQLModel):
+    project_id: str
+    prepared_output_group_id: str
+    jobs: list[ProcessingJobView] = Field(default_factory=list)
 
 
 class SourceSlicingRequest(SQLModel):
     replace_unlocked_slices: bool = True
     preserve_locked_slices: bool = True
     config_overrides: dict[str, Any] | None = None
+
+
+class ProjectSlicerRunRequest(SQLModel):
+    target_clip_length: float = 7.0
+    max_clip_length: float = 15.0
+    segmentation_sensitivity: float = 0.5
+    preserve_locked_slices: bool = True
+    replace_unlocked_slices: bool = True
+    advanced_config_overrides: dict[str, Any] | None = None
+
+
+class ProjectSlicerRunView(SQLModel):
+    id: str
+    project_id: str
+    prepared_output_group_id: str
+    status: JobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    recording_ids: list[str] = Field(default_factory=list)
+    jobs: list[ProcessingJobView] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    is_stale: bool = False
+    stale_reason: str | None = None
+
+
+class ProjectSlicerRunDeleteResult(SQLModel):
+    project_id: str
+    slicer_run_id: str
+    deleted_job_count: int = 0
+    deleted_qc_run_count: int = 0
+    deleted_qc_result_count: int = 0
+    deleted_slice_count: int = 0
+    deleted_variant_count: int = 0
+    deleted_file_count: int = 0
+    restored_slice_count: int = 0
+    deleted_slice_ids: list[str] = Field(default_factory=list)
+    deleted_variant_ids: list[str] = Field(default_factory=list)
+
+
+class QCRunCreateRequest(SQLModel):
+    slicer_run_id: str
+    keep_threshold: float = 0.72
+    reject_threshold: float = 0.35
+    preset: str = "balanced"
+
+
+class SliceQCResultView(SQLModel):
+    id: str
+    qc_run_id: str
+    slice_id: str
+    source_recording_id: str | None = None
+    source_order_index: int | None = None
+    source_start_seconds: float | None = None
+    source_end_seconds: float | None = None
+    aggregate_score: float
+    bucket: QCBucket
+    raw_metrics: dict[str, Any] = Field(default_factory=dict)
+    reason_codes: list[str] = Field(default_factory=list)
+    human_review_status: ReviewStatus | None = None
+    is_locked: bool = False
+    created_at: datetime
+
+
+class QCRunView(SQLModel):
+    id: str
+    project_id: str
+    slicer_run_id: str
+    status: JobStatus
+    threshold_config: dict[str, Any] = Field(default_factory=dict)
+    slice_population_hash: str
+    transcript_basis_hash: str
+    audio_basis_hash: str
+    is_stale: bool = False
+    stale_reason: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
+    result_count: int = 0
+    bucket_counts: dict[str, int] = Field(default_factory=dict)
+    results: list[SliceQCResultView] = Field(default_factory=list)
 
 
 class ClipLabCapabilitiesView(SQLModel):
@@ -684,6 +827,8 @@ class ProjectSummary(SQLModel):
     created_at: datetime
     updated_at: datetime
     export_status: JobStatus | None = None
+    active_prepared_output_group_id: str | None = None
+    active_preparation_job_id: str | None = None
 
 
 class SourceRecordingCreate(SQLModel):
