@@ -1,247 +1,277 @@
 # Install And Bootstrap
 
-This guide is written for both humans and coding agents.
+This guide is for humans and coding agents setting up Speechcraft locally.
 
-The goal is to make repo setup deterministic, low-friction, and easy to verify.
+## Prerequisites
 
-## What You Are Setting Up
-
-Speechcraft currently has two runnable parts:
-
-- `backend/`: FastAPI API for the Phase 1 Clip Prep Workstation
-- `frontend/`: React + Vite UI for the Phase 1 workstation
-
-The backend provides a persistent demo project and writes local state to disk.
-
-## Recommended Prerequisites
-
-These are the preferred tools for the current repo:
+Preferred tools:
 
 - Python `3.11+`
 - Node.js `20+`
-- `npm` `10+`
-- `uv` for Python environment management
+- npm `10+`
+- `uv`
 - `make`
+- `ffmpeg` available on `PATH` for audio preparation/export paths
 
 Optional:
 
-- `bun` works for the frontend, but `npm` is the portability default for other users and agents
+- NVIDIA GPU drivers/CUDA for faster ASR
+- `sqlite3` CLI for inspecting local workstation state
 
-## One-Time Bootstrap
-
-## Fastest Path
+## One-Time Setup
 
 From the repo root:
 
 ```bash
 make setup
-make check
 ```
 
-Then run the app in two terminals:
+That runs:
+
+- backend dependency installation through `uv sync`
+- frontend dependency installation through `npm install`
+
+You can also run them separately:
+
+```bash
+make setup-backend
+make setup-frontend
+```
+
+## Run The App
+
+Open two terminals from the repo root.
+
+### Terminal 1: Backend API + Worker
 
 ```bash
 make dev-backend
 ```
 
-```bash
-make dev-frontend
-```
+This starts both:
 
-Use `make help` to see the available repo-level commands.
+- FastAPI API
+- `ProcessingJob` worker
 
-## One-Time Bootstrap
+The worker must be running for preparation, ASR, alignment, slicer jobs, and other queued work.
 
-### Backend
+Default backend URL:
 
-Run from the repo root:
-
-```bash
-cd backend
-UV_CACHE_DIR=/tmp/uv-cache uv sync
-```
-
-This creates `backend/.venv/` and installs the backend dependencies.
-
-### Frontend
-
-Run from the repo root:
-
-```bash
-cd frontend
-npm install
-```
-
-This installs the Vite + React dependencies into `frontend/node_modules/`.
-
-## Run The App
-
-Open two terminals.
-
-### Terminal 1: Backend
-
-```bash
-cd /home/kavin/github/speechcraft/backend
-UV_CACHE_DIR=/tmp/uv-cache uv run uvicorn app.main:app --reload
-```
-
-Backend URLs:
-
-- API root: `http://127.0.0.1:8000`
-- OpenAPI docs: `http://127.0.0.1:8000/docs`
+- `http://127.0.0.1:8010`
+- `http://127.0.0.1:8010/docs`
 
 ### Terminal 2: Frontend
 
 ```bash
-cd /home/kavin/github/speechcraft/frontend
-npm run dev
-```
-
-Frontend URL:
-
-- App: `http://127.0.0.1:5173`
-
-## Fish Shell Note
-
-If you want to activate the backend venv manually in `fish`, use:
-
-```fish
-source .venv/bin/activate.fish
-```
-
-Then you can run:
-
-```fish
-uvicorn app.main:app --reload
-```
-
-Using `uv run ...` is still the simpler default.
-
-## Agent Bootstrap Checklist
-
-If an agent is setting up the repo automatically, this is the preferred sequence:
-
-1. From the repo root, prefer the helper layer first:
-
-```bash
-cd /home/kavin/github/speechcraft
-make setup
-make check
-```
-
-2. If the agent needs the explicit underlying commands instead, use:
-
-Backend deps:
-
-```bash
-cd /home/kavin/github/speechcraft/backend
-UV_CACHE_DIR=/tmp/uv-cache uv sync
-```
-
-Frontend deps:
-
-```bash
-cd /home/kavin/github/speechcraft/frontend
-npm install
-```
-
-3. Verify backend code compiles:
-
-```bash
-cd /home/kavin/github/speechcraft
-python3 -m compileall backend/app
-```
-
-4. Verify frontend builds:
-
-```bash
-cd /home/kavin/github/speechcraft/frontend
-npm run build
-```
-
-5. Start backend:
-
-```bash
-cd /home/kavin/github/speechcraft
-make dev-backend
-```
-
-6. Start frontend:
-
-```bash
-cd /home/kavin/github/speechcraft
 make dev-frontend
 ```
 
-7. Open and verify:
+Default frontend URL:
 
-- `http://127.0.0.1:5173/`
-- `http://127.0.0.1:5173/backend-test`
-- `http://127.0.0.1:8000/docs`
+- `http://127.0.0.1:5173`
 
-## What Gets Created Locally
+The Makefile points the frontend at `http://127.0.0.1:8010` by default.
 
-The repo creates local state in these places:
+## Run API And Worker Separately
 
-- `backend/.venv/`: Python virtual environment
-- `frontend/node_modules/`: frontend dependencies
-- `frontend/dist/`: frontend production build output
-- `backend/data/phase1-demo.json`: persistent demo project state
-- `backend/exports/`: export runs and rendered demo output
+For debugging, use separate terminals:
 
-These are generated or local-runtime files and should not be treated as source.
+```bash
+make dev-api
+```
 
-## Default Runtime Behavior
+```bash
+make dev-worker
+```
 
-Important defaults:
+## Ports And Overrides
 
-- The frontend points to `http://127.0.0.1:8000` by default.
-- If needed, you can override the frontend API target with `VITE_API_BASE_URL`.
-- The main workstation uses backend-aware fallback helpers for some reads.
-- The `/backend-test` route is stricter and is intended to hit the real backend only.
+Makefile defaults:
 
-## Troubleshooting
+- `BACKEND_HOST=127.0.0.1`
+- `BACKEND_PORT=8010`
+- `FRONTEND_API_BASE_URL=http://127.0.0.1:8010`
 
-### `uv sync` fails during backend install
+Examples:
 
-Use the commands exactly as shown above from `backend/`.
+```bash
+BACKEND_PORT=8000 make dev-backend
+```
 
-The current backend packaging is configured for editable installs and should work with:
+```bash
+FRONTEND_API_BASE_URL=http://127.0.0.1:8000 make dev-frontend
+```
+
+The frontend can also be configured directly with:
+
+```bash
+VITE_API_BASE_URL=http://127.0.0.1:8010 npm run dev
+```
+
+## ASR Configuration
+
+Speechcraft uses `faster-whisper` for real ASR by default.
+
+CPU default:
+
+```bash
+make dev-backend
+```
+
+CUDA example:
+
+```bash
+ASR_DEVICE=cuda ASR_COMPUTE_TYPE=float16 make dev-backend
+```
+
+Useful ASR environment variables:
+
+- `ASR_BACKEND=faster_whisper`
+- `ASR_DEVICE=cpu` or `cuda`
+- `ASR_COMPUTE_TYPE=int8`, `float16`, or another faster-whisper-supported compute type
+- `ASR_MODEL_PATH=/absolute/path/to/model-or-model-name`
+
+The UI option `turbo` maps to faster-whisper model `large-v3-turbo`.
+
+First ASR run may download the selected model into the local model/cache path used by faster-whisper/Hugging Face tooling.
+
+The stub ASR backend is blocked unless this is explicitly set:
+
+```bash
+SPEECHCRAFT_ALLOW_STUB_ASR=1
+```
+
+Use that only for tests or controlled smoke work. It writes placeholder transcripts and is not valid for real slicing.
+
+## Verification
+
+Run all normal checks:
+
+```bash
+make check
+```
+
+Backend only:
+
+```bash
+make check-backend
+```
+
+Frontend only:
+
+```bash
+make check-frontend
+```
+
+Focused commands:
+
+```bash
+python3 -m compileall backend/app
+```
 
 ```bash
 cd backend
-UV_CACHE_DIR=/tmp/uv-cache uv sync
+uv run python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-### Frontend cannot reach the backend
+```bash
+cd frontend
+npm run build
+```
 
-Check:
+Smoke test against a running backend:
 
-- backend is running on `127.0.0.1:8000`
-- `VITE_API_BASE_URL` is not pointing somewhere stale
-- your browser console for fetch errors
+```bash
+make smoke-backend
+```
 
-### Audio preview does not play
+If your backend is not on the default port:
 
-The frontend depends on the backend route:
+```bash
+SMOKE_BACKEND_BASE_URL=http://127.0.0.1:8000 make smoke-backend
+```
 
-- `GET /api/clips/{clip_id}/audio`
+## Local Runtime State
 
-If the backend is down or returning an error, playback will fail.
+Expected local files/directories:
 
-### Export succeeds but the audio is not “real”
+- `backend/.venv/`
+- `frontend/node_modules/`
+- `frontend/dist/`
+- `backend/data/project.db`
+- `backend/data/media/`
+- `backend/exports/`
 
-That is expected for now.
+The database and media/export folders are workstation runtime state. They may contain large generated audio artifacts.
 
-The current repo uses deterministic synthetic clip rendering for demo purposes.
-Real source-backed rendering is a later upgrade.
+## Common Workflow Check
 
-## DX Notes
+After starting backend and frontend:
 
-For the best developer experience in this repo:
+1. Open `http://127.0.0.1:5173`.
+2. Create a project in Ingest.
+3. Select one or more `.wav` files.
+4. Create project and import.
+5. Open Overview and run preparation if needed.
+6. Run ASR.
+7. Run alignment after ASR completes.
+8. Open Slicer and create a slicer run.
+9. Open QC and run QC for the selected slicer run.
+10. Open Lab from QC or directly for manual review.
 
-- use the root `Makefile` first
-- use `uv` for backend setup and execution
-- use `npm` for frontend setup and execution
-- use `make check` for quick repo-level verification
-- use `/backend-test` after startup to validate the current backend surface quickly
+## Troubleshooting
+
+### Frontend cannot reach backend
+
+Check that:
+
+- `make dev-backend` is running
+- frontend API base is `http://127.0.0.1:8010` unless you changed `BACKEND_PORT`
+- browser console is not showing CORS/API-base mismatch errors
+
+### Jobs stay queued
+
+The worker is not running.
+
+Use:
+
+```bash
+make dev-backend
+```
+
+or run the worker separately:
+
+```bash
+make dev-worker
+```
+
+### ASR completes instantly
+
+That is suspicious for real audio.
+
+Check that you are not intentionally running the stub backend:
+
+```bash
+echo "$ASR_BACKEND"
+echo "$SPEECHCRAFT_ALLOW_STUB_ASR"
+```
+
+For real ASR, use the default faster-whisper backend and restart `make dev-backend` after changing environment variables.
+
+### Preparation or export cannot process audio
+
+Confirm `ffmpeg` is installed and available:
+
+```bash
+ffmpeg -version
+```
+
+### `uv` cache permission issues
+
+The Makefile defaults to:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache
+```
+
+If running raw `uv` commands in restricted environments, set the same variable explicitly.
