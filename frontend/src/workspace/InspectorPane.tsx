@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import type { ClipLabItem, ExportRun, ReferenceAssetSummary, ReviewStatus } from "../types";
+import type { ClipLabItem, ExportRun, QcBucket, ReferenceAssetSummary, ReviewStatus } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatDurationCompact,
@@ -23,6 +23,13 @@ type InspectorPaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   activeClip: ClipLabItem | null;
+  qcMeta: {
+    bucket: QcBucket;
+    visibleBucket: QcBucket;
+    score: number;
+    reasonCodes: string[];
+    reviewSnapshot?: ReviewStatus | null;
+  } | null;
   totalClipCount: number;
   totalDurationSeconds: number;
   datasetStatusCounts: {
@@ -46,6 +53,7 @@ export default function InspectorPane({
   workspacePhase,
   workspaceError,
   activeClip,
+  qcMeta,
   totalClipCount,
   totalDurationSeconds,
   datasetStatusCounts,
@@ -104,6 +112,24 @@ export default function InspectorPane({
         <>
           <section className="inspector-block">
             <h3>Tags</h3>
+            {qcMeta ? (
+              <div className="qc-lab-card">
+                <div className="commit-row">
+                  <strong>QC machine triage</strong>
+                  <span>{qcMeta.score.toFixed(3)}</span>
+                </div>
+                <p>
+                  Visible bucket: {qcMeta.visibleBucket.replace(/_/g, " ")}. Persisted machine bucket:{" "}
+                  {qcMeta.bucket.replace(/_/g, " ")}.
+                </p>
+                <p>
+                  Review snapshot: {qcMeta.reviewSnapshot ?? "unresolved"}. Current human status below is live and wins.
+                </p>
+                {qcMeta.reasonCodes.length > 0 ? (
+                  <p>Reasons: {qcMeta.reasonCodes.join(", ")}</p>
+                ) : null}
+              </div>
+            ) : null}
             {activeClip.capabilities.can_set_status && activeClip.status ? (
               <div className="status-group">
                 {queuePriorityOrder.map((status) => (

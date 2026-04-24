@@ -11,7 +11,7 @@ import threading
 import subprocess
 import tempfile
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ from uuid import uuid4
 
 import numpy as np
 from sqlalchemy import func
+from sqlalchemy import insert
 from sqlalchemy import update as sql_update
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, SQLModel, create_engine, delete, select
@@ -46,6 +47,16 @@ from .models import (
     MediaCleanupResult,
     ProcessingJob,
     ProcessingJobView,
+    ProjectPreparationRequest,
+    ProjectPreparationRun,
+    ProjectRecordingJobsRun,
+    ProjectSlicerRunDeleteResult,
+    ProjectSlicerRunRequest,
+    ProjectSlicerRunView,
+    QCBucket,
+    QCRun,
+    QCRunCreateRequest,
+    QCRunView,
     ProjectSummary,
     ReferenceAsset,
     ReferenceAssetCreateFromSlice,
@@ -71,6 +82,8 @@ from .models import (
     ReferenceRunStatus,
     SliceRevision,
     SliceSaveRequest,
+    SliceQCResult,
+    SliceQCResultView,
     SliceDetail,
     SliceSummary,
     Slice,
@@ -192,6 +205,7 @@ class SQLiteRepository:
         )
         SQLModel.metadata.create_all(self.engine)
         self._migrate_enum_storage()
+        self._migrate_importbatch_schema()
         self._migrate_editcommit_schema()
         self._migrate_processingjob_schema()
         self._purge_legacy_review_window_schema()
@@ -218,6 +232,20 @@ class SQLiteRepository:
     def get_project(self, project_id: str) -> ProjectSummary:
         with self._session() as session:
             return self._project_summary(session, self._get_batch(session, project_id))
+
+    def list_project_preparation_jobs(self, project_id: str) -> list[ProcessingJobView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            jobs = session.exec(
+                select(ProcessingJob)
+                .where(ProcessingJob.kind == JobKind.PREPROCESS)
+                .order_by(ProcessingJob.created_at.desc(), ProcessingJob.id.desc())
+            ).all()
+            return [
+                self._processing_job_view(job)
+                for job in jobs
+                if dict(job.input_payload or {}).get("project_id") == project_id
+            ]
 
     def list_source_recordings(self, project_id: str) -> list[SourceRecordingView]:
         with self._session() as session:
@@ -624,6 +652,125 @@ class SQLiteRepository:
                 for recording in recordings
             ]
 
+    def run_project_preparation(
+        self,
+        project_id: str,
+        payload: ProjectPreparationRequest,
+    ) -> ProjectPreparationRun:
+        normalized_payload = self._normalize_project_preparation_payload(payload)
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            job = ProcessingJob(
+                id=self._new_id("job"),
+                kind=JobKind.PREPROCESS,
+                status=JobStatus.PENDING,
+                source_recording_id=None,
+                input_payload={
+                    "project_id": project_id,
+                    **normalized_payload,
+                },
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return ProjectPreparationRun(job=self._processing_job_view(job), created_recordings=[])
+
+    def enqueue_project_transcription(
+        self,
+        project_id: str,
+        payload: SourceTranscriptionRequest,
+    ) -> ProjectRecordingJobsRun:
+        normalized_payload = self._normalize_source_transcription_payload(payload)
+        with self._session() as session:
+            batch = self._get_batch(session, project_id)
+            prepared_output_group_id = batch.active_prepared_output_group_id
+            if not prepared_output_group_id:
+                raise ValueError("Run preparation before launching ASR")
+            recordings = self._prepared_recordings_for_group(session, project_id, prepared_output_group_id)
+            if not recordings:
+                raise ValueError("Active prepared output group has no prepared recordings")
+            jobs: list[ProcessingJob] = []
+            for recording in recordings:
+                self._mark_slicer_runs_stale_for_recording(
+                    session,
+                    recording.id,
+                    "ASR was re-run for this prepared recording.",
+                )
+                job = ProcessingJob(
+                    id=self._new_id("job"),
+                    kind=JobKind.SOURCE_TRANSCRIPTION,
+                    status=JobStatus.PENDING,
+                    source_recording_id=recording.id,
+                    input_payload=normalized_payload,
+                )
+                session.add(job)
+                jobs.append(job)
+            session.commit()
+            for job in jobs:
+                session.refresh(job)
+            return ProjectRecordingJobsRun(
+                project_id=project_id,
+                prepared_output_group_id=prepared_output_group_id,
+                jobs=[self._processing_job_view(job) for job in jobs],
+            )
+
+    def enqueue_project_alignment(
+        self,
+        project_id: str,
+        payload: SourceAlignmentRequest,
+    ) -> ProjectRecordingJobsRun:
+        normalized_payload = self._normalize_source_alignment_payload(payload)
+        with self._session() as session:
+            batch = self._get_batch(session, project_id)
+            prepared_output_group_id = batch.active_prepared_output_group_id
+            if not prepared_output_group_id:
+                raise ValueError("Run preparation before launching alignment")
+            recordings = self._prepared_recordings_for_group(session, project_id, prepared_output_group_id)
+            if not recordings:
+                raise ValueError("Active prepared output group has no prepared recordings")
+            active_transcription = session.exec(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.kind == JobKind.SOURCE_TRANSCRIPTION,
+                    ProcessingJob.source_recording_id.in_([recording.id for recording in recordings]),
+                    ProcessingJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+                )
+            ).first()
+            if active_transcription is not None:
+                raise ValueError("Wait for ASR to complete before launching alignment")
+            not_transcribed = [
+                recording.id
+                for recording in recordings
+                if recording.source_artifact is None
+                or recording.source_artifact.transcript_status not in {"ok", "patched"}
+            ]
+            if not_transcribed:
+                raise ValueError("Run ASR before launching alignment")
+            jobs: list[ProcessingJob] = []
+            for recording in recordings:
+                self._mark_slicer_runs_stale_for_recording(
+                    session,
+                    recording.id,
+                    "Alignment was re-run for this prepared recording.",
+                )
+                job = ProcessingJob(
+                    id=self._new_id("job"),
+                    kind=JobKind.SOURCE_ALIGNMENT,
+                    status=JobStatus.PENDING,
+                    source_recording_id=recording.id,
+                    input_payload=normalized_payload,
+                )
+                session.add(job)
+                jobs.append(job)
+            session.commit()
+            for job in jobs:
+                session.refresh(job)
+            return ProjectRecordingJobsRun(
+                project_id=project_id,
+                prepared_output_group_id=prepared_output_group_id,
+                jobs=[self._processing_job_view(job) for job in jobs],
+            )
+
     def set_source_recording_artifact_paths(
         self,
         recording_id: str,
@@ -674,14 +821,20 @@ class SQLiteRepository:
         recording_id: str,
         payload: SourceTranscriptionRequest,
     ) -> ProcessingJobView:
+        normalized_payload = self._normalize_source_transcription_payload(payload)
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
+            self._mark_slicer_runs_stale_for_recording(
+                session,
+                recording.id,
+                "ASR was re-run for this recording.",
+            )
             job = ProcessingJob(
                 id=self._new_id("job"),
                 kind=JobKind.SOURCE_TRANSCRIPTION,
                 status=JobStatus.PENDING,
                 source_recording_id=recording.id,
-                input_payload=payload.model_dump(mode="json"),
+                input_payload=normalized_payload,
             )
             session.add(job)
             session.commit()
@@ -693,14 +846,20 @@ class SQLiteRepository:
         recording_id: str,
         payload: SourceAlignmentRequest,
     ) -> ProcessingJobView:
+        normalized_payload = self._normalize_source_alignment_payload(payload)
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
+            self._mark_slicer_runs_stale_for_recording(
+                session,
+                recording.id,
+                "Alignment was re-run for this recording.",
+            )
             job = ProcessingJob(
                 id=self._new_id("job"),
                 kind=JobKind.SOURCE_ALIGNMENT,
                 status=JobStatus.PENDING,
                 source_recording_id=recording.id,
-                input_payload=payload.model_dump(mode="json"),
+                input_payload=normalized_payload,
             )
             session.add(job)
             session.commit()
@@ -725,6 +884,235 @@ class SQLiteRepository:
             session.commit()
             session.refresh(job)
             return self._processing_job_view(job)
+
+    def list_project_slicer_runs(self, project_id: str) -> list[ProjectSlicerRunView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            jobs = session.exec(
+                select(ProcessingJob)
+                .where(ProcessingJob.kind == JobKind.SOURCE_SLICING)
+                .order_by(ProcessingJob.created_at.desc(), ProcessingJob.id.desc())
+            ).all()
+            project_jobs = [
+                job for job in jobs if dict(job.input_payload or {}).get("project_id") == project_id
+            ]
+            return self._project_slicer_run_views(project_id, project_jobs)
+
+    def create_project_slicer_run(
+        self,
+        project_id: str,
+        payload: ProjectSlicerRunRequest,
+    ) -> ProjectSlicerRunView:
+        slicer_run_id = self._new_id("slicer-run")
+        with self._session() as session:
+            batch = self._get_batch(session, project_id)
+            prepared_output_group_id = batch.active_prepared_output_group_id
+            if not prepared_output_group_id:
+                raise ValueError("Run preparation before launching the slicer")
+            prepared_recordings = self._prepared_recordings_for_group(
+                session,
+                project_id,
+                prepared_output_group_id,
+            )
+            if not prepared_recordings:
+                raise ValueError("Active prepared output group has no prepared recordings")
+            config_overrides = self._project_slicer_config_overrides(payload)
+            unaligned_recordings = [
+                recording.id
+                for recording in prepared_recordings
+                if recording.source_artifact is None
+                or recording.source_artifact.alignment_status != "ok"
+                or not recording.source_artifact.alignment_json_path
+            ]
+            if unaligned_recordings:
+                raise ValueError("Run ASR and alignment on the prepared output before launching the slicer")
+
+            jobs: list[ProcessingJob] = []
+            for recording in prepared_recordings:
+                input_payload = SourceSlicingRequest(
+                    replace_unlocked_slices=payload.replace_unlocked_slices,
+                    preserve_locked_slices=payload.preserve_locked_slices,
+                    config_overrides=config_overrides,
+                ).model_dump(mode="json")
+                input_payload.update(
+                    {
+                        "project_id": project_id,
+                        "slicer_run_id": slicer_run_id,
+                        "prepared_output_group_id": prepared_output_group_id,
+                        "ui_config": payload.model_dump(mode="json"),
+                    }
+                )
+                job = ProcessingJob(
+                    id=self._new_id("job"),
+                    kind=JobKind.SOURCE_SLICING,
+                    status=JobStatus.PENDING,
+                    source_recording_id=recording.id,
+                    input_payload=input_payload,
+                )
+                session.add(job)
+                jobs.append(job)
+            session.commit()
+            for job in jobs:
+                session.refresh(job)
+            return self._project_slicer_run_view(project_id, jobs)
+
+    def delete_project_slicer_run(self, project_id: str, slicer_run_id: str) -> ProjectSlicerRunDeleteResult:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            jobs = self._slicer_run_jobs(session, project_id, slicer_run_id)
+            if not jobs:
+                raise KeyError(slicer_run_id)
+            if any(job.status in {JobStatus.PENDING, JobStatus.RUNNING} for job in jobs):
+                raise ValueError("Cannot delete a slicer run while jobs are pending or running")
+
+            job_ids = [job.id for job in jobs]
+            deleted_paths: list[str] = []
+            deleted_slice_ids: list[str] = []
+            deleted_variant_ids: list[str] = []
+
+            qc_runs = session.exec(
+                select(QCRun).where(QCRun.project_id == project_id, QCRun.slicer_run_id == slicer_run_id)
+            ).all()
+            qc_run_ids = [run.id for run in qc_runs]
+            deleted_qc_result_count = 0
+            if qc_run_ids:
+                qc_result_ids = session.exec(
+                    select(SliceQCResult.id).where(SliceQCResult.qc_run_id.in_(qc_run_ids))
+                ).all()
+                deleted_qc_result_count = len(qc_result_ids)
+                session.exec(delete(SliceQCResult).where(SliceQCResult.qc_run_id.in_(qc_run_ids)))
+                session.exec(delete(QCRun).where(QCRun.id.in_(qc_run_ids)))
+
+            candidate_slices = self._get_all_batch_slices(session, project_id)
+            generated_slices = [
+                slice_row
+                for slice_row in candidate_slices
+                if self._slice_metadata(slice_row).get("slicer_run_id") == slicer_run_id
+            ]
+            deleted_slice_ids = [slice_row.id for slice_row in generated_slices]
+            deleted_variant_ids = [
+                variant.id for slice_row in generated_slices for variant in slice_row.variants
+            ]
+            deleted_paths = [
+                variant.file_path for slice_row in generated_slices for variant in slice_row.variants
+            ]
+            self._bulk_delete_slice_rows(session, generated_slices)
+
+            deleted_slice_id_set = set(deleted_slice_ids)
+            restored_slice_count = 0
+            for slice_row in candidate_slices:
+                if slice_row.id in deleted_slice_id_set:
+                    continue
+                metadata = self._slice_metadata(slice_row)
+                if metadata.get("superseded_by_job_id") not in job_ids:
+                    continue
+                metadata["is_superseded"] = False
+                metadata.pop("superseded_by_job_id", None)
+                metadata["restored_after_slicer_run_delete"] = slicer_run_id
+                metadata["updated_at"] = utc_now().isoformat()
+                slice_row.model_metadata = metadata
+                session.add(slice_row)
+                restored_slice_count += 1
+
+            session.exec(delete(ProcessingJob).where(ProcessingJob.id.in_(job_ids)))
+            session.commit()
+
+        deleted_file_count = self._delete_unreferenced_media_files(deleted_paths)
+        return ProjectSlicerRunDeleteResult(
+            project_id=project_id,
+            slicer_run_id=slicer_run_id,
+            deleted_job_count=len(job_ids),
+            deleted_qc_run_count=len(qc_run_ids),
+            deleted_qc_result_count=deleted_qc_result_count,
+            deleted_slice_count=len(deleted_slice_ids),
+            deleted_variant_count=len(deleted_variant_ids),
+            deleted_file_count=deleted_file_count,
+            restored_slice_count=restored_slice_count,
+            deleted_slice_ids=deleted_slice_ids,
+            deleted_variant_ids=deleted_variant_ids,
+        )
+
+    def list_project_qc_runs(
+        self,
+        project_id: str,
+        slicer_run_id: str | None = None,
+    ) -> list[QCRunView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            statement = select(QCRun).where(QCRun.project_id == project_id).order_by(QCRun.created_at.desc())
+            if slicer_run_id:
+                statement = statement.where(QCRun.slicer_run_id == slicer_run_id)
+            runs = session.exec(statement).all()
+            return [self._qc_run_view(session, self._refresh_qc_run_stale_state(session, run)) for run in runs]
+
+    def get_qc_run(self, qc_run_id: str) -> QCRunView:
+        with self._session() as session:
+            run = session.get(QCRun, qc_run_id)
+            if run is None:
+                raise KeyError(qc_run_id)
+            return self._qc_run_view(session, self._refresh_qc_run_stale_state(session, run), include_results=True)
+
+    def create_qc_run(self, project_id: str, payload: QCRunCreateRequest) -> QCRunView:
+        keep_threshold = max(0.0, min(1.0, float(payload.keep_threshold)))
+        reject_threshold = max(0.0, min(1.0, float(payload.reject_threshold)))
+        if reject_threshold > keep_threshold:
+            raise ValueError("reject_threshold cannot exceed keep_threshold")
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            slicer_jobs = self._slicer_run_jobs(session, project_id, payload.slicer_run_id)
+            if not slicer_jobs:
+                raise ValueError("Slicer run not found")
+            if any(job.status != JobStatus.COMPLETED for job in slicer_jobs):
+                raise ValueError("QC requires a completed slicer run")
+            slices = self._qc_scope_slices_for_slicer_run(session, project_id, payload.slicer_run_id)
+            if not slices:
+                raise ValueError("Slicer run has no active slices to QC")
+            snapshot = self._qc_snapshot_for_slices(slices)
+            now = utc_now()
+            run = QCRun(
+                id=self._new_id("qc-run"),
+                project_id=project_id,
+                slicer_run_id=payload.slicer_run_id,
+                status=JobStatus.COMPLETED,
+                threshold_config={
+                    "keep_threshold": keep_threshold,
+                    "reject_threshold": reject_threshold,
+                    "preset": payload.preset,
+                },
+                slice_population_hash=snapshot["slice_population_hash"],
+                transcript_basis_hash=snapshot["transcript_basis_hash"],
+                audio_basis_hash=snapshot["audio_basis_hash"],
+                is_stale=False,
+                completed_at=now,
+            )
+            session.add(run)
+            session.flush()
+            qc_result_rows: list[dict[str, Any]] = []
+            for slice_row in slices:
+                result_payload = self._score_slice_for_qc(
+                    slice_row,
+                    keep_threshold=keep_threshold,
+                    reject_threshold=reject_threshold,
+                )
+                qc_result_rows.append(
+                    {
+                        "id": self._new_id("qc-result"),
+                        "qc_run_id": run.id,
+                        "slice_id": slice_row.id,
+                        "aggregate_score": result_payload["aggregate_score"],
+                        "bucket": result_payload["bucket"],
+                        "raw_metrics": result_payload["raw_metrics"],
+                        "reason_codes": result_payload["reason_codes"],
+                        "human_review_status": slice_row.status,
+                        "is_locked": bool(slice_row.is_locked),
+                        "created_at": now,
+                    }
+                )
+            if qc_result_rows:
+                session.execute(insert(SliceQCResult), qc_result_rows)
+            session.commit()
+            session.refresh(run)
+            return self._qc_run_view(session, run, include_results=True)
 
     def list_source_recording_jobs(self, recording_id: str) -> list[ProcessingJobView]:
         with self._session() as session:
@@ -756,19 +1144,14 @@ class SQLiteRepository:
                 for slice_row in self._get_all_batch_slices(session, project_id)
                 if self._slice_metadata(slice_row).get("is_superseded", False)
             ]
-            for slice_row in superseded_slices:
-                deleted_slice_ids.append(slice_row.id)
-                deleted_variant_ids.extend(variant.id for variant in slice_row.variants)
-                deleted_paths.extend(variant.file_path for variant in slice_row.variants)
-                variant_ids = [variant.id for variant in slice_row.variants]
-                commit_ids = [commit.id for commit in slice_row.commits]
-                session.exec(delete(SliceTagLink).where(SliceTagLink.slice_id == slice_row.id))
-                if variant_ids:
-                    session.exec(delete(AudioVariant).where(AudioVariant.id.in_(variant_ids)))
-                if commit_ids:
-                    session.exec(delete(EditCommit).where(EditCommit.id.in_(commit_ids)))
-                session.exec(delete(Transcript).where(Transcript.slice_id == slice_row.id))
-                session.exec(delete(Slice).where(Slice.id == slice_row.id))
+            deleted_slice_ids.extend(slice_row.id for slice_row in superseded_slices)
+            deleted_variant_ids.extend(
+                variant.id for slice_row in superseded_slices for variant in slice_row.variants
+            )
+            deleted_paths.extend(
+                variant.file_path for slice_row in superseded_slices for variant in slice_row.variants
+            )
+            self._bulk_delete_slice_rows(session, superseded_slices)
 
             session.flush()
 
@@ -800,6 +1183,20 @@ class SQLiteRepository:
             deleted_slice_ids=deleted_slice_ids,
             deleted_variant_ids=deleted_variant_ids,
         )
+
+    def _bulk_delete_slice_rows(self, session: Session, slices: list[Slice]) -> None:
+        slice_ids = [slice_row.id for slice_row in slices]
+        if not slice_ids:
+            return
+        variant_ids = [variant.id for slice_row in slices for variant in slice_row.variants]
+        commit_ids = [commit.id for slice_row in slices for commit in slice_row.commits]
+        session.exec(delete(SliceTagLink).where(SliceTagLink.slice_id.in_(slice_ids)))
+        if variant_ids:
+            session.exec(delete(AudioVariant).where(AudioVariant.id.in_(variant_ids)))
+        if commit_ids:
+            session.exec(delete(EditCommit).where(EditCommit.id.in_(commit_ids)))
+        session.exec(delete(Transcript).where(Transcript.slice_id.in_(slice_ids)))
+        session.exec(delete(Slice).where(Slice.id.in_(slice_ids)))
 
     def save_slice_state(self, slice_id: str, payload: SliceSaveRequest) -> SliceDetail:
         with self._session() as session:
@@ -1320,12 +1717,66 @@ class SQLiteRepository:
             return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset_id))
 
     def create_import_batch(self, payload: ImportBatchCreate) -> ProjectSummary:
+        normalized_name = payload.name.strip()
+        if not normalized_name:
+            raise ValueError("Project name is required")
         with self._session() as session:
-            batch = ImportBatch(id=payload.id, name=payload.name)
+            if session.get(ImportBatch, payload.id) is not None:
+                raise ValueError("Project id already exists")
+            existing_name = session.exec(
+                select(ImportBatch).where(func.lower(ImportBatch.name) == normalized_name.lower())
+            ).first()
+            if existing_name is not None:
+                raise ValueError("Project name already exists")
+            batch = ImportBatch(id=payload.id, name=normalized_name)
             session.add(batch)
             session.commit()
             session.refresh(batch)
             return self._project_summary(session, batch)
+
+    def delete_project(self, project_id: str) -> dict[str, int | str]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            recordings = session.exec(
+                select(SourceRecording)
+                .where(SourceRecording.batch_id == project_id)
+                .options(
+                    selectinload(SourceRecording.slices).selectinload(Slice.variants),
+                    selectinload(SourceRecording.slices).selectinload(Slice.commits),
+                )
+            ).all()
+            recording_ids = [recording.id for recording in recordings]
+            slice_rows = [slice_row for recording in recordings for slice_row in recording.slices]
+            slice_ids = [slice_row.id for slice_row in slice_rows]
+            variant_paths = [
+                variant.file_path for slice_row in slice_rows for variant in slice_row.variants
+            ]
+            source_paths = [recording.file_path for recording in recordings]
+            qc_run_ids = session.exec(select(QCRun.id).where(QCRun.project_id == project_id)).all()
+
+            if qc_run_ids:
+                session.exec(delete(SliceQCResult).where(SliceQCResult.qc_run_id.in_(qc_run_ids)))
+                session.exec(delete(QCRun).where(QCRun.id.in_(qc_run_ids)))
+            self._bulk_delete_slice_rows(session, slice_rows)
+            if recording_ids:
+                session.exec(delete(SourceRecordingArtifact).where(SourceRecordingArtifact.source_recording_id.in_(recording_ids)))
+                session.exec(delete(ProcessingJob).where(ProcessingJob.source_recording_id.in_(recording_ids)))
+                session.exec(delete(SourceRecording).where(SourceRecording.id.in_(recording_ids)))
+            session.exec(delete(ExportRun).where(ExportRun.batch_id == project_id))
+            session.exec(delete(ImportBatch).where(ImportBatch.id == project_id))
+            session.commit()
+
+        deleted_file_count = self._delete_managed_media_paths(source_paths + variant_paths)
+        return {"project_id": project_id, "deleted_file_count": deleted_file_count}
+
+    def new_source_recording_id(self) -> str:
+        return self._new_id("source")
+
+    def managed_source_recording_path(self, recording_id: str) -> Path:
+        return self._managed_media_path("sources", recording_id)
+
+    def read_pcm_wav_header(self, path: Path) -> tuple[int, int, int, int]:
+        return self._read_pcm_wav_header(path)
 
     def create_source_recording(self, payload: SourceRecordingCreate) -> SourceRecording:
         with self._session() as session:
@@ -1359,6 +1810,707 @@ class SQLiteRepository:
             session.commit()
             session.refresh(recording)
             return recording
+
+    def _normalize_project_preparation_payload(
+        self,
+        payload: ProjectPreparationRequest,
+    ) -> dict[str, Any]:
+        target_sample_rate = payload.target_sample_rate
+        if target_sample_rate is not None:
+            target_sample_rate = int(target_sample_rate)
+            if target_sample_rate <= 0:
+                raise ValueError("target_sample_rate must be positive")
+        channel_mode = payload.channel_mode
+        if channel_mode not in {"original", "mono", "left", "right"}:
+            raise ValueError("Unsupported channel_mode")
+        return {
+            "target_sample_rate": target_sample_rate,
+            "channel_mode": channel_mode,
+        }
+
+    def _normalize_source_transcription_payload(
+        self,
+        payload: SourceTranscriptionRequest,
+    ) -> dict[str, Any]:
+        batch_size = int(payload.batch_size)
+        if batch_size <= 0:
+            raise ValueError("ASR batch_size must be positive")
+        initial_prompt = payload.initial_prompt.strip() if payload.initial_prompt else None
+        return {
+            **payload.model_dump(mode="json"),
+            "model_size": payload.model_size,
+            "batch_size": batch_size,
+            "initial_prompt": initial_prompt,
+            "language_hint": "en",
+        }
+
+    def _normalize_source_alignment_payload(
+        self,
+        payload: SourceAlignmentRequest,
+    ) -> dict[str, Any]:
+        batch_size = int(payload.batch_size)
+        if batch_size <= 0:
+            raise ValueError("Alignment batch_size must be positive")
+        return {
+            **payload.model_dump(mode="json"),
+            "acoustic_model": payload.acoustic_model.strip() or "Wav2Vec2-Large-Robust-960h",
+            "text_normalization_strategy": payload.text_normalization_strategy,
+            "batch_size": batch_size,
+        }
+
+    def _project_slicer_config_overrides(
+        self,
+        payload: ProjectSlicerRunRequest,
+    ) -> dict[str, Any]:
+        target_duration = max(1.0, float(payload.target_clip_length))
+        max_duration = max(target_duration, float(payload.max_clip_length))
+        sensitivity = max(0.0, min(1.0, float(payload.segmentation_sensitivity)))
+        overrides = {
+            "target_duration": target_duration,
+            "max_duration": max_duration,
+            "soft_max": max(target_duration, min(max_duration, max_duration * 0.75)),
+            "min_boundary_acoustic_score": round(0.55 - (sensitivity * 0.3), 3),
+            "min_gap_for_boundary": round(0.18 - (sensitivity * 0.08), 3),
+            "preferred_gap_for_boundary": round(0.34 - (sensitivity * 0.14), 3),
+        }
+        if payload.advanced_config_overrides:
+            allowed_keys = {field.name for field in dataclass_fields(SlicerConfig)}
+            normalized_overrides: dict[str, float] = {}
+            for key, value in payload.advanced_config_overrides.items():
+                if key not in allowed_keys:
+                    raise ValueError(f"Unsupported slicer config override: {key}")
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValueError(f"Slicer config override must be a finite number: {key}")
+                if float(value) < 0:
+                    raise ValueError(f"Slicer config override cannot be negative: {key}")
+                normalized_overrides[key] = float(value)
+            overrides.update(normalized_overrides)
+        config = SlicerConfig(**overrides)
+        if config.min_duration <= 0 or config.target_duration <= 0 or config.max_duration <= 0:
+            raise ValueError("Slicer durations must be positive")
+        if config.max_duration < config.min_duration:
+            raise ValueError("Slicer max_duration cannot be less than min_duration")
+        if not (config.min_duration <= config.target_duration <= config.max_duration):
+            raise ValueError("Slicer target_duration must fall between min_duration and max_duration")
+        return overrides
+
+    def _preparation_recipe_payload(self, recording: SourceRecording) -> dict[str, Any] | None:
+        if not recording.processing_recipe:
+            return None
+        try:
+            payload = json.loads(recording.processing_recipe)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or payload.get("type") != "overview_preparation":
+            return None
+        return payload
+
+    def _prepared_recordings_for_group(
+        self,
+        session: Session,
+        project_id: str,
+        prepared_output_group_id: str,
+    ) -> list[SourceRecording]:
+        recordings = session.exec(
+            select(SourceRecording)
+            .where(
+                SourceRecording.batch_id == project_id,
+                SourceRecording.parent_recording_id.is_not(None),
+            )
+            .options(selectinload(SourceRecording.source_artifact))
+            .order_by(SourceRecording.id.asc())
+        ).all()
+        matching_recordings: list[SourceRecording] = []
+        for recording in recordings:
+            recipe = self._preparation_recipe_payload(recording)
+            if recipe is not None and recipe.get("output_group_id") == prepared_output_group_id:
+                matching_recordings.append(recording)
+        return matching_recordings
+
+    def _project_slicer_run_views(
+        self,
+        project_id: str,
+        jobs: list[ProcessingJob],
+    ) -> list[ProjectSlicerRunView]:
+        groups: dict[str, list[ProcessingJob]] = {}
+        for job in jobs:
+            payload = dict(job.input_payload or {})
+            run_id = str(payload.get("slicer_run_id") or job.id)
+            groups.setdefault(run_id, []).append(job)
+        return [
+            self._project_slicer_run_view(project_id, group_jobs)
+            for _run_id, group_jobs in sorted(
+                groups.items(),
+                key=lambda item: max(self._as_utc(job.created_at) for job in item[1]),
+                reverse=True,
+            )
+        ]
+
+    def _project_slicer_run_view(
+        self,
+        project_id: str,
+        jobs: list[ProcessingJob],
+    ) -> ProjectSlicerRunView:
+        if not jobs:
+            raise ValueError("Slicer run requires at least one job")
+        jobs = sorted(jobs, key=lambda job: (self._as_utc(job.created_at), job.id))
+        first_payload = dict(jobs[0].input_payload or {})
+        run_id = str(first_payload.get("slicer_run_id") or jobs[0].id)
+        statuses = [job.status for job in jobs]
+        if any(status == JobStatus.RUNNING for status in statuses):
+            status = JobStatus.RUNNING
+        elif any(status == JobStatus.PENDING for status in statuses):
+            status = JobStatus.PENDING
+        elif any(status == JobStatus.FAILED for status in statuses):
+            status = JobStatus.FAILED
+        else:
+            status = JobStatus.COMPLETED
+        created_at = min(self._as_utc(job.created_at) for job in jobs)
+        started_values = [self._as_utc(job.started_at) for job in jobs if job.started_at is not None]
+        completed_values = [self._as_utc(job.completed_at) for job in jobs if job.completed_at is not None]
+        job_views = [self._processing_job_view(job) for job in jobs]
+        stale_reasons = [
+            str((job.output_payload or job.input_payload or {}).get("stale_reason") or "")
+            for job in jobs
+            if dict(job.output_payload or job.input_payload or {}).get("is_stale")
+        ]
+        stale_reasons = [reason for reason in stale_reasons if reason]
+        is_stale = any(dict(job.output_payload or job.input_payload or {}).get("is_stale") for job in jobs)
+        failure_warnings = [
+            str(job.error_message)
+            for job in jobs
+            if job.status == JobStatus.FAILED and job.error_message
+        ]
+        return ProjectSlicerRunView(
+            id=run_id,
+            project_id=project_id,
+            prepared_output_group_id=str(first_payload.get("prepared_output_group_id") or ""),
+            status=status,
+            created_at=created_at,
+            started_at=min(started_values) if started_values else None,
+            completed_at=max(completed_values) if len(completed_values) == len(jobs) else None,
+            recording_ids=[str(job.source_recording_id) for job in jobs if job.source_recording_id],
+            jobs=job_views,
+            config=dict(first_payload.get("ui_config") or {}),
+            summary=self._project_slicer_run_summary(jobs),
+            warnings=[*failure_warnings, *stale_reasons],
+            is_stale=is_stale,
+            stale_reason=stale_reasons[0] if stale_reasons else None,
+        )
+
+    def _project_slicer_run_summary(self, jobs: list[ProcessingJob]) -> dict[str, Any]:
+        completed_payloads = [
+            dict(job.output_payload or {}) for job in jobs if job.status == JobStatus.COMPLETED
+        ]
+        created_slice_count = sum(int(payload.get("created_slice_count") or 0) for payload in completed_payloads)
+        preserved_locked_count = sum(
+            int(payload.get("preserved_locked_slice_count") or 0) for payload in completed_payloads
+        )
+        dropped_overlap_count = sum(
+            int(payload.get("dropped_overlap_count") or 0) for payload in completed_payloads
+        )
+        stats = [dict(payload.get("slicer_stats") or {}) for payload in completed_payloads]
+        total_sliced_duration = sum(float(item.get("total_clip_s") or 0.0) for item in stats)
+        duration_counts = sum(int(item.get("total_clips") or 0) for item in stats)
+        min_values = [float(item.get("min_duration_s") or 0.0) for item in stats if item.get("total_clips")]
+        max_values = [float(item.get("max_duration_s") or 0.0) for item in stats if item.get("total_clips")]
+        avg_duration = total_sliced_duration / duration_counts if duration_counts else 0.0
+        return {
+            "slices_created": created_slice_count,
+            "total_sliced_duration": round(total_sliced_duration, 2),
+            "average_slice_length": round(avg_duration, 2),
+            "minimum_slice_length": round(min(min_values), 2) if min_values else 0.0,
+            "maximum_slice_length": round(max(max_values), 2) if max_values else 0.0,
+            "preserved_locked_slice_count": preserved_locked_count,
+            "dropped_overlap_count": dropped_overlap_count,
+            "completed_recording_count": len(completed_payloads),
+            "failed_recording_count": sum(1 for job in jobs if job.status == JobStatus.FAILED),
+            "pending_recording_count": sum(1 for job in jobs if job.status == JobStatus.PENDING),
+            "running_recording_count": sum(1 for job in jobs if job.status == JobStatus.RUNNING),
+            "downstream_qc_data_available": created_slice_count > 0,
+        }
+
+    def _slicer_run_jobs(self, session: Session, project_id: str, slicer_run_id: str) -> list[ProcessingJob]:
+        jobs = session.exec(
+            select(ProcessingJob)
+            .where(ProcessingJob.kind == JobKind.SOURCE_SLICING)
+            .order_by(ProcessingJob.created_at.asc(), ProcessingJob.id.asc())
+        ).all()
+        return [
+            job
+            for job in jobs
+            if dict(job.input_payload or {}).get("project_id") == project_id
+            and dict(job.input_payload or {}).get("slicer_run_id") == slicer_run_id
+        ]
+
+    def _mark_slicer_runs_stale_for_recording(
+        self,
+        session: Session,
+        recording_id: str,
+        reason: str,
+    ) -> None:
+        jobs = session.exec(
+            select(ProcessingJob).where(
+                ProcessingJob.kind == JobKind.SOURCE_SLICING,
+                ProcessingJob.source_recording_id == recording_id,
+            )
+        ).all()
+        if not jobs:
+            return
+        now = utc_now().isoformat()
+        for job in jobs:
+            input_payload = dict(job.input_payload or {})
+            input_payload["is_stale"] = True
+            input_payload["stale_reason"] = reason
+            input_payload["stale_at"] = now
+            job.input_payload = input_payload
+            output_payload = dict(job.output_payload or {})
+            output_payload["is_stale"] = True
+            output_payload["stale_reason"] = reason
+            output_payload["stale_at"] = now
+            job.output_payload = output_payload
+            session.add(job)
+
+    def _sort_qc_slices_by_source_order(self, slices: list[Slice]) -> list[Slice]:
+        return sorted(
+            slices,
+            key=lambda slice_row: (
+                str(slice_row.source_recording_id),
+                int(self._slice_metadata(slice_row).get("order_index", 0)),
+                self._as_utc(slice_row.created_at),
+                slice_row.id,
+            ),
+        )
+
+    def _qc_scope_slices_for_slicer_run(
+        self,
+        session: Session,
+        project_id: str,
+        slicer_run_id: str,
+    ) -> list[Slice]:
+        slicer_jobs = self._slicer_run_jobs(session, project_id, slicer_run_id)
+        recording_ids = [str(job.source_recording_id) for job in slicer_jobs if job.source_recording_id]
+        if not recording_ids:
+            return []
+        slices = session.exec(
+            select(Slice)
+            .where(Slice.source_recording_id.in_(recording_ids))
+            .options(
+                selectinload(Slice.transcript),
+                selectinload(Slice.variants),
+                selectinload(Slice.active_variant),
+                selectinload(Slice.commits),
+            )
+            .order_by(Slice.source_recording_id.asc(), Slice.created_at.asc(), Slice.id.asc())
+        ).all()
+        active_slices = []
+        for slice_row in slices:
+            metadata = self._slice_metadata(slice_row)
+            if metadata.get("is_superseded", False):
+                continue
+            if metadata.get("slicer_run_id") != slicer_run_id:
+                continue
+            active_slices.append(slice_row)
+        return self._sort_qc_slices_by_source_order(active_slices)
+
+    def _qc_snapshot_for_slices(self, slices: list[Slice]) -> dict[str, str]:
+        population_parts: list[str] = []
+        transcript_parts: list[str] = []
+        audio_parts: list[str] = []
+        for slice_row in self._sort_qc_slices_by_source_order(slices):
+            transcript_text = self._transcript_text(slice_row.transcript)
+            active_variant_id = slice_row.active_variant_id or ""
+            active_commit_id = slice_row.active_commit_id or ""
+            metadata = self._slice_metadata(slice_row)
+            population_parts.append(f"{slice_row.id}:{slice_row.source_recording_id}")
+            transcript_parts.append(f"{slice_row.id}:{transcript_text}:{active_commit_id}")
+            audio_parts.append(
+                f"{slice_row.id}:{active_variant_id}:{active_commit_id}:"
+                f"{metadata.get('training_start')}:{metadata.get('training_end')}"
+            )
+        return {
+            "slice_population_hash": hashlib.sha1("|".join(population_parts).encode("utf-8")).hexdigest(),
+            "transcript_basis_hash": hashlib.sha1("|".join(transcript_parts).encode("utf-8")).hexdigest(),
+            "audio_basis_hash": hashlib.sha1("|".join(audio_parts).encode("utf-8")).hexdigest(),
+        }
+
+    def _refresh_qc_run_stale_state(self, session: Session, run: QCRun) -> QCRun:
+        slices = self._qc_scope_slices_for_slicer_run(session, run.project_id, run.slicer_run_id)
+        if not slices:
+            run.is_stale = True
+            run.stale_reason = "slicer_run_has_no_active_slices"
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            return run
+        snapshot = self._qc_snapshot_for_slices(slices)
+        stale_reasons = [
+            key
+            for key in ("slice_population_hash", "transcript_basis_hash", "audio_basis_hash")
+            if getattr(run, key) != snapshot[key]
+        ]
+        run.is_stale = bool(stale_reasons)
+        run.stale_reason = ",".join(stale_reasons) if stale_reasons else None
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        return run
+
+    def _score_slice_for_qc(
+        self,
+        slice_row: Slice,
+        *,
+        keep_threshold: float,
+        reject_threshold: float,
+    ) -> dict[str, Any]:
+        metadata = self._slice_metadata(slice_row)
+        duration = self._slice_duration(slice_row)
+        transcript_text = self._transcript_text(slice_row.transcript).strip()
+        word_count = len(transcript_text.split()) if transcript_text else 0
+        avg_alignment_confidence = float(metadata.get("avg_alignment_confidence") or 0.0)
+        edge_start_energy = float(metadata.get("edge_start_energy") or 0.0)
+        edge_end_energy = float(metadata.get("edge_end_energy") or 0.0)
+        flag_reasons = list(metadata.get("flag_reasons") or [])
+        reason_codes: list[str] = []
+
+        if duration <= 0 or slice_row.active_variant_id is None:
+            reason_codes.append("broken_audio")
+        if duration < 1.0 or word_count == 0:
+            reason_codes.append("near_silence_unusable_clip")
+        if not transcript_text:
+            reason_codes.append("transcript_mismatch")
+        if edge_start_energy > 0.8 or edge_end_energy > 0.8:
+            reason_codes.append("severe_clipping_corruption")
+        if any("overlap" in str(reason).lower() for reason in flag_reasons):
+            reason_codes.append("overlap_second_speaker")
+
+        duration_score = max(0.0, 1.0 - abs(duration - 7.0) / 10.0)
+        confidence_score = max(0.0, min(1.0, avg_alignment_confidence or 0.75))
+        transcript_score = min(1.0, word_count / max(duration * 2.2, 1.0)) if duration > 0 else 0.0
+        edge_penalty = min(0.35, (edge_start_energy + edge_end_energy) * 0.12)
+        flag_penalty = min(0.35, len(flag_reasons) * 0.08)
+        hard_gate_penalty = 0.55 if reason_codes else 0.0
+        aggregate_score = max(
+            0.0,
+            min(
+                1.0,
+                (duration_score * 0.3)
+                + (confidence_score * 0.3)
+                + (transcript_score * 0.25)
+                + 0.15
+                - edge_penalty
+                - flag_penalty
+                - hard_gate_penalty,
+            ),
+        )
+        aggregate_score = round(aggregate_score, 4)
+        if reason_codes or aggregate_score < reject_threshold:
+            bucket = QCBucket.AUTO_REJECTED
+        elif aggregate_score >= keep_threshold:
+            bucket = QCBucket.AUTO_KEPT
+        else:
+            bucket = QCBucket.NEEDS_REVIEW
+        return {
+            "aggregate_score": aggregate_score,
+            "bucket": bucket,
+            "reason_codes": sorted(set(reason_codes + [str(reason) for reason in flag_reasons])),
+            "raw_metrics": {
+                "duration_seconds": duration,
+                "word_count": word_count,
+                "avg_alignment_confidence": round(avg_alignment_confidence, 4),
+                "edge_start_energy": round(edge_start_energy, 6),
+                "edge_end_energy": round(edge_end_energy, 6),
+                "duration_score": round(duration_score, 4),
+                "confidence_score": round(confidence_score, 4),
+                "transcript_score": round(transcript_score, 4),
+                "edge_penalty": round(edge_penalty, 4),
+                "flag_penalty": round(flag_penalty, 4),
+                "hard_gate_penalty": hard_gate_penalty,
+            },
+        }
+
+    def _qc_result_source_key(self, result: SliceQCResult, slice_row: Slice | None) -> tuple[str, int, float, str]:
+        if slice_row is None:
+            return ("", 0, 0.0, result.slice_id)
+        metadata = self._slice_metadata(slice_row)
+        return (
+            slice_row.source_recording_id,
+            int(metadata.get("order_index", 0)),
+            float(metadata.get("training_start", metadata.get("original_start_time", 0.0)) or 0.0),
+            slice_row.id,
+        )
+
+    def _qc_result_view(self, result: SliceQCResult, slice_row: Slice | None = None) -> SliceQCResultView:
+        metadata = self._slice_metadata(slice_row) if slice_row else {}
+        return SliceQCResultView(
+            id=result.id,
+            qc_run_id=result.qc_run_id,
+            slice_id=result.slice_id,
+            source_recording_id=slice_row.source_recording_id if slice_row else None,
+            source_order_index=int(metadata.get("order_index", 0)) if slice_row else None,
+            source_start_seconds=(
+                float(metadata.get("training_start", metadata.get("original_start_time", 0.0)) or 0.0)
+                if slice_row
+                else None
+            ),
+            source_end_seconds=(
+                float(metadata.get("training_end", metadata.get("original_end_time", 0.0)) or 0.0)
+                if slice_row
+                else None
+            ),
+            aggregate_score=result.aggregate_score,
+            bucket=result.bucket,
+            raw_metrics=result.raw_metrics,
+            reason_codes=result.reason_codes,
+            human_review_status=result.human_review_status,
+            is_locked=result.is_locked,
+            created_at=self._as_utc(result.created_at),
+        )
+
+    def _qc_run_view(
+        self,
+        session: Session,
+        run: QCRun,
+        *,
+        include_results: bool = False,
+    ) -> QCRunView:
+        results = session.exec(
+            select(SliceQCResult)
+            .where(SliceQCResult.qc_run_id == run.id)
+            .order_by(SliceQCResult.created_at.asc(), SliceQCResult.slice_id.asc())
+        ).all()
+        slice_ids = [result.slice_id for result in results]
+        slice_map = {
+            slice_row.id: slice_row
+            for slice_row in session.exec(select(Slice).where(Slice.id.in_(slice_ids))).all()
+        } if slice_ids else {}
+        bucket_counts: dict[str, int] = {}
+        for result in results:
+            bucket_counts[result.bucket.value] = bucket_counts.get(result.bucket.value, 0) + 1
+        source_ordered_results = sorted(
+            results,
+            key=lambda result: self._qc_result_source_key(result, slice_map.get(result.slice_id)),
+        )
+        return QCRunView(
+            id=run.id,
+            project_id=run.project_id,
+            slicer_run_id=run.slicer_run_id,
+            status=run.status,
+            threshold_config=run.threshold_config,
+            slice_population_hash=run.slice_population_hash,
+            transcript_basis_hash=run.transcript_basis_hash,
+            audio_basis_hash=run.audio_basis_hash,
+            is_stale=run.is_stale,
+            stale_reason=run.stale_reason,
+            error_message=run.error_message,
+            created_at=self._as_utc(run.created_at),
+            completed_at=self._as_utc(run.completed_at) if run.completed_at else None,
+            result_count=len(results),
+            bucket_counts=bucket_counts,
+            results=[
+                self._qc_result_view(result, slice_map.get(result.slice_id))
+                for result in source_ordered_results
+            ] if include_results else [],
+        )
+
+    def _run_project_preparation_job(self, job_id: str) -> dict[str, Any]:
+        with self._session() as session:
+            job = self._get_processing_job(session, job_id)
+            payload = dict(job.input_payload or {})
+            project_id = str(payload.get("project_id") or "")
+            if not project_id:
+                raise ValueError("Preparation job is missing project_id")
+            settings = self._normalize_project_preparation_payload(
+                ProjectPreparationRequest(
+                    target_sample_rate=payload.get("target_sample_rate"),
+                    channel_mode=payload.get("channel_mode") or "original",
+                )
+            )
+        return self._materialize_project_preparation(project_id, settings, job_id=job_id)
+
+    def _materialize_project_preparation(
+        self,
+        project_id: str,
+        settings: dict[str, Any],
+        *,
+        job_id: str,
+    ) -> dict[str, Any]:
+        output_group_id = self._new_id("prep")
+        logs: list[str] = []
+        created_recording_ids: list[str] = []
+        written_paths: list[Path] = []
+        try:
+            with self._session() as session:
+                self._get_batch(session, project_id)
+                source_recordings = session.exec(
+                    select(SourceRecording)
+                    .where(
+                        SourceRecording.batch_id == project_id,
+                        SourceRecording.parent_recording_id.is_(None),
+                    )
+                    .order_by(SourceRecording.id.asc())
+                ).all()
+            if not source_recordings:
+                raise ValueError("Project has no raw source recordings to prepare")
+
+            logs.append(f"Preparing {len(source_recordings)} raw recording(s)")
+            for index, source_recording in enumerate(source_recordings, start=1):
+                source_path = self._get_source_recording_audio_path(source_recording)
+                derivative_id = self._new_id("prepared")
+                target_path = self._managed_media_path("prepared", derivative_id)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                written_paths.append(target_path)
+                sample_rate, channels, num_samples = self._write_prepared_wav(
+                    source_path,
+                    target_path,
+                    source_channels=source_recording.num_channels,
+                    target_sample_rate=settings["target_sample_rate"],
+                    channel_mode=settings["channel_mode"],
+                )
+                processing_recipe = json.dumps(
+                    {
+                        "type": "overview_preparation",
+                        "version": 1,
+                        "job_id": job_id,
+                        "output_group_id": output_group_id,
+                        "source_recording_id": source_recording.id,
+                        "settings": settings,
+                    },
+                    sort_keys=True,
+                )
+                derivative = self.create_preprocessed_recording(
+                    source_recording.id,
+                    RecordingDerivativeCreate(
+                        id=derivative_id,
+                        file_path=str(target_path),
+                        sample_rate=sample_rate,
+                        num_channels=channels,
+                        num_samples=num_samples,
+                        processing_recipe=processing_recipe,
+                    ),
+                )
+                created_recording_ids.append(derivative.id)
+                self._copy_prepared_recording_artifact(
+                    source_recording.id,
+                    derivative.id,
+                    job_id=job_id,
+                )
+                logs.append(
+                    f"[{index}/{len(source_recordings)}] Created prepared derivative {derivative.id} "
+                    f"from {source_recording.id}"
+                )
+            with self._session() as session:
+                batch = self._get_batch(session, project_id)
+                batch.active_prepared_output_group_id = output_group_id
+                batch.active_preparation_job_id = job_id
+                session.add(batch)
+                session.commit()
+        except Exception:
+            self._delete_source_recordings(created_recording_ids)
+            for path in written_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+
+        return {
+            "project_id": project_id,
+            "output_group_id": output_group_id,
+            "created_recording_ids": created_recording_ids,
+            "settings": settings,
+            "logs": logs,
+        }
+
+    def _copy_prepared_recording_artifact(
+        self,
+        source_recording_id: str,
+        derivative_recording_id: str,
+        *,
+        job_id: str,
+    ) -> None:
+        with self._session() as session:
+            source_recording = self._get_source_recording(session, source_recording_id)
+            derivative_recording = self._get_source_recording(session, derivative_recording_id)
+            source_artifact = self._ensure_source_recording_artifact(session, source_recording)
+            derivative_artifact = self._ensure_source_recording_artifact(session, derivative_recording)
+            derivative_artifact.transcript_text_path = source_artifact.transcript_text_path
+            derivative_artifact.transcript_json_path = source_artifact.transcript_json_path
+            derivative_artifact.alignment_json_path = source_artifact.alignment_json_path
+            derivative_artifact.transcript_status = source_artifact.transcript_status
+            derivative_artifact.alignment_status = source_artifact.alignment_status
+            derivative_artifact.transcript_word_count = source_artifact.transcript_word_count
+            derivative_artifact.alignment_word_count = source_artifact.alignment_word_count
+            derivative_artifact.transcript_updated_at = source_artifact.transcript_updated_at
+            derivative_artifact.aligned_at = source_artifact.aligned_at
+            derivative_artifact.alignment_backend = source_artifact.alignment_backend
+            derivative_artifact.artifact_metadata = {
+                **dict(source_artifact.artifact_metadata or {}),
+                "copied_from_source_recording_id": source_recording.id,
+                "copied_by_preparation_job_id": job_id,
+            }
+            session.add(derivative_artifact)
+            session.commit()
+
+    def _delete_source_recordings(self, recording_ids: list[str]) -> None:
+        if not recording_ids:
+            return
+        with self._session() as session:
+            recordings = session.exec(
+                select(SourceRecording).where(SourceRecording.id.in_(recording_ids))
+            ).all()
+            for recording in recordings:
+                session.delete(recording)
+            session.commit()
+
+    def _write_prepared_wav(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        source_channels: int,
+        target_sample_rate: int | None,
+        channel_mode: str,
+    ) -> tuple[int, int, int]:
+        if channel_mode == "right" and source_channels < 2:
+            raise ValueError("Right channel selection requires a stereo source recording")
+        if source_channels <= 0:
+            raise ValueError("Source recording has an invalid channel count")
+
+        filters: list[str] = []
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-map_metadata",
+            "-1",
+        ]
+        if channel_mode == "mono":
+            command.extend(["-ac", "1"])
+        elif channel_mode == "left":
+            filters.append("pan=mono|c0=c0")
+        elif channel_mode == "right":
+            filters.append("pan=mono|c0=c1")
+        if target_sample_rate is not None:
+            filters.append(f"aresample={int(target_sample_rate)}:resampler=soxr")
+        if filters:
+            command.extend(["-af", ",".join(filters)])
+        command.extend(["-acodec", "pcm_s16le", str(target_path)])
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            raise ValueError(f"ffmpeg preparation failed for {source_path.name}: {stderr or result.returncode}")
+
+        channels, sample_width, sample_rate, frames = self._read_pcm_wav_header(target_path)
+        if sample_width != 2:
+            raise ValueError("Prepared WAV must be 16-bit PCM")
+        self._validate_audio_asset(target_path, sample_rate, channels, frames)
+        return sample_rate, channels, frames
 
     def _ensure_source_recording_artifact(
         self,
@@ -2036,6 +3188,16 @@ class SQLiteRepository:
             row[1]
             for row in connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
         }
+
+    def _migrate_importbatch_schema(self) -> None:
+        with self.engine.begin() as connection:
+            columns = self._table_columns(connection, "importbatch")
+            if not columns:
+                return
+            if "active_prepared_output_group_id" not in columns:
+                connection.exec_driver_sql("ALTER TABLE importbatch ADD COLUMN active_prepared_output_group_id TEXT")
+            if "active_preparation_job_id" not in columns:
+                connection.exec_driver_sql("ALTER TABLE importbatch ADD COLUMN active_preparation_job_id TEXT")
 
     def _migrate_editcommit_schema(self) -> None:
         with self.engine.begin() as connection:
@@ -2979,6 +4141,8 @@ class SQLiteRepository:
             created_at=created_at,
             updated_at=updated_at,
             export_status=export_status,
+            active_prepared_output_group_id=batch.active_prepared_output_group_id,
+            active_preparation_job_id=batch.active_preparation_job_id,
         )
 
     def _normalize_export_run(self, run: ExportRun) -> ExportRun:
@@ -5133,6 +6297,20 @@ class SQLiteRepository:
             deleted_count += 1
         return deleted_count
 
+    def _delete_managed_media_paths(self, paths: list[str]) -> int:
+        media_root = self.media_root.resolve()
+        deleted_count = 0
+        for raw_path in sorted(set(paths)):
+            try:
+                path = Path(raw_path).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            if not path.is_relative_to(media_root) or not path.exists() or not path.is_file():
+                continue
+            path.unlink()
+            deleted_count += 1
+        return deleted_count
+
     def _get_revision_referenced_variant_ids(self, session: Session, slice_ids: list[str]) -> set[str]:
         if not slice_ids:
             return set()
@@ -5203,6 +6381,8 @@ class SQLiteRepository:
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             job_kind = job.kind
+        if job_kind == JobKind.PREPROCESS:
+            return self._run_project_preparation_job(job_id)
         if job_kind == JobKind.SOURCE_TRANSCRIPTION:
             return self._run_source_transcription_job(job_id)
         if job_kind == JobKind.SOURCE_ALIGNMENT:
@@ -5220,7 +6400,6 @@ class SQLiteRepository:
             payload = dict(job.input_payload or {})
             adapter_config = self._source_asr_backend_config(payload)
             language_hint = payload.get("language_hint")
-            completed_at = utc_now()
             backend_client = self._create_source_asr_backend_client(adapter_config)
             draft_result = self._run_source_recording_asr_adapter(
                 recording,
@@ -5228,6 +6407,7 @@ class SQLiteRepository:
                 backend_client=backend_client,
                 language_hint=str(language_hint) if language_hint is not None else None,
             )
+            completed_at = utc_now()
 
             artifact_dir = self._source_recording_artifact_dir(recording.id)
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -5261,6 +6441,8 @@ class SQLiteRepository:
             metadata["base_transcript_text_path"] = str(transcript_base_path)
             metadata["transcript_patches"] = []
             metadata["last_transcription_job_id"] = job.id
+            metadata["transcription_backend"] = draft_result["backend"]
+            metadata["transcription_model_name"] = draft_result["model_name"]
             metadata["language"] = draft_result["language"]
             artifact.artifact_metadata = metadata
             session.add(artifact)
@@ -5312,9 +6494,11 @@ class SQLiteRepository:
 
             alignment_backend = str(
                 payload.get("alignment_backend")
+                or payload.get("acoustic_model")
                 or artifact.alignment_backend
                 or "torchaudio_forced_align_worker"
             ).strip() or "torchaudio_forced_align_worker"
+            text_normalization_strategy = str(payload.get("text_normalization_strategy") or "loose")
 
             if transcript_json_payload is not None:
                 alignment_units, summary = self._run_segmented_source_alignment(recording, transcript_json_payload)
@@ -5323,6 +6507,8 @@ class SQLiteRepository:
                 transcript_text = transcript_text_path.read_text(encoding="utf-8").strip()
                 if not transcript_text:
                     raise ValueError("Source alignment transcript artifact is empty")
+                if transcript_text.startswith("stub asr source recording "):
+                    raise ValueError("Refusing to align stub ASR transcript. Run real ASR before alignment.")
                 alignment_units = self._run_forced_align_worker_on_file(Path(recording.file_path), transcript_text)
                 summary = {
                     "segment_count": 1,
@@ -5341,6 +6527,8 @@ class SQLiteRepository:
                 "status": "ok",
                 "alignment_backend": alignment_backend,
                 "alignment_mode": alignment_mode,
+                "text_normalization_strategy": text_normalization_strategy,
+                "batch_size": int(payload.get("batch_size") or 8),
                 "alignment_word_count": len(alignment_units),
                 **summary,
             }
@@ -5355,6 +6543,8 @@ class SQLiteRepository:
             metadata["alignment_summary_path"] = str(summary_path)
             metadata["last_alignment_job_id"] = job.id
             metadata["alignment_mode"] = alignment_mode
+            metadata["text_normalization_strategy"] = text_normalization_strategy
+            metadata["alignment_batch_size"] = int(payload.get("batch_size") or 8)
             artifact.artifact_metadata = metadata
             session.add(artifact)
             session.commit()
@@ -5367,6 +6557,8 @@ class SQLiteRepository:
             "alignment_word_count": len(alignment_units),
             "alignment_backend": alignment_backend,
             "alignment_mode": alignment_mode,
+            "text_normalization_strategy": text_normalization_strategy,
+            "batch_size": int(payload.get("batch_size") or 8),
         }
 
     def _run_source_slicing_job(self, job_id: str) -> dict[str, Any]:
@@ -5391,6 +6583,7 @@ class SQLiteRepository:
             config_overrides = payload.get("config_overrides") or {}
             if not isinstance(config_overrides, dict):
                 raise ValueError("config_overrides must be an object")
+            slicer_run_id = str(payload.get("slicer_run_id") or job.id)
             config = SlicerConfig(**config_overrides)
             full_audio_bytes = self._extract_source_window_wav_bytes(recording, 0.0, recording.duration_s)
             audio_samples, sample_rate = self._wav_bytes_to_mono_samples(full_audio_bytes)
@@ -5425,6 +6618,8 @@ class SQLiteRepository:
                         slice_payload=slice_payload,
                         source_alignment_backend=artifact.alignment_backend,
                         language=language,
+                        slicer_run_id=slicer_run_id,
+                        slicer_job_id=job.id,
                     )
                 )
 
@@ -5501,9 +6696,13 @@ class SQLiteRepository:
         slice_payload: dict[str, Any],
         source_alignment_backend: str | None,
         language: str = "en",
+        slicer_run_id: str | None = None,
+        slicer_job_id: str | None = None,
     ) -> Slice:
         extra_metadata = {
             "generation_mode": "source_slicer_v2",
+            "slicer_run_id": slicer_run_id,
+            "slicer_job_id": slicer_job_id,
             "raw_start": float(slice_payload["raw_start"]),
             "raw_end": float(slice_payload["raw_end"]),
             "snapped_start": float(slice_payload["snapped_start"]),
@@ -5672,6 +6871,8 @@ class SQLiteRepository:
                 model=backend_client,
                 model_name=adapter_config["model_name"],
                 model_version=adapter_config["model_version"],
+                batch_size=max(1, int(adapter_config.get("batch_size") or 8)),
+                initial_prompt=adapter_config.get("initial_prompt") or None,
                 language_hint=language_hint,
             )
         raise ValueError(f"Unsupported ASR backend: {backend}")
@@ -5690,29 +6891,45 @@ class SQLiteRepository:
 
     def _source_asr_backend_config(self, payload: dict[str, Any]) -> dict[str, str]:
         # Dev/local smoke path:
-        # ASR_BACKEND=faster_whisper ASR_MODEL_PATH=/abs/path/to/local/model
+        # ASR_BACKEND=faster_whisper ASR_MODEL_PATH=/abs/path/to/local/model-or-model-name
         # ASR_DEVICE=cpu|cuda ASR_COMPUTE_TYPE=int8|float16 uv run --directory backend python -m app.worker --once
-        backend = str(os.getenv("ASR_BACKEND", "stub")).strip().lower() or "stub"
+        backend = str(os.getenv("ASR_BACKEND", "faster_whisper")).strip().lower() or "faster_whisper"
+        model_size = str(payload.get("model_size") or "turbo").strip()
+        batch_size = max(1, int(payload.get("batch_size") or 8))
+        initial_prompt = str(payload.get("initial_prompt") or "").strip()
         requested_model_name = str(payload.get("model_name") or "").strip()
         requested_model_version = str(payload.get("model_version") or "").strip()
         if backend == "stub":
+            if os.getenv("SPEECHCRAFT_ALLOW_STUB_ASR") != "1":
+                raise ValueError(
+                    "Stub ASR is disabled. Set ASR_BACKEND=faster_whisper for real transcription "
+                    "or SPEECHCRAFT_ALLOW_STUB_ASR=1 for tests only."
+                )
             return {
                 "backend": "stub",
-                "model_name": requested_model_name or "stub-source-recording-asr",
+                "model_size": model_size,
+                "batch_size": str(batch_size),
+                "initial_prompt": initial_prompt,
+                "model_name": requested_model_name or f"stub-source-recording-asr-{model_size}",
                 "model_version": requested_model_version or "stub-v1",
             }
         if backend == "faster_whisper":
             model_path = str(os.getenv("ASR_MODEL_PATH", "")).strip()
-            if not model_path:
-                raise ValueError("ASR_MODEL_PATH is required when ASR_BACKEND=faster_whisper")
-            model_path_obj = Path(model_path)
-            if not model_path_obj.exists():
+            model_aliases = {
+                "turbo": "large-v3-turbo",
+            }
+            model_ref = model_path or model_aliases.get(model_size, model_size)
+            model_path_obj = Path(model_ref)
+            if model_path and not model_path_obj.exists():
                 raise ValueError(f"ASR_MODEL_PATH does not exist: {model_path_obj}")
             return {
                 "backend": "faster_whisper",
-                "model_path": str(model_path_obj),
-                "model_name": requested_model_name or model_path_obj.name,
-                "model_version": requested_model_version or "local",
+                "model_path": str(model_path_obj if model_path else model_ref),
+                "model_size": model_size,
+                "batch_size": str(batch_size),
+                "initial_prompt": initial_prompt,
+                "model_name": requested_model_name or model_size or model_path_obj.name,
+                "model_version": requested_model_version or ("local" if model_path else "faster-whisper"),
                 "device": str(os.getenv("ASR_DEVICE", "cpu")).strip() or "cpu",
                 "compute_type": str(os.getenv("ASR_COMPUTE_TYPE", "int8")).strip() or "int8",
             }
@@ -5750,12 +6967,27 @@ class SQLiteRepository:
         model: Any,
         model_name: str,
         model_version: str,
+        batch_size: int,
+        initial_prompt: str | None,
         language_hint: str | None,
     ) -> dict[str, Any]:
-        segments_iter, info = model.transcribe(
+        transcriber = model
+        transcribe_kwargs: dict[str, Any] = {}
+        if batch_size > 1:
+            try:
+                from faster_whisper import BatchedInferencePipeline
+
+                transcriber = BatchedInferencePipeline(model=model)
+                transcribe_kwargs["batch_size"] = batch_size
+            except ImportError:
+                transcriber = model
+
+        segments_iter, info = transcriber.transcribe(
             str(Path(recording.file_path)),
             language=language_hint or None,
             condition_on_previous_text=False,
+            initial_prompt=initial_prompt or None,
+            **transcribe_kwargs,
         )
         segments = [
             {

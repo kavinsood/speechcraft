@@ -106,6 +106,138 @@ export type ProcessingJob = {
   completed_at?: string | null;
 };
 
+export type PreparationSettings = {
+  target_sample_rate?: number | null;
+  channel_mode: "original" | "mono" | "left" | "right";
+};
+
+export type ProjectTranscriptionSettings = {
+  model_size: "base" | "small" | "medium" | "large-v3" | "turbo";
+  batch_size: number;
+  initial_prompt?: string | null;
+};
+
+export type ProjectAlignmentSettings = {
+  acoustic_model: string;
+  text_normalization_strategy: "strict" | "loose" | "spoken_form";
+  batch_size: number;
+};
+
+export type ProjectPreparationRun = {
+  job: ProcessingJob;
+  created_recordings: SourceRecording[];
+  active_prepared_output_group_id?: string | null;
+};
+
+export type ProjectRecordingJobsRun = {
+  project_id: string;
+  prepared_output_group_id: string;
+  jobs: ProcessingJob[];
+};
+
+export type SlicerRunRequest = {
+  target_clip_length: number;
+  max_clip_length: number;
+  segmentation_sensitivity: number;
+  preserve_locked_slices: boolean;
+  replace_unlocked_slices: boolean;
+  advanced_config_overrides?: Record<string, unknown> | null;
+};
+
+export type SlicerRun = {
+  id: string;
+  project_id: string;
+  prepared_output_group_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  recording_ids: string[];
+  jobs: ProcessingJob[];
+  config: Record<string, unknown>;
+  summary: {
+    slices_created?: number;
+    total_sliced_duration?: number;
+    average_slice_length?: number;
+    minimum_slice_length?: number;
+    maximum_slice_length?: number;
+    preserved_locked_slice_count?: number;
+    dropped_overlap_count?: number;
+    completed_recording_count?: number;
+    failed_recording_count?: number;
+    pending_recording_count?: number;
+    running_recording_count?: number;
+    downstream_qc_data_available?: boolean;
+  };
+  warnings: string[];
+  is_stale?: boolean;
+  stale_reason?: string | null;
+};
+
+export type SlicerRunDeleteResult = {
+  project_id: string;
+  slicer_run_id: string;
+  deleted_job_count: number;
+  deleted_qc_run_count: number;
+  deleted_qc_result_count: number;
+  deleted_slice_count: number;
+  deleted_variant_count: number;
+  deleted_file_count: number;
+  restored_slice_count: number;
+  deleted_slice_ids: string[];
+  deleted_variant_ids: string[];
+};
+
+export type QcBucket = "auto_kept" | "needs_review" | "auto_rejected";
+
+export type QcRunCreateRequest = {
+  slicer_run_id: string;
+  keep_threshold: number;
+  reject_threshold: number;
+  preset: string;
+};
+
+export type SliceQcResult = {
+  id: string;
+  qc_run_id: string;
+  slice_id: string;
+  source_recording_id?: string | null;
+  source_order_index?: number | null;
+  source_start_seconds?: number | null;
+  source_end_seconds?: number | null;
+  aggregate_score: number;
+  bucket: QcBucket;
+  raw_metrics: Record<string, unknown>;
+  reason_codes: string[];
+  human_review_status?: ReviewStatus | null;
+  is_locked: boolean;
+  created_at: string;
+};
+
+export type QcRun = {
+  id: string;
+  project_id: string;
+  slicer_run_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  threshold_config: {
+    keep_threshold?: number;
+    reject_threshold?: number;
+    preset?: string;
+    [key: string]: unknown;
+  };
+  slice_population_hash: string;
+  transcript_basis_hash: string;
+  audio_basis_hash: string;
+  is_stale: boolean;
+  stale_reason?: string | null;
+  error_message?: string | null;
+  created_at: string;
+  completed_at?: string | null;
+  result_count: number;
+  bucket_counts: Partial<Record<QcBucket, number>>;
+  results: SliceQcResult[];
+};
+
 export type SourceRecordingQueue = SourceRecording & {
   duration_seconds: number;
   slice_count: number;
@@ -228,6 +360,8 @@ export type ImportBatch = {
   created_at: string;
   updated_at: string;
   export_status?: "pending" | "running" | "completed" | "failed" | null;
+  active_prepared_output_group_id?: string | null;
+  active_preparation_job_id?: string | null;
 };
 
 export type Project = ImportBatch;

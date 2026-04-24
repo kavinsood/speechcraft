@@ -8,6 +8,7 @@ import {
   fetchProjectExports,
   fetchProjectRecordings,
   fetchProjectSlices,
+  fetchQcRun,
   mergeWithNextClip,
   redoClip,
   resolveApiUrl,
@@ -24,6 +25,7 @@ import ClipQueuePane from "../workspace/ClipQueuePane";
 import EditorPane from "../workspace/EditorPane";
 import InspectorPane from "../workspace/InspectorPane";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
+import { usePipelineContext } from "../pipeline/PipelineContext";
 import {
   getSliceDuration,
   sortClipsForQueue,
@@ -33,6 +35,9 @@ import type {
   ClipLabItemRef,
   ExportRun,
   Project,
+  QcBucket,
+  QcRun,
+  SliceQcResult,
   ReferenceAssetSummary,
   ReviewStatus,
   Slice,
@@ -43,6 +48,14 @@ import type {
 type WorkspaceStatus = "loading" | "error" | "ready";
 
 const ACTIVE_RECORDING_PROCESSING_STATES = new Set(["transcribing", "aligning", "slicing"]);
+
+type QcClipMeta = {
+  bucket: QcBucket;
+  visibleBucket: QcBucket;
+  score: number;
+  reasonCodes: string[];
+  reviewSnapshot?: ReviewStatus | null;
+};
 
 type LabelPageProps = {
   activeProject: Project | null;
@@ -84,6 +97,25 @@ function summarizeSlice(slice: Slice): SliceSummary {
   };
 }
 
+function classifyQcBucket(result: SliceQcResult, keepThreshold: number, rejectThreshold: number): QcBucket {
+  if (result.reason_codes.length > 0 || result.aggregate_score < rejectThreshold) {
+    return "auto_rejected";
+  }
+  if (result.aggregate_score >= keepThreshold) {
+    return "auto_kept";
+  }
+  return "needs_review";
+}
+
+function compareQcSourceOrder(left: SliceQcResult, right: SliceQcResult): number {
+  return (
+    (left.source_recording_id ?? "").localeCompare(right.source_recording_id ?? "") ||
+    (left.source_order_index ?? Number.MAX_SAFE_INTEGER) - (right.source_order_index ?? Number.MAX_SAFE_INTEGER) ||
+    (left.source_start_seconds ?? Number.MAX_SAFE_INTEGER) - (right.source_start_seconds ?? Number.MAX_SAFE_INTEGER) ||
+    left.slice_id.localeCompare(right.slice_id)
+  );
+}
+
 export default function LabelPage({
   activeProject,
   activeClipItem,
@@ -93,6 +125,7 @@ export default function LabelPage({
   onRetryProjects,
   onHeaderActionsChange,
 }: LabelPageProps) {
+  const { labHandoff } = usePipelineContext();
   const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus>("loading");
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceEmptyMessage, setWorkspaceEmptyMessage] = useState<string | null>(null);
@@ -103,12 +136,46 @@ export default function LabelPage({
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [referenceAssets, setReferenceAssets] = useState<ReferenceAssetSummary[]>([]);
+  const [handoffQcRun, setHandoffQcRun] = useState<QcRun | null>(null);
+  const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
   const [isRunningExport, setIsRunningExport] = useState(false);
   const [isCleaningMedia, setIsCleaningMedia] = useState(false);
   const [isSavingReference, setIsSavingReference] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
   const latestDetailRequestRef = useRef(0);
   const showDangerousDevActions = import.meta.env.DEV;
+
+  useEffect(() => {
+    setHandoffQcRun(null);
+    setHandoffNotice(null);
+    if (!labHandoff?.qcRunId) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const run = await fetchQcRun(labHandoff.qcRunId ?? "");
+        if (cancelled) {
+          return;
+        }
+        if (run.slicer_run_id !== labHandoff.slicerRunId || run.project_id !== activeProject?.id) {
+          setHandoffNotice("QC handoff did not match this project and slicer run. Showing source-order Lab queue.");
+          return;
+        }
+        setHandoffQcRun(run);
+        if (run.is_stale) {
+          setHandoffNotice("QC handoff is stale. Review is still available, but rerun QC before relying on machine filters.");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setHandoffNotice(getErrorMessage(error, "QC handoff context could not be loaded. Showing source-order Lab queue."));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject?.id, labHandoff?.qcRunId, labHandoff?.slicerRunId]);
 
   function getWorkspaceEmptyMessage(nextSlices: SliceSummary[], nextRecordings: SourceRecordingQueue[]): string | null {
     if (nextSlices.length > 0) {
@@ -274,6 +341,60 @@ export default function LabelPage({
   }, [slices]);
 
   const sliceMap = useMemo(() => new Map(slices.map((slice) => [slice.id, slice])), [slices]);
+  const qcResultMap = useMemo(() => {
+    if (!labHandoff || !handoffQcRun) {
+      return null;
+    }
+    const keepThreshold = labHandoff.keepThreshold ?? Number(handoffQcRun.threshold_config.keep_threshold ?? 0.72);
+    const rejectThreshold = labHandoff.rejectThreshold ?? Number(handoffQcRun.threshold_config.reject_threshold ?? 0.35);
+    return new Map(
+      handoffQcRun.results.map((result) => [
+        result.slice_id,
+        {
+          bucket: result.bucket,
+          visibleBucket: classifyQcBucket(result, keepThreshold, rejectThreshold),
+          score: result.aggregate_score,
+          reasonCodes: result.reason_codes,
+          reviewSnapshot: result.human_review_status,
+        },
+      ]),
+    );
+  }, [handoffQcRun, labHandoff]);
+  const qcOrderedClipIds = useMemo(() => {
+    if (!labHandoff || !handoffQcRun) {
+      return null;
+    }
+    const keepThreshold = labHandoff.keepThreshold ?? Number(handoffQcRun.threshold_config.keep_threshold ?? 0.72);
+    const rejectThreshold = labHandoff.rejectThreshold ?? Number(handoffQcRun.threshold_config.reject_threshold ?? 0.35);
+    const bucketFilter = labHandoff.bucketFilter;
+    const filteredResults = handoffQcRun.results.filter((result) => {
+      if (bucketFilter === "all") {
+        return true;
+      }
+      const visibleBucket = classifyQcBucket(result, keepThreshold, rejectThreshold);
+      return (
+        (bucketFilter === "auto-kept" && visibleBucket === "auto_kept") ||
+        (bucketFilter === "needs-review" && visibleBucket === "needs_review") ||
+        (bucketFilter === "auto-rejected" && visibleBucket === "auto_rejected")
+      );
+    });
+    if (labHandoff.sort === "qc-score-ascending") {
+      filteredResults.sort((left, right) => left.aggregate_score - right.aggregate_score);
+    } else if (labHandoff.sort === "qc-score-descending") {
+      filteredResults.sort((left, right) => right.aggregate_score - left.aggregate_score);
+    } else {
+      filteredResults.sort(compareQcSourceOrder);
+    }
+    return filteredResults.map((result) => result.slice_id);
+  }, [handoffQcRun, labHandoff]);
+  const queueSlices = useMemo(() => {
+    if (!qcOrderedClipIds) {
+      return slices;
+    }
+    return qcOrderedClipIds
+      .map((clipId) => sliceMap.get(clipId) ?? null)
+      .filter((slice): slice is SliceSummary => slice !== null);
+  }, [qcOrderedClipIds, sliceMap, slices]);
 
   const activeSliceSummary = useMemo(() => {
     const visibleQueueClips = visibleQueueClipIds
@@ -281,7 +402,7 @@ export default function LabelPage({
       .filter((slice): slice is SliceSummary => slice !== null);
 
     if (activeClipItem) {
-      return sliceMap.get(activeClipItem.id) ?? visibleQueueClips[0] ?? slices[0] ?? null;
+      return visibleQueueClips.find((slice) => slice.id === activeClipItem.id) ?? visibleQueueClips[0] ?? slices[0] ?? null;
     }
 
     return visibleQueueClips[0] ?? slices[0] ?? null;
@@ -291,11 +412,15 @@ export default function LabelPage({
     const requestId = latestDetailRequestRef.current + 1;
     latestDetailRequestRef.current = requestId;
 
-    const nextActiveTarget = activeClipItem ?? (activeSliceSummary ? { id: activeSliceSummary.id } : null);
+    const nextActiveTarget = activeSliceSummary ? { id: activeSliceSummary.id } : null;
 
     if (!nextActiveTarget) {
       setActiveClip(null);
       return;
+    }
+
+    if (nextActiveTarget.id !== activeClipItem?.id) {
+      onActiveClipItemChange(nextActiveTarget);
     }
 
     void (async () => {
@@ -634,6 +759,7 @@ export default function LabelPage({
     >
       <div className="workspace-shell">
         {workspaceNotice ? <p className="workspace-notice">{workspaceNotice}</p> : null}
+        {handoffNotice ? <p className="workspace-notice">{handoffNotice}</p> : null}
 
         {workspaceStatus === "error" && !activeProject ? (
           <WorkspaceStatePanel
@@ -650,7 +776,8 @@ export default function LabelPage({
             workspaceError={workspaceError}
             workspaceEmptyMessage={workspaceEmptyMessage}
             recordings={recordings}
-            clips={slices}
+            clips={queueSlices}
+            qcResultMap={qcResultMap}
             activeClipItem={activeClipItem}
             onSelectClipItem={handleClipSelect}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
@@ -682,6 +809,7 @@ export default function LabelPage({
             workspacePhase={workspaceStatus}
             workspaceError={workspaceError}
             activeClip={activeClip}
+            qcMeta={activeClip ? qcResultMap?.get(activeClip.id) ?? null : null}
             totalClipCount={sortClipsForQueue(slices).length}
             totalDurationSeconds={totalDurationSeconds}
             datasetStatusCounts={datasetStatusCounts}

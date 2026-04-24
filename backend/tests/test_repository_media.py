@@ -29,6 +29,12 @@ from app.models import (
     ReferenceSourceKind,
     ReferenceVariant,
     ReviewStatus,
+    ProjectPreparationRequest,
+    ProjectSlicerRunRequest,
+    ProcessingJob,
+    JobKind,
+    JobStatus,
+    QCRunCreateRequest,
     Slice,
     SliceEdlUpdate,
     SliceSaveRequest,
@@ -42,6 +48,7 @@ from app.models import (
     SourceRecording,
     SourceRecordingCreate,
     TagPayload,
+    utc_now,
 )
 from app.repository import SQLiteRepository, SliceSaveValidationError
 from app.worker import process_next_job
@@ -58,6 +65,35 @@ def read_reference_embeddings(path: Path) -> dict[str, object]:
 
 def read_reference_manifest(path: Path) -> dict[str, object]:
     return json.loads(path.read_text())
+
+
+def mark_recording_aligned(repository: SQLiteRepository, recording_id: str) -> None:
+    artifact_dir = repository.exports_root / "test-artifacts" / recording_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = artifact_dir / "transcript.txt"
+    alignment_path = artifact_dir / "alignment.json"
+    transcript_path.write_text("alpha beta gamma delta\n", encoding="utf-8")
+    alignment_path.write_text(
+        json.dumps(
+            [
+                {"word": "alpha", "start": 0.0, "end": 0.5},
+                {"word": "beta", "start": 0.7, "end": 1.2},
+                {"word": "gamma", "start": 1.5, "end": 2.0},
+                {"word": "delta", "start": 2.4, "end": 2.9},
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    repository.set_source_recording_artifact_paths(
+        recording_id,
+        transcript_text_path=str(transcript_path),
+        alignment_json_path=str(alignment_path),
+        transcript_status="ok",
+        alignment_status="ok",
+        transcript_word_count=4,
+        alignment_word_count=4,
+    )
 
 
 def build_legacy_clip(
@@ -174,6 +210,251 @@ class RepositoryMediaTests(TestCase):
         )
 
         self.assertAlmostEqual(updated.duration_seconds, round(initial.duration_seconds + 0.2, 2), places=2)
+
+    def test_project_preparation_worker_creates_derived_recordings_and_active_group(self) -> None:
+        raw_recordings = [
+            recording
+            for recording in self.repository.list_source_recordings("phase1-demo")
+            if recording.parent_recording_id is None
+        ]
+        self.assertGreaterEqual(len(raw_recordings), 1)
+
+        run = self.repository.run_project_preparation(
+            "phase1-demo",
+            ProjectPreparationRequest(target_sample_rate=16000, channel_mode="mono"),
+        )
+        self.assertEqual(run.job.status, "pending")
+
+        processed = process_next_job(self.repository, "test-worker")
+
+        self.assertTrue(processed)
+        jobs = self.repository.list_project_preparation_jobs("phase1-demo")
+        self.assertEqual(jobs[0].status, "completed")
+        output_group_id = jobs[0].output_payload["output_group_id"]
+        project = self.repository.get_project("phase1-demo")
+        self.assertEqual(project.active_prepared_output_group_id, output_group_id)
+        self.assertEqual(project.active_preparation_job_id, jobs[0].id)
+
+        recordings = self.repository.list_source_recordings("phase1-demo")
+        derived_recordings = [
+            recording
+            for recording in recordings
+            if recording.parent_recording_id is not None and output_group_id in (recording.processing_recipe or "")
+        ]
+        self.assertEqual(len(derived_recordings), len(raw_recordings))
+        for recording in derived_recordings:
+            self.assertEqual(recording.sample_rate, 16000)
+            self.assertEqual(recording.num_channels, 1)
+
+    def test_project_preparation_rejects_right_channel_for_mono_source(self) -> None:
+        run = self.repository.run_project_preparation(
+            "phase1-demo",
+            ProjectPreparationRequest(target_sample_rate=16000, channel_mode="right"),
+        )
+
+        processed = process_next_job(self.repository, "test-worker")
+
+        self.assertTrue(processed)
+        job = self.repository.get_processing_job(run.job.id)
+        self.assertEqual(job.status, "failed")
+        self.assertIn("Right channel selection requires a stereo source recording", job.error_message or "")
+        derived_recordings = [
+            recording
+            for recording in self.repository.list_source_recordings("phase1-demo")
+            if recording.parent_recording_id is not None and run.job.id in (recording.processing_recipe or "")
+        ]
+        self.assertEqual(derived_recordings, [])
+
+    def test_project_preparation_cleans_written_files_when_materialization_fails(self) -> None:
+        def fail_after_writing(
+            source_path: Path,
+            target_path: Path,
+            **kwargs: object,
+        ) -> tuple[int, int, int]:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(b"orphan candidate")
+            raise ValueError("forced preparation failure")
+
+        run = self.repository.run_project_preparation(
+            "phase1-demo",
+            ProjectPreparationRequest(target_sample_rate=16000, channel_mode="mono"),
+        )
+
+        with patch.object(self.repository, "_write_prepared_wav", side_effect=fail_after_writing):
+            processed = process_next_job(self.repository, "test-worker")
+
+        self.assertTrue(processed)
+        job = self.repository.get_processing_job(run.job.id)
+        self.assertEqual(job.status, "failed")
+        prepared_files = list((self.repository.media_root / "prepared").glob("*.wav"))
+        self.assertEqual(prepared_files, [])
+
+    def test_project_slicer_run_requires_active_prepared_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Run preparation before launching the slicer"):
+            self.repository.create_project_slicer_run("phase1-demo", ProjectSlicerRunRequest())
+
+    def test_project_slicer_run_enqueues_distinct_jobs_for_active_prepared_group(self) -> None:
+        prep_run = self.repository.run_project_preparation(
+            "phase1-demo",
+            ProjectPreparationRequest(target_sample_rate=16000, channel_mode="mono"),
+        )
+        self.assertTrue(process_next_job(self.repository, "test-worker"))
+        prep_job = self.repository.get_processing_job(prep_run.job.id)
+        output_group_id = prep_job.output_payload["output_group_id"]
+        for recording_id in prep_job.output_payload["created_recording_ids"]:
+            mark_recording_aligned(self.repository, recording_id)
+
+        slicer_run = self.repository.create_project_slicer_run(
+            "phase1-demo",
+            ProjectSlicerRunRequest(target_clip_length=6, max_clip_length=12, segmentation_sensitivity=0.7),
+        )
+
+        self.assertEqual(slicer_run.status, "pending")
+        self.assertEqual(slicer_run.prepared_output_group_id, output_group_id)
+        self.assertEqual(len(slicer_run.jobs), 1)
+        self.assertEqual(slicer_run.config["target_clip_length"], 6)
+        self.assertEqual(slicer_run.jobs[0].kind, "source_slicing")
+        self.assertEqual(slicer_run.jobs[0].input_payload["slicer_run_id"], slicer_run.id)
+
+        runs = self.repository.list_project_slicer_runs("phase1-demo")
+        self.assertEqual(runs[0].id, slicer_run.id)
+
+    def test_project_slicer_run_rejects_invalid_advanced_override(self) -> None:
+        prep_run = self.repository.run_project_preparation(
+            "phase1-demo",
+            ProjectPreparationRequest(target_sample_rate=16000, channel_mode="mono"),
+        )
+        self.assertTrue(process_next_job(self.repository, "test-worker"))
+        self.repository.get_processing_job(prep_run.job.id)
+
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            self.repository.create_project_slicer_run(
+                "phase1-demo",
+                ProjectSlicerRunRequest(advanced_config_overrides={"target_duration": "potato"}),
+            )
+
+        with self.assertRaisesRegex(ValueError, "Unsupported slicer config override"):
+            self.repository.create_project_slicer_run(
+                "phase1-demo",
+                ProjectSlicerRunRequest(advanced_config_overrides={"not_a_slicer_knob": 1}),
+            )
+
+    def _create_completed_seed_slicer_run(self, slicer_run_id: str = "slicer-run-test") -> str:
+        recording = self.repository.list_source_recordings("phase1-demo")[0]
+        seed_slice = self.repository.get_project_slices("phase1-demo")[0]
+        with Session(self.repository.engine) as session:
+            slice_row = session.get(Slice, seed_slice.id)
+            assert slice_row is not None
+            metadata = dict(slice_row.model_metadata or {})
+            metadata["slicer_run_id"] = slicer_run_id
+            metadata["slicer_job_id"] = f"job-{slicer_run_id}"
+            slice_row.model_metadata = metadata
+            session.add(slice_row)
+            job = ProcessingJob(
+                id=f"job-{slicer_run_id}",
+                kind=JobKind.SOURCE_SLICING,
+                status=JobStatus.COMPLETED,
+                source_recording_id=recording.id,
+                input_payload={
+                    "project_id": "phase1-demo",
+                    "slicer_run_id": slicer_run_id,
+                    "prepared_output_group_id": "test-prepared-group",
+                    "ui_config": {},
+                },
+                output_payload={
+                    "created_slice_count": 1,
+                    "preserved_locked_slice_count": 0,
+                    "dropped_overlap_count": 0,
+                    "slicer_stats": {"total_clips": 1, "total_clip_s": 1.5},
+                },
+                completed_at=utc_now(),
+            )
+            session.add(job)
+            session.commit()
+        return slicer_run_id
+
+    def test_delete_project_slicer_run_removes_generated_slices_jobs_and_qc(self) -> None:
+        slicer_run_id = self._create_completed_seed_slicer_run()
+        qc_run = self.repository.create_qc_run("phase1-demo", QCRunCreateRequest(slicer_run_id=slicer_run_id))
+
+        result = self.repository.delete_project_slicer_run("phase1-demo", slicer_run_id)
+
+        self.assertEqual(result.deleted_job_count, 1)
+        self.assertEqual(result.deleted_qc_run_count, 1)
+        self.assertEqual(result.deleted_qc_result_count, 1)
+        self.assertEqual(result.deleted_slice_count, 1)
+        self.assertEqual(result.deleted_variant_count, 1)
+        self.assertEqual(self.repository.list_project_slicer_runs("phase1-demo"), [])
+        with self.assertRaises(KeyError):
+            self.repository.get_qc_run(qc_run.id)
+
+    def test_qc_run_persists_machine_results_without_changing_human_review(self) -> None:
+        slicer_run_id = self._create_completed_seed_slicer_run()
+        before_slice = self.repository.get_project_slices("phase1-demo")[0]
+
+        qc_run = self.repository.create_qc_run(
+            "phase1-demo",
+            QCRunCreateRequest(slicer_run_id=slicer_run_id, keep_threshold=0.7, reject_threshold=0.3),
+        )
+
+        after_slice = self.repository.get_project_slices("phase1-demo")[0]
+        self.assertEqual(after_slice.status, before_slice.status)
+        self.assertEqual(qc_run.slicer_run_id, slicer_run_id)
+        self.assertEqual(qc_run.status, "completed")
+        self.assertEqual(qc_run.result_count, 1)
+        self.assertEqual(len(qc_run.results), 1)
+        self.assertIn(qc_run.results[0].bucket, {"auto_kept", "needs_review", "auto_rejected"})
+        self.assertIsNotNone(qc_run.results[0].raw_metrics.get("duration_seconds"))
+
+    def test_qc_run_keeps_machine_bucket_separate_from_human_status(self) -> None:
+        slicer_run_id = self._create_completed_seed_slicer_run()
+        qc_run = self.repository.create_qc_run("phase1-demo", QCRunCreateRequest(slicer_run_id=slicer_run_id))
+        result = qc_run.results[0]
+
+        self.repository.update_slice_status(result.slice_id, SliceStatusUpdate(status=ReviewStatus.ACCEPTED))
+        refreshed = self.repository.get_qc_run(qc_run.id)
+        reviewed_slice = self.repository.get_slice_detail(result.slice_id)
+
+        self.assertEqual(refreshed.results[0].bucket, result.bucket)
+        self.assertEqual(refreshed.results[0].human_review_status, result.human_review_status)
+        self.assertEqual(reviewed_slice.status, ReviewStatus.ACCEPTED)
+
+    def test_qc_run_becomes_stale_when_transcript_basis_changes(self) -> None:
+        slicer_run_id = self._create_completed_seed_slicer_run()
+        qc_run = self.repository.create_qc_run("phase1-demo", QCRunCreateRequest(slicer_run_id=slicer_run_id))
+        self.assertFalse(qc_run.is_stale)
+        slice_id = self.repository.get_project_slices("phase1-demo")[0].id
+
+        self.repository.update_slice_transcript(
+            slice_id,
+            SliceTranscriptUpdate(modified_text="A changed transcript makes QC stale."),
+        )
+        refreshed = self.repository.get_qc_run(qc_run.id)
+
+        self.assertTrue(refreshed.is_stale)
+        self.assertIn("transcript_basis_hash", refreshed.stale_reason or "")
+
+    def test_qc_run_requires_completed_slicer_run(self) -> None:
+        recording = self.repository.list_source_recordings("phase1-demo")[0]
+        slicer_run_id = "pending-slicer-run"
+        with Session(self.repository.engine) as session:
+            job = ProcessingJob(
+                id=f"job-{slicer_run_id}",
+                kind=JobKind.SOURCE_SLICING,
+                status=JobStatus.PENDING,
+                source_recording_id=recording.id,
+                input_payload={
+                    "project_id": "phase1-demo",
+                    "slicer_run_id": slicer_run_id,
+                    "prepared_output_group_id": "test-prepared-group",
+                    "ui_config": {},
+                },
+            )
+            session.add(job)
+            session.commit()
+
+        with self.assertRaisesRegex(ValueError, "completed slicer run"):
+            self.repository.create_qc_run("phase1-demo", QCRunCreateRequest(slicer_run_id=slicer_run_id))
 
     def test_slice_media_path_reflects_edl_audio(self) -> None:
         initial = self.repository.get_project_slices("phase1-demo")[0]
@@ -605,7 +886,8 @@ class RepositoryMediaTests(TestCase):
             SourceTranscriptionRequest(model_name="stub-source-asr", model_version="2026.04", language_hint="en"),
         )
 
-        processed = process_next_job(self.repository, worker_id="test-worker")
+        with patch.dict(os.environ, {"ASR_BACKEND": "stub", "SPEECHCRAFT_ALLOW_STUB_ASR": "1"}):
+            processed = process_next_job(self.repository, worker_id="test-worker")
 
         self.assertTrue(processed)
         latest = self.repository.get_processing_job(job.id)
@@ -637,7 +919,10 @@ class RepositoryMediaTests(TestCase):
             "src-source-align",
             SourceTranscriptionRequest(model_name="stub-source-asr", model_version="2026.04", language_hint="en"),
         )
-        process_next_job(self.repository, worker_id="test-worker")
+        with patch.dict(os.environ, {"ASR_BACKEND": "stub", "SPEECHCRAFT_ALLOW_STUB_ASR": "1"}):
+            process_next_job(self.repository, worker_id="test-worker")
+        artifact = self.repository.get_source_recording_artifact("src-source-align")
+        Path(artifact.transcript_text_path).write_text("alpha beta gamma\n", encoding="utf-8")
 
         def fake_align(_audio_bytes: bytes, transcript_text: str) -> list[dict[str, object]]:
             words = transcript_text.split() or ["stub"]

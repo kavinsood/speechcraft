@@ -1,227 +1,215 @@
-# Speechcraft
+# Speechcraft Overview
 
-## What Speechcraft is
+## What Speechcraft Is
 
-Speechcraft is a workstation for turning raw speech recordings into training-ready datasets for voice models.
+Speechcraft is a browser-first workstation for turning raw speech recordings into training-ready voice datasets.
 
-It helps a user go from a folder of `.wav` files to a clean set of slices that can be reviewed, filtered, and exported for downstream TTS or voice-cloning workflows.
+It is built for a practical workflow:
 
-At a high level, Speechcraft is not trying to be a generic audio editor or a toy demo UI. It is built around one practical problem:
+```text
+Ingest -> Overview -> Slicer -> QC -> Lab -> Export
+```
 
-**taking messy raw speech audio and turning it into something a model can actually train on well.**
+The app is not a generic audio editor. It is a staged dataset-preparation system where each page owns a different kind of truth.
 
-## Who it is for
+## Current User
 
-Speechcraft is for people who need to prepare speech datasets without building and maintaining a pile of fragile scripts.
+Speechcraft is for people preparing speech data for voice cloning, TTS fine-tuning, or related speech-model workflows.
 
-That includes:
-- individual hackers and researchers
+Primary users include:
+
 - ML engineers building voice datasets
-- teams preparing internal speech corpora
-- users who want a fast automatic path
-- users who want a careful manual review path
+- voice-cloning operators
+- researchers preparing controlled speech corpora
+- users who want a fast machine-triaged path
+- users who need a careful human-review path
 
-It is designed for both:
-- the person who wants something usable quickly
-- the person who is willing to review and curate for better quality
+## Core Product Rule
 
-## The core idea
+The pipeline keeps machine state, derived data, run outputs, and human decisions separate.
 
-Speechcraft is organized as a pipeline with clear stages.
+That means:
 
-For this sprint, the intended flow is:
+- raw imports are not mutated
+- preparation creates derived recordings
+- ASR and alignment are source-recording artifacts
+- slicer executions create distinct slicer runs
+- QC executions create distinct QC runs
+- machine QC does not overwrite human review
+- Lab is where human truth is changed
 
-**Ingest -> Overview -> Prep -> Slicer -> QC -> Lab -> Export**
+## Stage Responsibilities
 
-Each stage owns a different kind of truth.
-That is important.
+### Ingest
 
-- **Overview** works with imported raw recordings and preparation settings.
-- **Slicer** creates slice runs from prepared recordings.
-- **QC** analyzes one slicer run and classifies slices for fast triage.
-- **Lab** is where a human manually reviews and edits slices.
+Ingest creates projects and imports raw `.wav` files.
 
-Speechcraft deliberately keeps these stages separate instead of blurring everything into one screen with hidden state.
+The current UI provides:
 
-## What makes Speechcraft different
+- project-name input
+- native multi-file picker
+- staged file list
+- remove/clear actions
+- serial upload progress
+- project cleanup on import failure
 
-### 1. It treats dataset preparation as a real product
+The backend streams uploaded files to disk and validates WAV headers before creating raw `SourceRecording` rows.
 
-A lot of speech workflows are still built from scattered scripts, broken dependencies, one-off notebooks, and random open-source tools that only work if the moon phase is correct.
+### Overview
 
-Speechcraft is trying to replace that with a coherent workstation.
+Overview is recording-centric.
 
-### 2. It is slice-first where it matters
+It owns:
 
-The user reviews the actual slices that matter downstream, not fake intermediary objects that never reach training.
+- raw and derived recording inventory
+- dataset summary cards
+- sample-rate/channel-count warnings
+- preparation controls
+- active prepared output status
+- project-level ASR launch
+- project-level alignment launch
+- prep/ASR/alignment job activity
 
-That means when a human opens Lab, they are looking at the units the model will actually train on.
+Preparation creates derived `SourceRecording` rows with lineage. It does not mutate raw files.
 
-### 3. It supports both automation and human override
+ASR and alignment run over the active prepared output group. Alignment is blocked until ASR has completed.
 
-Speechcraft can automatically score and triage slices, but machine output is not final truth.
+### Slicer
 
-A human can always review, restore, reject, or override what the machine did.
+Slicer is run-centric.
 
-### 4. It keeps the workflow explicit
+It consumes the active prepared output group from Overview and requires aligned prepared recordings. The old “ASR metadata requested” slicer option was removed because ASR/alignment are upstream preparation responsibilities.
 
-Raw recordings are immutable.
-Preparation creates derived outputs.
-Slicer and QC are run-based.
-Human-reviewed material is protected.
-Long-running jobs must visibly report what they are doing.
+Each slicer execution creates a distinct run. Prior runs remain available, can be selected, and can be deleted to reclaim generated slices/media/QC data.
 
-Nothing important should happen silently.
+Rerunning ASR or alignment marks downstream slicer runs stale.
 
-## What the stages do
+### QC
 
-## Ingest
+QC is machine triage for one slicer run.
 
-The user imports raw `.wav` recordings.
+It creates persisted QC runs and per-slice QC results. Each result stores:
 
-For this sprint, `.wav` import is the only supported path.
+- aggregate score
+- machine bucket
+- raw metrics
+- reason codes
+- human review snapshot
 
-## Overview
+QC uses machine buckets:
 
-Overview is the post-ingest source-level page.
+- Auto-kept
+- Needs review
+- Auto-rejected
 
-Its job is to answer:
-- what raw audio was imported
-- what technical properties it has
-- whether recordings are mixed in sample rate or channels
-- whether preparation is needed before slicing
+QC can become stale if slice population, transcript basis, or audio basis changes.
 
-It is not a slice-quality page.
+### Lab
 
-## Prep
+Lab is slice-centric human review.
 
-Preparation creates a derived dataset copy from the raw recordings.
+It can open directly in source order or consume QC handoff context from the QC page. QC context can shape the queue through bucket filters, sort order, and thresholds, but it does not become human truth.
 
-For this sprint, preparation focuses on dataset-level source operations such as:
-- downsampling
-- mono/downmix
-- channel selection
+Human actions in Lab remain authoritative.
 
-Preparation does not mutate original imports in place.
+### Export
 
-## Slicer
+Export is the downstream handoff stage.
 
-The Slicer stage creates candidate slices from prepared recordings.
+The backend has export preview/run endpoints. The current frontend Export page is still mostly a stage shell and boundary marker rather than a full export workstation.
 
-It is not a waveform editor.
-It is a run launcher and run summary surface.
+### Reference
 
-Each slicer execution creates a new slicer run.
-Prior runs remain distinct.
-Reviewed or locked material is preserved by the existing protection logic when rerunning.
+Reference remains available as a separate workstation route. It is not part of the main Ingest -> Export sprint path, but it was preserved rather than mapped onto Lab.
 
-## QC
+## Shared State And Navigation
 
-QC is the post-slice triage stage.
+Project selection is shared across stages.
 
-Its job is to:
-- analyze slices from one slicer run
-- classify them into machine buckets
-- support the no-review fast path
-- give the user a macro view of the dataset before entering manual review
+Run selection is URL-backed where it matters:
 
-For this sprint, the UI-facing buckets are:
-- **Auto-kept**
-- **Needs review**
-- **Auto-rejected**
+- `/slicer?project=...&run=...`
+- `/qc?project=...&run=...&qc=...`
+- `/lab?project=...&run=...&qc=...&bucket=...&sort=...&keep=...&reject=...`
 
-QC is machine triage, not human approval.
+Changing project clears downstream run/QC/Lab handoff state. Changing slicer run clears selected QC run and Lab handoff.
 
-## Lab
+## Job Model
 
-Lab is the manual review and editing surface.
+Long-running work is represented as `ProcessingJob` rows and surfaced through reusable job activity panels.
 
-This is where a human can:
-- inspect slices
-- review transcripts
-- correct mistakes
-- accept or reject slices
-- override QC decisions
+Current job-backed operations include:
 
-Lab owns slice-level human review.
+- preparation
+- source transcription
+- source alignment
+- slicer runs
 
-## Export
+`make dev-backend` starts both the API and worker. If the worker is not running, jobs can remain queued.
 
-Export is the handoff stage where the reviewed or automatically selected dataset can be emitted for downstream use.
+## Current QC Scoring Status
 
-## Fast path and review path
+QC is currently deterministic heuristic triage, not a trained ML quality model.
 
-Speechcraft supports two main user modes.
+It uses signals such as:
 
-### Fast path
+- duration
+- word count / transcript density
+- alignment confidence
+- edge/boundary energy
+- slicer flag reasons
+- hard-gate reason codes
 
-The user imports audio, prepares if needed, runs slicing, runs QC, adjusts thresholding, and exports using the machine-selected result set.
+This is intentionally transparent and auditable. It is a foundation for future ML-quality metrics, not the final scoring model.
 
-This is for the user who wants speed and is willing to trust machine triage.
+## Product Principles
 
-### Review path
+### Originals Are Immutable
 
-The user goes through the same earlier stages, then opens Lab and manually reviews slices.
+Raw imported WAV files remain source truth.
 
-This is the safer path and is recommended when quality matters more than speed.
+### Derived Data Is Explicit
 
-## Product principles
+Prepared recordings are derived outputs with parent/recipe lineage.
 
-Speechcraft is built around a few strong rules.
+### Runs Are First-Class
 
-### Originals are immutable
-Raw imported recordings are never mutated in place.
+Slicer and QC runs are not silently overwritten.
 
-### Preparation creates derived data
-Preparation generates a new derived dataset copy using explicit settings.
+### Human Decision Wins
 
-### Runs are first-class
-Slicer and QC are run-based. Old runs are not silently replaced.
+Machine QC can rank, bucket, and filter. Lab owns final review state.
 
-### Human decision is king
-Machine QC may classify and rank. Human review may override it.
+### Stale State Is Surfaced
 
-### Reviewed material is protected
-Reviewed and locked slices are preserved and kept distinct from machine-only results.
+When upstream inputs change, downstream slicer/QC state is marked stale instead of silently reused.
 
-### Advanced controls stay hidden by default
-The default UX is for the lazy user. Expert controls exist, but are collapsed.
+### Boring Native UX Where Possible
 
-### Long-running jobs must be visibly alive
-Preparation, slicing, QC, and similar steps must show clear activity, logs, and completion state.
+Ingest uses the native browser file picker. The app avoids custom file-manager behavior for the core import path.
 
-## What Speechcraft is not
+## Current Assumptions
 
-Speechcraft is not:
-- a generic DAW
-- a music editor
-- a diarization-first multi-speaker suite in this sprint
-- a multilingual corpus manager in this sprint
-- a recommendation engine that tells the user what dataset choices to make
-- a giant graph playground with complex interactions
+Current implementation assumptions:
 
-It is a focused speech dataset preparation workstation.
-
-## Current sprint assumptions
-
-For this sprint, Speechcraft assumes:
 - `.wav` import only
-- English only
-- single-speaker workflows
-- a no-review fast path exists
-- a manual review path exists in Lab
-- advanced controls are available for expert users
+- English ASR/alignment path
+- single-speaker-oriented workflow
+- prepared output is the normal slicer input
+- ASR uses faster-whisper by default
+- alignment is required before slicing
+- QC is advisory machine triage
+- Lab is final human review
 
-Explicitly out of scope for this sprint:
-- transcript import
-- diarization workflows
-- multi-speaker workflows
-- multilingual/code-switching support
-- region-level exclusion tools
-- automatic recommendation logic
-- full cross-stage reversible navigation
+Still out of scope:
 
-## In one sentence
+- diarization-first multi-speaker workflow
+- transcript import as a primary ingest path
+- multilingual corpus management
+- learned QC model
+- advanced waveform analytics such as full SNR/LUFS/clipping percent/VAD ratio
+- graph-heavy QC interaction
 
-Speechcraft is a browser-first workstation for turning raw speech recordings into training-ready voice datasets through explicit preparation, repeatable slicer and QC runs, and optional human review in a slice-level lab.
+## One Sentence
 
+Speechcraft is a staged speech-dataset workstation that imports WAVs, prepares derived recordings, generates ASR/alignment, creates slicer runs, performs persisted machine QC, and hands slices to Lab for human review and export.

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -16,6 +18,14 @@ from .models import (
     ImportBatchCreate,
     MediaCleanupResult,
     ProcessingJobView,
+    ProjectPreparationRequest,
+    ProjectPreparationRun,
+    ProjectRecordingJobsRun,
+    QCRunCreateRequest,
+    QCRunView,
+    ProjectSlicerRunDeleteResult,
+    ProjectSlicerRunRequest,
+    ProjectSlicerRunView,
     ProjectSummary,
     RecordingDerivativeCreate,
     ReferenceAssetCreateFromCandidate,
@@ -49,6 +59,16 @@ from .models import (
     WaveformPeaks,
 )
 from .repository import SliceSaveValidationError, repository
+
+
+ALLOWED_WAV_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "audio/vnd.wave",
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+}
 
 
 DEFAULT_ALLOWED_ORIGINS = (
@@ -110,12 +130,63 @@ def get_project(project_id: str) -> ProjectSummary:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str) -> dict[str, int | str]:
+    try:
+        return repository.delete_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
 @app.get("/api/projects/{project_id}/source-recordings", response_model=list[SourceRecordingView])
 def list_project_source_recordings(project_id: str) -> list[SourceRecordingView]:
     try:
         return repository.list_source_recordings(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/source-recordings/upload", response_model=SourceRecording)
+async def upload_project_source_recording(
+    project_id: str,
+    file: UploadFile = File(...),
+) -> SourceRecording:
+    filename = Path(file.filename or "").name
+    if not filename.lower().endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Only WAV files are supported right now")
+    if (file.content_type or "") not in ALLOWED_WAV_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Only WAV files are supported right now")
+
+    try:
+        repository.get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+    recording_id = repository.new_source_recording_id()
+    target_path = repository.managed_source_recording_path(recording_id)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
+        channels, _sample_width, sample_rate, frames = repository.read_pcm_wav_header(target_path)
+        return repository.create_source_recording(
+            SourceRecordingCreate(
+                id=recording_id,
+                batch_id=project_id,
+                file_path=str(target_path),
+                sample_rate=sample_rate,
+                num_channels=channels,
+                num_samples=frames,
+            )
+        )
+    except KeyError as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        target_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await file.close()
 
 
 @app.get("/api/projects/{project_id}/slices", response_model=list[SliceSummary])
@@ -132,6 +203,110 @@ def list_project_recordings(project_id: str) -> list[SourceRecordingQueueView]:
         return repository.list_project_recordings(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/preparation", response_model=ProjectPreparationRun, status_code=202)
+def run_project_preparation(
+    project_id: str,
+    payload: ProjectPreparationRequest,
+) -> ProjectPreparationRun:
+    try:
+        return repository.run_project_preparation(project_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/preparation-jobs", response_model=list[ProcessingJobView])
+def list_project_preparation_jobs(project_id: str) -> list[ProcessingJobView]:
+    try:
+        return repository.list_project_preparation_jobs(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/transcription", response_model=ProjectRecordingJobsRun, status_code=202)
+def enqueue_project_transcription(
+    project_id: str,
+    payload: SourceTranscriptionRequest,
+) -> ProjectRecordingJobsRun:
+    try:
+        return repository.enqueue_project_transcription(project_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/alignment", response_model=ProjectRecordingJobsRun, status_code=202)
+def enqueue_project_alignment(
+    project_id: str,
+    payload: SourceAlignmentRequest,
+) -> ProjectRecordingJobsRun:
+    try:
+        return repository.enqueue_project_alignment(project_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/slicer-runs", response_model=list[ProjectSlicerRunView])
+def list_project_slicer_runs(project_id: str) -> list[ProjectSlicerRunView]:
+    try:
+        return repository.list_project_slicer_runs(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/slicer-runs", response_model=ProjectSlicerRunView, status_code=202)
+def create_project_slicer_run(
+    project_id: str,
+    payload: ProjectSlicerRunRequest,
+) -> ProjectSlicerRunView:
+    try:
+        return repository.create_project_slicer_run(project_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/slicer-runs/{slicer_run_id}", response_model=ProjectSlicerRunDeleteResult)
+def delete_project_slicer_run(project_id: str, slicer_run_id: str) -> ProjectSlicerRunDeleteResult:
+    try:
+        return repository.delete_project_slicer_run(project_id, slicer_run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slicer run not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/qc-runs", response_model=list[QCRunView])
+def list_project_qc_runs(project_id: str, slicer_run_id: str | None = None) -> list[QCRunView]:
+    try:
+        return repository.list_project_qc_runs(project_id, slicer_run_id=slicer_run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/qc-runs", response_model=QCRunView)
+def create_project_qc_run(project_id: str, payload: QCRunCreateRequest) -> QCRunView:
+    try:
+        return repository.create_qc_run(project_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/qc-runs/{qc_run_id}", response_model=QCRunView)
+def get_qc_run(qc_run_id: str) -> QCRunView:
+    try:
+        return repository.get_qc_run(qc_run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="QC run not found") from exc
 
 
 @app.get("/api/slices/{slice_id}", response_model=SliceDetail)
@@ -405,7 +580,10 @@ def get_source_recording_window_media(
 
 @app.post("/api/import-batches", response_model=ProjectSummary)
 def create_import_batch(payload: ImportBatchCreate) -> ProjectSummary:
-    return repository.create_import_batch(payload)
+    try:
+        return repository.create_import_batch(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/source-recordings", response_model=SourceRecording)
