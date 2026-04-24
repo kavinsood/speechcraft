@@ -4,6 +4,14 @@ import type {
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
+  ProjectAlignmentSettings,
+  PreparationSettings,
+  ProjectRecordingJobsRun,
+  ProjectPreparationRun,
+  ProjectTranscriptionSettings,
+  ProcessingJob,
+  QcRun,
+  QcRunCreateRequest,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
   ReferenceCandidate,
@@ -12,6 +20,9 @@ import type {
   ReviewStatus,
   Slice,
   SliceSummary,
+  SlicerRun,
+  SlicerRunDeleteResult,
+  SlicerRunRequest,
   SourceRecording,
   SourceRecordingQueue,
   WaveformPeaks,
@@ -95,6 +106,68 @@ export async function fetchProjects(): Promise<ImportBatch[]> {
 export async function fetchProject(projectId: string): Promise<ImportBatch> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}`);
   return await parseJson<ImportBatch>(response);
+}
+
+export async function createImportBatch(payload: { id: string; name: string }): Promise<ImportBatch> {
+  const response = await fetch(`${API_BASE}/api/import-batches`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<ImportBatch>(response);
+}
+
+export async function deleteProject(
+  projectId: string,
+): Promise<{ project_id: string; deleted_file_count: number }> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}`, {
+    method: "DELETE",
+  });
+  return await parseJson<{ project_id: string; deleted_file_count: number }>(response);
+}
+
+export function uploadProjectSourceRecording(
+  projectId: string,
+  file: File,
+  onProgress: (progress: number) => void,
+): Promise<SourceRecording> {
+  const url = `${API_BASE}/api/projects/${projectId}/source-recordings/upload`;
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", url);
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable || event.total <= 0) {
+        return;
+      }
+      onProgress(Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100))));
+    };
+    request.onload = () => {
+      let payload: unknown = null;
+      try {
+        payload = request.responseText ? JSON.parse(request.responseText) : null;
+      } catch {
+        payload = null;
+      }
+      if (request.status >= 200 && request.status < 300 && payload) {
+        onProgress(100);
+        resolve(payload as SourceRecording);
+        return;
+      }
+      const message =
+        payload && typeof payload === "object" && "detail" in payload
+          ? String((payload as { detail?: unknown }).detail)
+          : `Upload failed: ${request.status}`;
+      reject(new ApiError(message, request.status, url));
+    };
+    request.onerror = () => {
+      reject(new ApiError("Upload failed before the server responded.", request.status || 0, url));
+    };
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    request.send(formData);
+  });
 }
 
 export async function fetchProjectSlices(projectId: string): Promise<SliceSummary[]> {
@@ -191,6 +264,112 @@ export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAss
 export async function fetchProjectRecordings(projectId: string): Promise<SourceRecordingQueue[]> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/recordings`);
   return await parseJson<SourceRecordingQueue[]>(response);
+}
+
+export async function runProjectTranscription(
+  projectId: string,
+  settings: ProjectTranscriptionSettings,
+): Promise<ProjectRecordingJobsRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/transcription`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return await parseJson<ProjectRecordingJobsRun>(response);
+}
+
+export async function runProjectAlignment(
+  projectId: string,
+  settings: ProjectAlignmentSettings,
+): Promise<ProjectRecordingJobsRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/alignment`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return await parseJson<ProjectRecordingJobsRun>(response);
+}
+
+export async function runProjectPreparation(
+  projectId: string,
+  settings: PreparationSettings,
+): Promise<ProjectPreparationRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/preparation`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return await parseJson<ProjectPreparationRun>(response);
+}
+
+export async function fetchProjectPreparationJobs(projectId: string): Promise<ProcessingJob[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/preparation-jobs`);
+  return await parseJson<ProcessingJob[]>(response);
+}
+
+export async function fetchProcessingJob(jobId: string): Promise<ProcessingJob> {
+  const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+  return await parseJson<ProcessingJob>(response);
+}
+
+export async function fetchProjectSlicerRuns(projectId: string): Promise<SlicerRun[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slicer-runs`);
+  return await parseJson<SlicerRun[]>(response);
+}
+
+export async function createProjectSlicerRun(
+  projectId: string,
+  payload: SlicerRunRequest,
+): Promise<SlicerRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slicer-runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<SlicerRun>(response);
+}
+
+export async function deleteProjectSlicerRun(
+  projectId: string,
+  slicerRunId: string,
+): Promise<SlicerRunDeleteResult> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slicer-runs/${slicerRunId}`, {
+    method: "DELETE",
+  });
+  return await parseJson<SlicerRunDeleteResult>(response);
+}
+
+export async function fetchProjectQcRuns(projectId: string, slicerRunId?: string): Promise<QcRun[]> {
+  const url = new URL(`${API_BASE}/api/projects/${projectId}/qc-runs`);
+  if (slicerRunId) {
+    url.searchParams.set("slicer_run_id", slicerRunId);
+  }
+  const response = await fetch(url.toString());
+  return await parseJson<QcRun[]>(response);
+}
+
+export async function createProjectQcRun(projectId: string, payload: QcRunCreateRequest): Promise<QcRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/qc-runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return await parseJson<QcRun>(response);
+}
+
+export async function fetchQcRun(qcRunId: string): Promise<QcRun> {
+  const response = await fetch(`${API_BASE}/api/qc-runs/${qcRunId}`);
+  return await parseJson<QcRun>(response);
 }
 
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
