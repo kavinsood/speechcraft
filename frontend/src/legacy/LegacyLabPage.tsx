@@ -1,7 +1,7 @@
 import { type ReactNode } from "react";
 import { usePipelineContext } from "../pipeline/PipelineContext";
 import type { ClipLabItemRef, Project } from "../types";
-import LabelPage from "./LabelPage";
+import LabelPage from "../pages/LabelPage";
 
 type LabPageProps = {
   activeProject: Project | null;
@@ -13,7 +13,7 @@ type LabPageProps = {
   onHeaderActionsChange: (actions: ReactNode) => void;
 };
 
-export default function LabPage(props: LabPageProps) {
+export default function LegacyLabPage(props: LabPageProps) {
   const { labHandoff } = usePipelineContext();
 
   return (
@@ -22,7 +22,7 @@ export default function LabPage(props: LabPageProps) {
         <div className="pipeline-handoff-banner">
           <strong>QC handoff</strong>
           <span>
-            Run {labHandoff.slicerRunId}, filter {labHandoff.bucketFilter.replace(/-/g, " ")}, sort{" "}
+            Run {labHandoff.datasetRunId}, filter {labHandoff.bucketFilter.replace(/-/g, " ")}, sort{" "}
             {labHandoff.sort.replace(/-/g, " ")}, keep {labHandoff.keepThreshold ?? "n/a"}, reject{" "}
             {labHandoff.rejectThreshold ?? "n/a"}, preset {labHandoff.preset ?? "n/a"}
           </span>

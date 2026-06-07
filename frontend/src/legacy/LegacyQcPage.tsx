@@ -163,7 +163,11 @@ export default function QcPage({
   onRetryProjects,
   onOpenLab,
 }: QcPageProps) {
-  const { selectedSlicerRunId, selectedQcRunId, selectQcRun } = usePipelineContext();
+  const { selectedSlicerDatasetRunId } = usePipelineContext();
+  // Legacy QC: use dataset run ID as the slicer run ID stand-in (not connected to old backend tables)
+  const selectedSlicerRunId = selectedSlicerDatasetRunId;
+  const [selectedQcRunId, setSelectedQcRunId] = useState<string | null>(null);
+  function selectQcRun(id: string | null) { setSelectedQcRunId(id); }
   const [loadStatus, setLoadStatus] = useState<QcLoadStatus>("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [qcRuns, setQcRuns] = useState<QcRun[]>([]);
@@ -306,7 +310,7 @@ export default function QcPage({
     }
     onOpenLab({
       source: "qc",
-      slicerRunId: selectedSlicerRunId,
+      datasetRunId: selectedSlicerRunId,
       qcRunId: selectedQcRunId,
       bucketFilter,
       sort: sortMode,
