@@ -6,9 +6,19 @@ BACKEND_PORT ?= 8010
 FRONTEND_API_BASE_URL ?= http://$(BACKEND_HOST):$(BACKEND_PORT)
 SMOKE_BACKEND_BASE_URL ?= http://127.0.0.1:8010
 SMOKE_BACKEND_PROJECT_ID ?= phase1-demo
+LOCAL_MFA_BIN := $(HOME)/.conda/envs/speechcraft-mfa/bin/mfa
+ifeq ($(wildcard $(LOCAL_MFA_BIN)),$(LOCAL_MFA_BIN))
+SPEECHCRAFT_MFA_BIN ?= $(LOCAL_MFA_BIN)
+endif
+SPEECHCRAFT_MFA_DICTIONARY ?= english_us_mfa
+SPEECHCRAFT_MFA_ACOUSTIC_MODEL ?= english_mfa
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BACKEND_DIR := $(ROOT_DIR)/backend
 FRONTEND_DIR := $(ROOT_DIR)/frontend
+
+export SPEECHCRAFT_MFA_BIN
+export SPEECHCRAFT_MFA_DICTIONARY
+export SPEECHCRAFT_MFA_ACOUSTIC_MODEL
 
 help:
 	@printf "\nSpeechcraft commands:\n"
@@ -36,7 +46,7 @@ setup-frontend:
 	cd $(FRONTEND_DIR) && npm install
 
 dev-backend:
-	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) sh -c 'set -e; uv run uvicorn app.main:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT) & api_pid=$$!; uv run python -m app.worker & worker_pid=$$!; trap "kill $$api_pid $$worker_pid 2>/dev/null || true" INT TERM EXIT; wait'
+	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) sh -c 'set -e; mkdir -p logs; : > logs/dev-backend.log; (uv run uvicorn app.main:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT) 2>&1 | tee -a logs/dev-backend.log) & api_pid=$$!; (uv run python -m app.worker 2>&1 | tee -a logs/dev-backend.log) & worker_pid=$$!; trap "kill $$api_pid $$worker_pid 2>/dev/null || true" INT TERM EXIT; wait'
 
 dev-api:
 	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) uv run uvicorn app.main:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT)

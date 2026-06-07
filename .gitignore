@@ -1,4 +1,5 @@
 .DS_Store
+.codex
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -14,10 +15,12 @@ dist/
 build/
 backend/data/*.json
 backend/data/*.db
+backend/*.db
 backend/data/media/
 backend/media/
 backend/exports/
 repomix-output.xml
+docs/review_bundles/*.patch
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts

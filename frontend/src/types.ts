@@ -58,12 +58,98 @@ export type AudioVariant = {
 export type SourceRecording = {
   id: string;
   batch_id: string;
+  display_name?: string | null;
   parent_recording_id?: string | null;
   sample_rate: number;
   num_channels: number;
   num_samples: number;
   processing_recipe?: string | null;
   duration_seconds: number;
+};
+
+export type DatasetRunStatus = "pending" | "running" | "completed" | "needs_review" | "rejected" | "failed";
+
+export type DatasetRunArtifact = {
+  id: string;
+  kind: string;
+  path: string;
+  byte_size?: number | null;
+  content_hash?: string | null;
+  summary: Record<string, unknown>;
+  reason_codes: string[];
+};
+
+export type DatasetRun = {
+  id: string;
+  project_id: string;
+  pipeline_version: string;
+  artifact_root?: string | null;
+  stage: string;
+  status: DatasetRunStatus;
+  config_hash?: string | null;
+  input_summary: Record<string, unknown>;
+  output_summary: Record<string, unknown>;
+  reason_codes: string[];
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  artifacts: DatasetRunArtifact[];
+};
+
+export type DatasetRunCreateRequest = {
+  source_recording_ids: string[];
+  config: Record<string, unknown>;
+  single_speaker: boolean;
+  target_speaker_label: string;
+  stop_after: string;
+};
+
+export type DatasetSpeakerSample = {
+  sample_id: string;
+  speaker_id: string;
+  source_audio_id: string;
+  audio_path: string;
+  start_sample: number;
+  end_sample: number;
+  duration_sec: number;
+};
+
+export type DatasetSpeakerSelection = {
+  mode: string;
+  selected: boolean;
+  target_speaker_id?: string | null;
+  source: string;
+  available_speaker_ids: string[];
+  updated_at?: string | null;
+};
+
+export type DatasetSpeakerResults = {
+  run_id: string;
+  speaker_regions_summary: Record<string, unknown>;
+  speaker_samples_manifest: DatasetSpeakerSample[];
+  speaker_selection?: DatasetSpeakerSelection | null;
+};
+
+export type DatasetRunLog = {
+  run_id: string;
+  path: string;
+  text: string;
+  truncated: boolean;
+};
+
+export type DatasetSlicerResults = {
+  run_id: string;
+  safe_cutpoint_summary: Record<string, unknown>;
+  candidate_review_summary: Record<string, unknown>;
+  candidate_review_manifest: Array<Record<string, unknown>>;
+  candidate_review_rejected: Array<Record<string, unknown>>;
+};
+
+export type DatasetPreflight = {
+  ok: boolean;
+  reason_codes?: string[];
+  error?: string;
+  [key: string]: unknown;
 };
 
 export type SourceRecordingArtifact = {
@@ -133,59 +219,6 @@ export type ProjectRecordingJobsRun = {
   project_id: string;
   prepared_output_group_id: string;
   jobs: ProcessingJob[];
-};
-
-export type SlicerRunRequest = {
-  target_clip_length: number;
-  max_clip_length: number;
-  segmentation_sensitivity: number;
-  preserve_locked_slices: boolean;
-  replace_unlocked_slices: boolean;
-  advanced_config_overrides?: Record<string, unknown> | null;
-};
-
-export type SlicerRun = {
-  id: string;
-  project_id: string;
-  prepared_output_group_id: string;
-  status: "pending" | "running" | "completed" | "failed";
-  created_at: string;
-  started_at?: string | null;
-  completed_at?: string | null;
-  recording_ids: string[];
-  jobs: ProcessingJob[];
-  config: Record<string, unknown>;
-  summary: {
-    slices_created?: number;
-    total_sliced_duration?: number;
-    average_slice_length?: number;
-    minimum_slice_length?: number;
-    maximum_slice_length?: number;
-    preserved_locked_slice_count?: number;
-    dropped_overlap_count?: number;
-    completed_recording_count?: number;
-    failed_recording_count?: number;
-    pending_recording_count?: number;
-    running_recording_count?: number;
-    downstream_qc_data_available?: boolean;
-  };
-  warnings: string[];
-  is_stale?: boolean;
-  stale_reason?: string | null;
-};
-
-export type SlicerRunDeleteResult = {
-  project_id: string;
-  slicer_run_id: string;
-  deleted_job_count: number;
-  deleted_qc_run_count: number;
-  deleted_qc_result_count: number;
-  deleted_slice_count: number;
-  deleted_variant_count: number;
-  deleted_file_count: number;
-  restored_slice_count: number;
-  deleted_slice_ids: string[];
-  deleted_variant_ids: string[];
 };
 
 export type QcBucket = "auto_kept" | "needs_review" | "auto_rejected";

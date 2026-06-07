@@ -1,11 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
-import { ApiError, createProjectSlicerRun, deleteProjectSlicerRun, fetchProjectSlicerRuns } from "../api";
+import {
+  ApiError,
+  buildCandidateReviewAudioUrl,
+  fetchDatasetRunLog,
+  fetchDatasetSlicerResults,
+  fetchProjectDatasetRuns,
+  refreshDatasetRun,
+  rerunDatasetSlicer,
+} from "../api";
 import JobActivityPanel, { type JobActivity } from "../components/JobActivityPanel";
 import { usePipelineContext } from "../pipeline/PipelineContext";
-import type { Project, SlicerRun, SlicerRunRequest } from "../types";
+import { hasCandidateClipArtifacts, isSlicerInputReady } from "../pipeline/datasetRunHelpers";
+import type { DatasetRun, DatasetRunLog, DatasetSlicerResults, Project } from "../types";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
 
-type SlicerPageProps = {
+type Props = {
   activeProject: Project | null;
   projectLoadStatus: "loading" | "ready" | "error";
   projectLoadError: string | null;
@@ -13,455 +22,244 @@ type SlicerPageProps = {
   onOpenQc: () => void;
 };
 
-type SlicerLoadStatus = "idle" | "loading" | "ready" | "error";
-
-const defaultSlicerSettings: SlicerRunRequest = {
-  target_clip_length: 7,
-  max_clip_length: 15,
-  segmentation_sensitivity: 0.5,
-  preserve_locked_slices: true,
-  replace_unlocked_slices: true,
-  advanced_config_overrides: null,
+const defaults: Record<string, number> = {
+  cutpoint_left_word_edge_guard_ms: 30,
+  cutpoint_min_gap_ms: 80,
+  cutpoint_right_word_edge_guard_ms: 30,
+  cutpoint_noise_margin_db: 6,
+  cutpoint_frame_ms: 20,
+  cutpoint_hop_ms: 10,
+  oov_cut_guard_sec: 0.5,
+  symbol_cut_guard_sec: 0.5,
+  numeric_cut_guard_sec: 0.5,
+  provisional_split_guard_sec: 0.5,
+  candidate_min_clip_sec: 3,
+  candidate_target_clip_sec: 8,
+  candidate_max_clip_sec: 15,
 };
 
-function getErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof ApiError) {
-    return error.message;
-  }
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-  return fallback;
+const controls = [
+  ["Left word-edge guard", "cutpoint_left_word_edge_guard_ms", "ms", 0, 500, 5],
+  ["Minimum usable gap", "cutpoint_min_gap_ms", "ms", 0, 1000, 5],
+  ["Right word-edge guard", "cutpoint_right_word_edge_guard_ms", "ms", 0, 500, 5],
+  ["Noise-floor margin", "cutpoint_noise_margin_db", "dB", 0, 30, 0.5],
+  ["RMS frame", "cutpoint_frame_ms", "ms", 5, 200, 5],
+  ["RMS hop", "cutpoint_hop_ms", "ms", 1, 100, 1],
+  ["OOV cut guard", "oov_cut_guard_sec", "sec", 0, 5, 0.05],
+  ["Symbol cut guard", "symbol_cut_guard_sec", "sec", 0, 5, 0.05],
+  ["Numeric cut guard", "numeric_cut_guard_sec", "sec", 0, 5, 0.05],
+  ["Provisional seam guard", "provisional_split_guard_sec", "sec", 0, 5, 0.05],
+  ["Minimum clip", "candidate_min_clip_sec", "sec", 1, 15, 0.5],
+  ["Target clip", "candidate_target_clip_sec", "sec", 1, 20, 0.5],
+  ["Maximum clip", "candidate_max_clip_sec", "sec", 1, 30, 0.5],
+] as const;
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof ApiError || error instanceof Error ? error.message || fallback : fallback;
 }
 
-function formatDuration(seconds?: number): string {
-  if (!seconds || !Number.isFinite(seconds)) {
-    return "0:00";
-  }
-  const rounded = Math.round(seconds);
-  return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
+function count(summary: Record<string, unknown>, key: string): number {
+  const value = Number(summary[key] ?? 0);
+  return Number.isFinite(value) ? value : 0;
 }
 
-function runToActivity(run: SlicerRun | null): JobActivity | null {
-  if (!run) {
-    return null;
-  }
+function textValue(row: Record<string, unknown>, key: string): string {
+  const value = row[key];
+  return typeof value === "string" ? value : "";
+}
 
-  const lines = run.jobs.flatMap((job, index) => {
-    const outputLogs = Array.isArray(job.output_payload?.logs) ? job.output_payload.logs : [];
-    const baseLine = {
-      id: `${job.id}-status`,
-      timestamp: String(index + 1).padStart(2, "0"),
-      message:
-        job.status === "failed"
-          ? `${job.source_recording_id}: ${job.error_message ?? "Slicing failed"}`
-          : `${job.source_recording_id}: ${job.status}`,
-    };
-    return [
-      baseLine,
-      ...outputLogs.map((line, logIndex) => ({
-        id: `${job.id}-log-${logIndex}`,
-        timestamp: `${index + 1}.${logIndex + 1}`,
-        message: String(line),
-      })),
-    ];
-  });
-
+function activity(run: DatasetRun | null, log: DatasetRunLog | null): JobActivity | null {
+  if (!run) return null;
   return {
     id: run.id,
-    name: `Slicer run ${run.id}`,
+    name: `SafeCutPoint slicer · ${run.id}`,
     type: "slicing",
-    state: run.status === "pending" ? "running" : run.status,
-    startedAt: run.started_at ?? run.created_at,
+    state: run.status === "running" ? "running" : run.status === "failed" ? "failed" : run.status === "completed" ? "completed" : "idle",
+    startedAt: run.started_at,
     completedAt: run.completed_at,
-    progressLabel:
-      run.status === "completed"
-        ? "Slicer run completed"
-        : run.status === "failed"
-          ? "Slicer run failed"
-          : run.status === "pending"
-            ? "Queued for worker"
-            : "Slicing recordings",
-    logs: lines,
+    progressLabel: `${run.status} · ${run.stage.replace(/_/g, " ")}`,
+    logs: (log?.text ?? "").split("\n").filter(Boolean).map((message, index) => ({ id: `${run.id}-${index}`, timestamp: String(index + 1).padStart(3, "0"), message })),
   };
 }
 
-export default function SlicerPage({
-  activeProject,
-  projectLoadStatus,
-  projectLoadError,
-  onRetryProjects,
-  onOpenQc,
-}: SlicerPageProps) {
-  const { selectedSlicerRunId, selectSlicerRun } = usePipelineContext();
-  const [loadStatus, setLoadStatus] = useState<SlicerLoadStatus>("idle");
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [runs, setRuns] = useState<SlicerRun[]>([]);
-  const [settings, setSettings] = useState<SlicerRunRequest>(defaultSlicerSettings);
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [advancedJson, setAdvancedJson] = useState("{}");
-  const [launchError, setLaunchError] = useState<string | null>(null);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+export default function SlicerPage({ activeProject, projectLoadStatus, projectLoadError, onRetryProjects, onOpenQc }: Props) {
+  const { selectedSlicerDatasetRunId, selectSlicerDatasetRun } = usePipelineContext();
+  const [runs, setRuns] = useState<DatasetRun[]>([]);
+  const [results, setResults] = useState<DatasetSlicerResults | null>(null);
+  const [log, setLog] = useState<DatasetRunLog | null>(null);
+  const [settings, setSettings] = useState(defaults);
+  const [error, setError] = useState<string | null>(null);
+  const [pollWarning, setPollWarning] = useState<string | null>(null);
+  const [pollFailureCount, setPollFailureCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const selectedRun = useMemo(
+    () => runs.find((run) => run.id === selectedSlicerDatasetRunId) ?? null,
+    [runs, selectedSlicerDatasetRunId],
+  );
 
   async function loadRuns(projectId: string) {
-    setLoadStatus("loading");
-    setLoadError(null);
     try {
-      const nextRuns = await fetchProjectSlicerRuns(projectId);
-      setRuns(nextRuns);
-      setLoadStatus("ready");
-      if (!selectedSlicerRunId && nextRuns[0]) {
-        selectSlicerRun(nextRuns[0].id);
+      setRuns(await fetchProjectDatasetRuns(projectId));
+    } catch (loadError) {
+      setError(errorMessage(loadError, "Dataset runs could not be loaded."));
+    }
+  }
+
+  async function loadSelected(runId: string, refresh = false, polling = false) {
+    try {
+      const [run, nextResults, nextLog] = await Promise.all([
+        refresh ? refreshDatasetRun(runId) : Promise.resolve(runs.find((item) => item.id === runId) ?? null),
+        fetchDatasetSlicerResults(runId),
+        fetchDatasetRunLog(runId),
+      ]);
+      if (run) setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      setResults(nextResults);
+      setLog(nextLog);
+      setPollWarning(null);
+      setPollFailureCount(0);
+    } catch (loadError) {
+      const message = errorMessage(loadError, "Slicer results could not be loaded.");
+      if (polling) {
+        setPollWarning(message);
+        setPollFailureCount((current) => Math.min(current + 1, 3));
+      } else {
+        setError(message);
       }
-    } catch (error) {
-      setRuns([]);
-      setLoadStatus("error");
-      setLoadError(getErrorMessage(error, "Slicer runs could not be loaded."));
     }
   }
 
   useEffect(() => {
     setRuns([]);
-    setLaunchError(null);
-    setDeleteError(null);
-    if (!activeProject) {
-      setLoadStatus("idle");
-      return;
-    }
-    void loadRuns(activeProject.id);
+    setResults(null);
+    setLog(null);
+    if (activeProject) void loadRuns(activeProject.id);
   }, [activeProject?.id]);
 
-  const selectedRun = useMemo(
-    () => runs.find((run) => run.id === selectedSlicerRunId) ?? null,
-    [runs, selectedSlicerRunId],
-  );
-  const activeRun = useMemo(
-    () => runs.find((run) => run.status === "pending" || run.status === "running") ?? null,
-    [runs],
-  );
+  useEffect(() => {
+    if (selectedSlicerDatasetRunId) void loadSelected(selectedSlicerDatasetRunId);
+    else {
+      setResults(null);
+      setLog(null);
+    }
+  }, [selectedSlicerDatasetRunId]);
 
   useEffect(() => {
-    if (!activeProject || !activeRun) {
-      return;
-    }
-    let cancelled = false;
-    let timeoutId: number | null = null;
+    if (!selectedRun || selectedRun.status !== "running") return;
+    const intervalMs = pollFailureCount === 0 ? 2000 : pollFailureCount === 1 ? 5000 : 10000;
+    const timer = window.setInterval(() => void loadSelected(selectedRun.id, true, true), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [selectedRun?.id, selectedRun?.status, pollFailureCount]);
 
-    const poll = async () => {
-      await loadRuns(activeProject.id);
-      if (!cancelled) {
-        timeoutId = window.setTimeout(() => {
-          void poll();
-        }, 2500);
-      }
-    };
-
-    timeoutId = window.setTimeout(() => {
-      void poll();
-    }, 2500);
-
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
-    };
-  }, [activeProject?.id, activeRun?.id]);
-
-  async function handleLaunchRun() {
-    if (!activeProject) {
-      return;
-    }
-    setLaunchError(null);
-    let advanced_config_overrides: Record<string, unknown> | null = null;
-    if (showAdvanced && advancedJson.trim() && advancedJson.trim() !== "{}") {
-      try {
-        const parsed = JSON.parse(advancedJson) as unknown;
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error("Advanced overrides must be a JSON object.");
-        }
-        advanced_config_overrides = parsed as Record<string, unknown>;
-      } catch (error) {
-        setLaunchError(getErrorMessage(error, "Advanced overrides must be valid JSON."));
-        return;
-      }
-    }
-
+  async function generateOrRegenerate() {
+    if (!selectedRun) return;
+    setBusy(true);
+    setError(null);
     try {
-      const run = await createProjectSlicerRun(activeProject.id, {
-        ...settings,
-        advanced_config_overrides,
-      });
-      setRuns((current) => [run, ...current.filter((entry) => entry.id !== run.id)]);
-      selectSlicerRun(run.id);
-    } catch (error) {
-      setLaunchError(getErrorMessage(error, "Slicer run could not be launched."));
+      const run = await rerunDatasetSlicer(selectedRun.id, settings);
+      setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      await loadSelected(run.id, true);
+    } catch (rerunError) {
+      setError(errorMessage(rerunError, "SafeCutPoint slicer rerun failed."));
+    } finally {
+      setBusy(false);
     }
   }
 
-  async function handleDeleteSelectedRun() {
-    if (!activeProject || !selectedRun) {
-      return;
-    }
-    setDeleteError(null);
-    if (selectedRun.status === "pending" || selectedRun.status === "running") {
-      setDeleteError("Slicer runs can only be deleted after they complete or fail.");
-      return;
-    }
-    const confirmed = window.confirm(
-      `Delete slicer run ${selectedRun.id}? This removes generated slices, QC runs, and unreferenced media files for this run.`,
-    );
-    if (!confirmed) {
-      return;
-    }
+  if (projectLoadStatus === "error") return <WorkspaceStatePanel title="Projects unavailable" message={projectLoadError ?? "Project load failed."} actionLabel="Retry" onAction={onRetryProjects} />;
+  if (projectLoadStatus === "loading") return <WorkspaceStatePanel title="Loading projects" message="Fetching project context." />;
+  if (!activeProject) return <WorkspaceStatePanel title="No project selected" message="Select a project before slicing." />;
 
-    try {
-      await deleteProjectSlicerRun(activeProject.id, selectedRun.id);
-      const remainingRuns = runs.filter((run) => run.id !== selectedRun.id);
-      setRuns(remainingRuns);
-      selectSlicerRun(remainingRuns[0]?.id ?? null);
-    } catch (error) {
-      setDeleteError(getErrorMessage(error, "Slicer run could not be deleted."));
-    }
-  }
-
-  if (projectLoadStatus === "error") {
-    return (
-      <WorkspaceStatePanel
-        title="Projects unavailable"
-        message={projectLoadError ?? "The project list could not be loaded."}
-        actionLabel="Retry project load"
-        onAction={onRetryProjects}
-      />
-    );
-  }
-
-  if (projectLoadStatus === "loading") {
-    return <WorkspaceStatePanel title="Loading projects" message="Fetching project context." />;
-  }
-
-  if (!activeProject) {
-    return (
-      <WorkspaceStatePanel
-        title="No project selected"
-        message="Select a project before creating or choosing slicer runs."
-      />
-    );
-  }
-
-  if (loadStatus === "loading" && runs.length === 0) {
-    return <WorkspaceStatePanel title="Loading slicer runs" message="Reading run history." />;
-  }
-
-  if (loadStatus === "error") {
-    return (
-      <WorkspaceStatePanel
-        title="Slicer runs unavailable"
-        message={loadError ?? "Slicer runs could not be loaded."}
-        actionLabel="Retry slicer runs"
-        onAction={() => void loadRuns(activeProject.id)}
-      />
-    );
-  }
-
-  const canLaunch = Boolean(activeProject.active_prepared_output_group_id) && !activeRun;
+  const safe = results?.safe_cutpoint_summary ?? {};
+  const clips = results?.candidate_review_summary ?? {};
+  const manifest = results?.candidate_review_manifest ?? [];
+  const rejectionReasons = safe.rejection_reason_counts && typeof safe.rejection_reason_counts === "object" ? Object.entries(safe.rejection_reason_counts as Record<string, unknown>) : [];
+  const slicerReady = isSlicerInputReady(selectedRun);
+  const hasCandidates = hasCandidateClipArtifacts(selectedRun, results);
+  const generateDisabled = !selectedRun || !slicerReady || selectedRun.status === "running" || busy;
+  const generateLabel = busy
+    ? "Starting..."
+    : hasCandidates
+      ? "Regenerate SafeCutPoints + assembly"
+      : "Generate candidate clips";
 
   return (
-    <section className="step-page pipeline-page slicer-page">
-      <div className="stage-layout">
-        <aside className="stage-sidebar panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Run selector</p>
-              <h3>Slicer runs</h3>
-            </div>
+    <section className="step-page dataset-slicer-page">
+      {error ? <p className="shell-notice shell-notice-error">{error}</p> : null}
+      {pollWarning ? <p className="shell-notice">{pollWarning}</p> : null}
+      <div className="dataset-slicer-layout">
+        <aside className="panel processing-sidebar">
+          <div className="panel-header"><div><p className="eyebrow">Dataset runs</p><h3>Slicer inputs</h3></div></div>
+          <div className="processing-run-list">
+            {runs.map((run) => <button key={run.id} type="button" aria-pressed={selectedRun?.id === run.id} onClick={() => selectSlicerDatasetRun(run.id)}><strong>{run.id}</strong><span>{run.status} · {run.stage.replace(/_/g, " ")}</span></button>)}
+            {runs.length === 0 ? <p>No dataset runs. Complete Processing first.</p> : null}
           </div>
-          <ul className="stage-list">
-            {runs.length > 0 ? (
-              runs.map((run) => (
-                <li key={run.id}>
-                  <button
-                    className="pipeline-list-button"
-                    type="button"
-                    onClick={() => selectSlicerRun(run.id)}
-                    aria-pressed={selectedRun?.id === run.id}
-                  >
-                    <strong>{run.id}</strong>
-                    <span>
-                      {run.status}
-                      {run.is_stale ? " · stale" : ""} · {run.summary.slices_created ?? 0} slice(s)
-                    </span>
-                  </button>
-                </li>
-              ))
-            ) : (
-              <li>
-                <strong>No slicer runs</strong>
-                <span>Launch a run after preparation completes.</span>
-              </li>
-            )}
-          </ul>
-          <button
-            className="ghost-button pipeline-full-button"
-            type="button"
-            onClick={handleDeleteSelectedRun}
-            disabled={!selectedRun || selectedRun.status === "pending" || selectedRun.status === "running"}
-          >
-            Delete selected run
-          </button>
-          {deleteError ? <p className="shell-notice shell-notice-error">{deleteError}</p> : null}
         </aside>
 
-        <main className="stage-main">
-          <section className="panel pipeline-hero">
-            <p className="eyebrow">Slicer scope</p>
-            <h3>{selectedRun ? selectedRun.id : "No slicer run selected"}</h3>
-            <p>
-              Slicer creates distinct candidate-slice runs over the active prepared output group.
-              It does not own QC buckets or manual Lab review.
-            </p>
-            <button
-              className="primary-button"
-              type="button"
-              onClick={handleLaunchRun}
-              disabled={!canLaunch}
-            >
-              Launch slicer run
-            </button>
-            {launchError ? <p className="shell-notice shell-notice-error">{launchError}</p> : null}
+        <main className="processing-main">
+          <section className="panel processing-controls">
+            <div className="panel-header"><div><p className="eyebrow">SafeCutPoint authority</p><h3>Acoustic cut and assembly controls</h3></div><span className="status-pill">{slicerReady ? "Alignment ready" : "Needs alignment"}</span></div>
+            {!selectedRun ? (
+              <p>Select a dataset run from the sidebar or use Open Slicer on a completed Processing run.</p>
+            ) : slicerReady && !hasCandidates ? (
+              <p>Alignment is ready. SafeCutPoints and candidate clips have not been generated yet.</p>
+            ) : hasCandidates ? (
+              <p>Existing candidate clips found for this run.</p>
+            ) : (
+              <p>Complete Processing through alignment QC before generating candidate clips.</p>
+            )}
+            <div className="processing-settings-grid">
+              {controls.map(([label, key, unit, min, max, step]) => <label className="processing-setting" key={key}><span>{label}</span><span className="processing-input-row"><input type="number" value={settings[key]} min={min} max={max} step={step} onChange={(event) => setSettings((current) => ({ ...current, [key]: Number(event.target.value) }))} /><small>{unit}</small></span></label>)}
+            </div>
+            <div className="processing-actions">
+              <button className="primary-button" type="button" disabled={generateDisabled} onClick={() => void generateOrRegenerate()}>{generateLabel}</button>
+              <span>Only slicer artifacts are regenerated. ASR and MFA remain untouched.</span>
+            </div>
           </section>
 
-          <section className="panel overview-prep-panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Top-level controls</p>
-                <h3>Segmentation settings</h3>
+          <section className="dataset-slicer-stats">
+            <article className="panel pipeline-card"><p className="eyebrow">SafeCutPoints</p><h3>{count(safe, "accepted_cutpoints")}</h3><p>{count(safe, "rejected_cutpoint_candidates")} rejected · {(count(safe, "acceptance_rate") * 100).toFixed(1)}% accepted</p></article>
+            <article className="panel pipeline-card"><p className="eyebrow">Candidate yield</p><h3>{count(clips, "candidate_review_clips")} clips</h3><p>{count(clips, "total_duration_sec").toFixed(1)} sec · {count(clips, "clips_needing_review")} review flagged</p></article>
+            <article className="panel pipeline-card"><p className="eyebrow">Rejected spans</p><h3>{count(clips, "rejected_spans")}</h3><p>Buffers or spans not assembled automatically.</p></article>
+          </section>
+
+          <JobActivityPanel title="Slicer terminal" job={activity(selectedRun, log)} maxLogLines={500} />
+
+          <section className="panel dataset-slicer-reasons">
+            <div className="panel-header"><div><p className="eyebrow">Diagnostics</p><h3>SafeCutPoint rejection reasons</h3></div></div>
+            <div>{rejectionReasons.length ? rejectionReasons.sort((a, b) => Number(b[1]) - Number(a[1])).map(([reason, value]) => <p key={reason}><strong>{reason.replace(/_/g, " ")}</strong><span>{String(value)}</span></p>) : <p>No SafeCutPoint diagnostics yet.</p>}</div>
+          </section>
+
+          <section className="panel dataset-slicer-candidates">
+            <div className="panel-header"><div><p className="eyebrow">Candidate review clips</p><h3>Listening grid</h3></div></div>
+            {!selectedRun ? (
+              <p>Select a dataset run to inspect candidate clips.</p>
+            ) : manifest.length === 0 ? (
+              <p>No candidate clips generated yet.</p>
+            ) : (
+              <div className="processing-run-list">
+                {manifest.map((clip) => {
+                  const clipId = textValue(clip, "id");
+                  const text = textValue(clip, "training_text");
+                  const needsReview = Boolean(clip.needs_review);
+                  const durationSec = Number(clip.duration_sec ?? 0);
+                  return (
+                    <article key={clipId} className="panel">
+                      <p className="eyebrow">{clipId}</p>
+                      <p><strong>{durationSec.toFixed(2)} sec</strong>{needsReview ? " · needs review" : ""}</p>
+                      <audio controls preload="none" src={buildCandidateReviewAudioUrl(selectedRun.id, clipId)} />
+                      <p>{text || "No transcript text recorded."}</p>
+                    </article>
+                  );
+                })}
               </div>
-            </div>
-            <div className="overview-control-grid">
-              <label>
-                <span>Target clip length</span>
-                <input
-                  className="search-input"
-                  type="number"
-                  min="1"
-                  max="30"
-                  value={settings.target_clip_length}
-                  onChange={(event) =>
-                    setSettings((current) => ({
-                      ...current,
-                      target_clip_length: Number(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>Maximum clip length</span>
-                <input
-                  className="search-input"
-                  type="number"
-                  min="1"
-                  max="60"
-                  value={settings.max_clip_length}
-                  onChange={(event) =>
-                    setSettings((current) => ({
-                      ...current,
-                      max_clip_length: Number(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>Segmentation sensitivity</span>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={settings.segmentation_sensitivity}
-                  onChange={(event) =>
-                    setSettings((current) => ({
-                      ...current,
-                      segmentation_sensitivity: Number(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-            </div>
-            <button className="ghost-button" type="button" onClick={() => setShowAdvanced((value) => !value)}>
-              {showAdvanced ? "Hide advanced" : "Show advanced"}
-            </button>
-            {showAdvanced ? (
-              <textarea
-                className="transcript-editor slicer-advanced-json"
-                value={advancedJson}
-                onChange={(event) => setAdvancedJson(event.target.value)}
-                rows={5}
-              />
-            ) : null}
+            )}
           </section>
-
-          <section className="pipeline-card-grid">
-            <article className="panel pipeline-card">
-              <p className="eyebrow">Run summary</p>
-              <h3>{selectedRun?.status ?? "No run"}</h3>
-              <p>Slices: {selectedRun?.summary.slices_created ?? 0}</p>
-              <p>Total duration: {formatDuration(selectedRun?.summary.total_sliced_duration)}</p>
-              <p>Average length: {selectedRun?.summary.average_slice_length?.toFixed(2) ?? "0.00"}s</p>
-            </article>
-            <article className="panel pipeline-card">
-              <p className="eyebrow">Range and preservation</p>
-              <h3>
-                {selectedRun
-                  ? `${selectedRun.summary.minimum_slice_length ?? 0}s - ${selectedRun.summary.maximum_slice_length ?? 0}s`
-                  : "No data"}
-              </h3>
-              <p>Preserved locked: {selectedRun?.summary.preserved_locked_slice_count ?? 0}</p>
-              <p>Dropped overlaps: {selectedRun?.summary.dropped_overlap_count ?? 0}</p>
-              <p>QC data: {selectedRun?.summary.downstream_qc_data_available ? "available" : "not available"}</p>
-            </article>
-          </section>
-
-          <JobActivityPanel title="Slicing activity" job={runToActivity(activeRun ?? selectedRun)} />
         </main>
 
-        <aside className="stage-sidebar panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Next stage</p>
-              <h3>QC handoff</h3>
-            </div>
-          </div>
-          <ul className="stage-list">
-            <li>
-              <strong>Prepared input</strong>
-              <span>{activeProject.active_prepared_output_group_id ?? "No active prepared output"}</span>
-            </li>
-            <li>
-              <strong>Selected run</strong>
-              <span>{selectedRun?.id ?? "Choose a completed run before opening QC"}</span>
-            </li>
-            {selectedRun?.warnings.map((warning) => (
-              <li key={warning}>
-                <strong>Warning</strong>
-                <span>{warning}</span>
-              </li>
-            ))}
-            {selectedRun?.is_stale ? (
-              <li>
-                <strong>Stale run</strong>
-                <span>{selectedRun.stale_reason ?? "ASR or alignment changed after this run."}</span>
-              </li>
-            ) : null}
-          </ul>
-          <button
-            className="primary-button pipeline-full-button"
-            type="button"
-            onClick={onOpenQc}
-            disabled={!selectedRun || selectedRun.status !== "completed" || selectedRun.is_stale}
-          >
-            Open QC
-          </button>
+        <aside className="panel processing-sidebar">
+          <div className="panel-header"><div><p className="eyebrow">Next stage</p><h3>QC handoff</h3></div></div>
+          <p>Candidate review clips are not final training clips. QC and native-rate export remain separate stages.</p>
+          <button className="primary-button" type="button" disabled={!selectedRun || manifest.length === 0 || selectedRun.status === "running"} onClick={onOpenQc}>Open QC</button>
         </aside>
       </div>
     </section>

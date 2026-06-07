@@ -13,8 +13,10 @@ import ExportPage from "./pages/ExportPage";
 import IngestPage from "./pages/IngestPage";
 import LabPage from "./pages/LabPage";
 import OverviewPage from "./pages/OverviewPage";
+import ProcessingPage from "./pages/ProcessingPage";
 import QcPage from "./pages/QcPage";
 import ReferencePage from "./pages/ReferencePage";
+import SpeakersPage from "./pages/SpeakersPage";
 import SlicerPage from "./pages/SlicerPage";
 import type { ClipLabItemRef, Project } from "./types";
 
@@ -52,7 +54,9 @@ const qcSortModes = ["source-order", "qc-score-ascending", "qc-score-descending"
 const stepDefinitions: StepDefinition[] = [
   { id: "ingest", label: "Ingest", shortLabel: "In", glyph: "I", tone: "Sources first" },
   { id: "overview", label: "Overview", shortLabel: "Ov", glyph: "O", tone: "Raw recordings and prep" },
-  { id: "slicer", label: "Slicer", shortLabel: "Sl", glyph: "S", tone: "Create candidate slice runs" },
+  { id: "speakers", label: "Speakers", shortLabel: "Sp", glyph: "S", tone: "Detect and choose the target voice" },
+  { id: "processing", label: "Processing", shortLabel: "Pr", glyph: "P", tone: "Align the selected speaker" },
+  { id: "slicer", label: "Slicer", shortLabel: "Sl", glyph: "C", tone: "Generate candidate review clips" },
   { id: "qc", label: "QC", shortLabel: "QC", glyph: "Q", tone: "Machine triage for one run" },
   { id: "lab", label: "Lab", shortLabel: "La", glyph: "L", tone: "Human review and override" },
   { id: "export", label: "Export", shortLabel: "Ex", glyph: "E", tone: "Emit training-ready data" },
@@ -95,6 +99,8 @@ function readPipelineSelectionFromSearch(
   searchParams: URLSearchParams,
   step: AppStep,
 ): PipelineSelectionState {
+  const processingRunId = searchParams.get("processingRun")?.trim() || null;
+  const speakersRunId = searchParams.get("speakersRun")?.trim() || null;
   const runId = searchParams.get("run")?.trim() || null;
   const qcRunId = searchParams.get("qc")?.trim() || null;
   const bucket = searchParams.get("bucket");
@@ -102,11 +108,13 @@ function readPipelineSelectionFromSearch(
   const keepThreshold = parseNullableThreshold(searchParams.get("keep") ?? searchParams.get("threshold"));
   const rejectThreshold = parseNullableThreshold(searchParams.get("reject"));
   const preset = searchParams.get("preset")?.trim() || null;
-  const selectedQcRun = runId && qcRunId ? { slicerRunId: runId, qcRunId } : null;
 
-  if (!runId) {
-    return initialPipelineSelection;
-  }
+  const selectedSpeakersRunId = step === "speakers" ? speakersRunId : null;
+  const selectedSlicerDatasetRunId = step === "slicer" ? runId : null;
+  const selectedQcDatasetRunId = step === "qc" ? runId : null;
+  const selectedLabDatasetRunId = step === "lab" ? runId : null;
+  const selectedQcRun =
+    runId && qcRunId && (step === "qc" || step === "lab") ? { datasetRunId: runId, qcRunId } : null;
 
   const hasHandoffParams =
     step === "lab" ||
@@ -117,20 +125,25 @@ function readPipelineSelectionFromSearch(
     preset !== null;
 
   return {
-    selectedSlicerRunId: runId,
+    selectedSpeakersRunId,
+    selectedProcessingRunId: processingRunId,
+    selectedSlicerDatasetRunId,
+    selectedQcDatasetRunId,
+    selectedLabDatasetRunId,
     selectedQcRun,
-    labHandoff: hasHandoffParams
-      ? {
-          source: "qc",
-          slicerRunId: runId,
-          qcRunId,
-          bucketFilter: isQcBucketFilter(bucket) ? bucket : "all",
-          sort: isQcSortMode(sort) ? sort : "source-order",
-          keepThreshold,
-          rejectThreshold,
-          preset,
-        }
-      : null,
+    labHandoff:
+      hasHandoffParams && runId
+        ? {
+            source: "qc",
+            datasetRunId: runId,
+            qcRunId,
+            bucketFilter: isQcBucketFilter(bucket) ? bucket : "all",
+            sort: isQcSortMode(sort) ? sort : "source-order",
+            keepThreshold,
+            rejectThreshold,
+            preset,
+          }
+        : null,
   };
 }
 
@@ -178,12 +191,27 @@ function writeRouteToLocation(
     url.searchParams.delete("clip_id");
   }
 
-  const routeUsesRunSelection = route.step === "slicer" || route.step === "qc" || route.step === "lab";
   const routeUsesQcSelection = route.step === "qc" || route.step === "lab";
   const routeUsesLabHandoff = route.step === "lab";
 
-  if (routeUsesRunSelection && pipelineSelection.selectedSlicerRunId) {
-    url.searchParams.set("run", pipelineSelection.selectedSlicerRunId);
+  if (route.step === "speakers" && pipelineSelection.selectedSpeakersRunId) {
+    url.searchParams.set("speakersRun", pipelineSelection.selectedSpeakersRunId);
+  } else {
+    url.searchParams.delete("speakersRun");
+  }
+
+  if (route.step === "processing" && pipelineSelection.selectedProcessingRunId) {
+    url.searchParams.set("processingRun", pipelineSelection.selectedProcessingRunId);
+  } else {
+    url.searchParams.delete("processingRun");
+  }
+
+  if (route.step === "slicer" && pipelineSelection.selectedSlicerDatasetRunId) {
+    url.searchParams.set("run", pipelineSelection.selectedSlicerDatasetRunId);
+  } else if (route.step === "qc" && pipelineSelection.selectedQcDatasetRunId) {
+    url.searchParams.set("run", pipelineSelection.selectedQcDatasetRunId);
+  } else if (route.step === "lab" && pipelineSelection.selectedLabDatasetRunId) {
+    url.searchParams.set("run", pipelineSelection.selectedLabDatasetRunId);
   } else {
     url.searchParams.delete("run");
   }
@@ -252,17 +280,33 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
     };
   }
 
-  if (step === "slicer") {
+  if (step === "speakers") {
     return {
       eyebrow: "Step 03",
+      title: "Speakers",
+      description: "Run speech detection and diarization, audition samples, and choose the target voice.",
+    };
+  }
+
+  if (step === "slicer") {
+    return {
+      eyebrow: "Step 05",
       title: "Slicer",
-      description: "Create and inspect candidate slice runs over prepared recordings.",
+      description: "Generate candidate review clips from aligned runs and tune SafeCutPoint assembly.",
+    };
+  }
+
+  if (step === "processing") {
+    return {
+      eyebrow: "Step 04",
+      title: "Processing",
+      description: "Process the chosen speaker through buffers, ASR, MFA, and alignment QC before slicing.",
     };
   }
 
   if (step === "qc") {
     return {
-      eyebrow: "Step 04",
+      eyebrow: "Step 06",
       title: "QC",
       description: "Run machine triage for one selected slicer run without claiming human approval.",
     };
@@ -270,7 +314,7 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
 
   if (step === "lab") {
     return {
-      eyebrow: "Step 05",
+      eyebrow: "Step 07",
       title: activeProject?.name ?? "Lab",
       description: "Manual slice review, transcript repair, and human overrides live here.",
     };
@@ -286,7 +330,7 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
   }
 
   return {
-    eyebrow: "Step 06",
+    eyebrow: "Step 08",
     title: "Export",
     description: "Emit the selected reviewed or machine-triaged dataset for downstream training.",
   };
@@ -395,23 +439,83 @@ export default function App() {
     writeRouteToLocation(nextRoute, initialPipelineSelection);
   }
 
-  function selectSlicerRun(runId: string | null) {
+  function selectProcessingRun(runId: string | null) {
     const nextPipelineSelection: PipelineSelectionState = {
-      selectedSlicerRunId: runId,
+      ...pipelineSelection,
+      selectedProcessingRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-processing-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectSpeakersRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedSpeakersRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-speakers-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectSlicerDatasetRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedSlicerDatasetRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-slicer-dataset-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectQcDatasetRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedQcDatasetRunId: runId,
       selectedQcRun: null,
       labHandoff: null,
     };
-    dispatchPipelineSelection({ type: "select-slicer-run", runId });
+    dispatchPipelineSelection({ type: "select-qc-dataset-run", runId });
     writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectLabDatasetRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedLabDatasetRunId: runId,
+      labHandoff: null,
+    };
+    dispatchPipelineSelection({ type: "select-lab-dataset-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function openSlicerWithRun(runId: string) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedSlicerDatasetRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-slicer-dataset-run", runId });
+    const nextRoute = { step: "slicer" as const, projectId: route.projectId, clipItem: route.clipItem };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute, nextPipelineSelection);
+  }
+
+  function openProcessingWithRun(runId: string) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedProcessingRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-processing-run", runId });
+    const nextRoute = { step: "processing" as const, projectId: route.projectId, clipItem: route.clipItem };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute, nextPipelineSelection);
   }
 
   function selectQcRun(qcRunId: string | null) {
     const nextPipelineSelection: PipelineSelectionState =
-      pipelineSelection.selectedSlicerRunId && qcRunId
+      pipelineSelection.selectedQcDatasetRunId && qcRunId
         ? {
             ...pipelineSelection,
             selectedQcRun: {
-              slicerRunId: pipelineSelection.selectedSlicerRunId,
+              datasetRunId: pipelineSelection.selectedQcDatasetRunId,
               qcRunId,
             },
             labHandoff: null,
@@ -428,9 +532,9 @@ export default function App() {
   function setPipelineLabHandoff(handoff: LabHandoffContext | null) {
     const handoffMatchesSelection =
       !handoff ||
-      (handoff.slicerRunId === pipelineSelection.selectedSlicerRunId &&
+      (handoff.datasetRunId === pipelineSelection.selectedLabDatasetRunId &&
         (!handoff.qcRunId ||
-          (pipelineSelection.selectedQcRun?.slicerRunId === handoff.slicerRunId &&
+          (pipelineSelection.selectedQcRun?.datasetRunId === handoff.datasetRunId &&
             pipelineSelection.selectedQcRun.qcRunId === handoff.qcRunId)));
 
     if (!handoffMatchesSelection) {
@@ -466,6 +570,22 @@ export default function App() {
     pageContent = <IngestPage {...pageProps} onImportComplete={handleImportComplete} />;
   } else if (route.step === "overview") {
     pageContent = <OverviewPage {...pageProps} />;
+  } else if (route.step === "speakers") {
+    pageContent = (
+      <SpeakersPage
+        {...pageProps}
+        onOpenProcessing={() => navigate("processing")}
+        onOpenProcessingWithRun={openProcessingWithRun}
+      />
+    );
+  } else if (route.step === "processing") {
+    pageContent = (
+      <ProcessingPage
+        {...pageProps}
+        onOpenSpeakers={() => navigate("speakers")}
+        onOpenSlicerWithRun={openSlicerWithRun}
+      />
+    );
   } else if (route.step === "slicer") {
     pageContent = <SlicerPage {...pageProps} onOpenQc={() => navigate("qc")} />;
   } else if (route.step === "qc") {
@@ -552,11 +672,19 @@ export default function App() {
       <section className="workstation-stage">
         {projectLoadError ? <p className="shell-notice shell-notice-error">{projectLoadError}</p> : null}
         <PipelineProvider
-          selectedSlicerRunId={pipelineSelection.selectedSlicerRunId}
+          selectedSpeakersRunId={pipelineSelection.selectedSpeakersRunId}
+          selectedProcessingRunId={pipelineSelection.selectedProcessingRunId}
+          selectedSlicerDatasetRunId={pipelineSelection.selectedSlicerDatasetRunId}
+          selectedQcDatasetRunId={pipelineSelection.selectedQcDatasetRunId}
+          selectedLabDatasetRunId={pipelineSelection.selectedLabDatasetRunId}
           selectedQcRun={pipelineSelection.selectedQcRun}
           selectedQcRunId={pipelineSelection.selectedQcRun?.qcRunId ?? null}
           labHandoff={pipelineSelection.labHandoff}
-          selectSlicerRun={selectSlicerRun}
+          selectSpeakersRun={selectSpeakersRun}
+          selectProcessingRun={selectProcessingRun}
+          selectSlicerDatasetRun={selectSlicerDatasetRun}
+          selectQcDatasetRun={selectQcDatasetRun}
+          selectLabDatasetRun={selectLabDatasetRun}
           selectQcRun={selectQcRun}
           setLabHandoff={setPipelineLabHandoff}
           resetPipelineSelection={() => {

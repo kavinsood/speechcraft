@@ -96,6 +96,9 @@ make dev-frontend
 ```
 
 `make dev-backend` starts both the FastAPI API and the processing worker. The worker is required for preparation, ASR, alignment, and slicer jobs.
+If the local MFA conda env exists at `~/.conda/envs/speechcraft-mfa/bin/mfa`,
+the Makefile auto-exports it for dataset-worker alignment runs.
+The combined backend/API dev output is also written to `backend/logs/dev-backend.log`.
 
 ## URLs
 

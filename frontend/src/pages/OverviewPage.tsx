@@ -5,16 +5,12 @@ import {
   fetchProjectPreparationJobs,
   fetchProjectRecordings,
   runProjectPreparation,
-  runProjectAlignment,
-  runProjectTranscription,
 } from "../api";
 import JobActivityPanel, { type JobActivity } from "../components/JobActivityPanel";
 import type {
   PreparationSettings,
   ProcessingJob,
   Project,
-  ProjectAlignmentSettings,
-  ProjectTranscriptionSettings,
   SourceRecordingQueue,
 } from "../types";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
@@ -27,28 +23,10 @@ type OverviewPageProps = {
 };
 
 type RecordingLoadStatus = "idle" | "loading" | "ready" | "error";
-type SourceBatchKind = "asr" | "alignment";
-
-type SourceBatchState = {
-  kind: SourceBatchKind;
-  jobs: ProcessingJob[];
-};
 
 const defaultPrepSettings: PreparationSettings = {
   target_sample_rate: 24000,
   channel_mode: "mono",
-};
-
-const defaultTranscriptionSettings: ProjectTranscriptionSettings = {
-  model_size: "turbo",
-  batch_size: 8,
-  initial_prompt: "",
-};
-
-const defaultAlignmentSettings: ProjectAlignmentSettings = {
-  acoustic_model: "Wav2Vec2-Large-Robust-960h",
-  text_normalization_strategy: "loose",
-  batch_size: 8,
 };
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -139,29 +117,13 @@ function jobToActivity(job: ProcessingJob, fallbackName: string): JobActivity {
     startedAt: job.started_at ?? job.created_at,
     completedAt: job.completed_at,
     progressLabel:
-      job.kind === "source_transcription"
-        ? job.status === "completed"
-          ? "ASR transcript created"
-          : job.status === "failed"
-            ? job.error_message ?? "ASR failed"
-            : job.status === "pending"
-              ? "Queued for worker"
-              : "Transcribing"
-        : job.kind === "source_alignment"
-          ? job.status === "completed"
-            ? "Alignment created"
-            : job.status === "failed"
-              ? job.error_message ?? "Alignment failed"
-              : job.status === "pending"
-                ? "Queued for worker"
-                : "Aligning"
-          : job.status === "completed"
-            ? "Prepared output created"
-            : job.status === "failed"
-              ? job.error_message ?? "Preparation failed"
-              : job.status === "pending"
-                ? "Queued for worker"
-                : "Preparation running",
+      job.status === "completed"
+        ? "Prepared output created"
+        : job.status === "failed"
+          ? job.error_message ?? "Preparation failed"
+          : job.status === "pending"
+            ? "Queued for worker"
+            : "Preparation running",
     logs:
       logs.length > 0
         ? logs
@@ -180,53 +142,6 @@ function jobToActivity(job: ProcessingJob, fallbackName: string): JobActivity {
   };
 }
 
-function sourceBatchToActivity(batch: SourceBatchState): JobActivity {
-  const jobs = batch.jobs;
-  const total = jobs.length;
-  const completed = jobs.filter((job) => job.status === "completed").length;
-  const failed = jobs.filter((job) => job.status === "failed").length;
-  const running = jobs.filter((job) => job.status === "running").length;
-  const queued = jobs.filter((job) => job.status === "pending").length;
-  const terminal = completed + failed;
-  const state =
-    failed > 0
-      ? "failed"
-      : terminal === total && total > 0
-        ? "completed"
-        : "running";
-  const startedValues = jobs
-    .map((job) => job.started_at ?? job.created_at)
-    .filter((value): value is string => Boolean(value));
-  const completedValues = jobs
-    .map((job) => job.completed_at)
-    .filter((value): value is string => Boolean(value));
-  const title = batch.kind === "asr" ? "ASR batch" : "Alignment batch";
-  const action = batch.kind === "asr" ? "ASR" : "Alignment";
-
-  return {
-    id: `${batch.kind}-${jobs.map((job) => job.id).join("-")}`,
-    name: title,
-    type: "preparation",
-    state,
-    startedAt: startedValues.sort()[0] ?? null,
-    completedAt:
-      terminal === total && total > 0
-        ? completedValues.sort()[Math.max(0, completedValues.length - 1)] ?? null
-        : null,
-    progressLabel: `${completed} of ${total} completed, ${running} running, ${queued} queued${
-      failed ? `, ${failed} failed` : ""
-    }`,
-    logs: jobs.map((job, index) => ({
-      id: `${job.id}-batch-status`,
-      timestamp: String(index + 1).padStart(2, "0"),
-      message:
-        job.status === "failed"
-          ? `${job.source_recording_id ?? job.id}: ${job.error_message ?? `${action} failed`}`
-          : `${job.source_recording_id ?? job.id}: ${job.status}`,
-    })),
-  };
-}
-
 export default function OverviewPage({
   activeProject,
   projectLoadStatus,
@@ -237,11 +152,7 @@ export default function OverviewPage({
   const [recordingError, setRecordingError] = useState<string | null>(null);
   const [recordings, setRecordings] = useState<SourceRecordingQueue[]>([]);
   const [prepJobs, setPrepJobs] = useState<ProcessingJob[]>([]);
-  const [sourceBatch, setSourceBatch] = useState<SourceBatchState | null>(null);
   const [prepSettings, setPrepSettings] = useState<PreparationSettings>(defaultPrepSettings);
-  const [transcriptionSettings, setTranscriptionSettings] =
-    useState<ProjectTranscriptionSettings>(defaultTranscriptionSettings);
-  const [alignmentSettings, setAlignmentSettings] = useState<ProjectAlignmentSettings>(defaultAlignmentSettings);
 
   async function loadRecordings(projectId: string) {
     setRecordingStatus((current) => (current === "ready" ? current : "loading"));
@@ -266,7 +177,6 @@ export default function OverviewPage({
   useEffect(() => {
     setRecordings([]);
     setPrepJobs([]);
-    setSourceBatch(null);
     setRecordingError(null);
     if (!activeProject) {
       setRecordingStatus("idle");
@@ -280,34 +190,6 @@ export default function OverviewPage({
     () => prepJobs.find((job) => job.status === "pending" || job.status === "running") ?? null,
     [prepJobs],
   );
-  const fallbackSourceJobs = useMemo(
-    () =>
-      recordings
-        .map((recording) => recording.active_job)
-        .filter((job): job is ProcessingJob => Boolean(job)),
-    [recordings],
-  );
-  const sourceBatchForActivity = useMemo<SourceBatchState | null>(
-    () =>
-      sourceBatch ??
-      (fallbackSourceJobs.length > 0
-        ? {
-            kind: fallbackSourceJobs.some((job) => job.kind === "source_alignment")
-              ? "alignment"
-              : "asr",
-            jobs: fallbackSourceJobs,
-          }
-        : null),
-    [fallbackSourceJobs, sourceBatch],
-  );
-  const activeSourceJobs = useMemo(
-    () =>
-      (sourceBatchForActivity?.jobs ?? []).filter((job) =>
-        ["pending", "running"].includes(job.status),
-      ),
-    [sourceBatchForActivity],
-  );
-
   useEffect(() => {
     if (!activeProject || !activePrepJob) {
       return;
@@ -334,54 +216,6 @@ export default function OverviewPage({
       window.clearInterval(intervalId);
     };
   }, [activeProject, activePrepJob?.id, onRetryProjects]);
-
-  useEffect(() => {
-    if (!activeProject || activeSourceJobs.length === 0) {
-      return;
-    }
-
-    let cancelled = false;
-    let timeoutId: number | null = null;
-    const poll = async () => {
-      try {
-        const jobs = await Promise.all(
-          (sourceBatchForActivity?.jobs ?? activeSourceJobs).map((job) => fetchProcessingJob(job.id)),
-        );
-        if (cancelled) {
-          return;
-        }
-        const batchKind: SourceBatchKind = jobs.some((job) => job.kind === "source_alignment")
-          ? "alignment"
-          : "asr";
-        setSourceBatch({ kind: sourceBatchForActivity?.kind ?? batchKind, jobs });
-        if (jobs.every((job) => job.status === "completed" || job.status === "failed")) {
-          await loadRecordings(activeProject.id);
-          onRetryProjects();
-          return;
-        }
-      } catch {
-        if (!cancelled) {
-          await loadRecordings(activeProject.id);
-        }
-      }
-      if (!cancelled) {
-        timeoutId = window.setTimeout(() => {
-          void poll();
-        }, 2000);
-      }
-    };
-
-    timeoutId = window.setTimeout(() => {
-      void poll();
-    }, 2000);
-
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
-    };
-  }, [activeProject, activeSourceJobs.map((job) => job.id).join(","), onRetryProjects, sourceBatchForActivity]);
 
   const rawRecordings = useMemo(
     () => recordings.filter((recording) => !recording.parent_recording_id),
@@ -440,30 +274,6 @@ export default function OverviewPage({
     channelCounts.length > 1 ? "Mixed channel counts across imported recordings." : null,
     prepIsStale ? "Preparation settings changed after the latest prepared output." : null,
   ].filter((warning): warning is string => Boolean(warning));
-  const preparedScope = latestPreparedGroup?.[1] ?? [];
-  const preparedTranscribedCount = preparedScope.filter((recording) =>
-    ["ok", "patched"].includes(recording.artifact?.transcript_status ?? ""),
-  ).length;
-  const preparedAlignedCount = preparedScope.filter(
-    (recording) => recording.artifact?.alignment_status === "ok",
-  ).length;
-  const hasPreparedScope = preparedScope.length > 0;
-  const transcriptionActive = recordings.some(
-    (recording) =>
-      recording.active_job?.kind === "source_transcription" &&
-      ["pending", "running"].includes(recording.active_job.status),
-  );
-  const alignmentActive = recordings.some(
-    (recording) =>
-      recording.active_job?.kind === "source_alignment" &&
-      ["pending", "running"].includes(recording.active_job.status),
-  );
-  const canRunAlignment =
-    hasPreparedScope &&
-    !transcriptionActive &&
-    !alignmentActive &&
-    preparedTranscribedCount === preparedScope.length;
-
   async function handleRunPreparation() {
     if (!activeProject) {
       return;
@@ -482,65 +292,6 @@ export default function OverviewPage({
           input_payload: prepSettings,
           output_payload: null,
           error_message: getErrorMessage(error, "Preparation request failed."),
-          created_at: failedAt,
-          completed_at: failedAt,
-        },
-        ...current,
-      ]);
-    }
-  }
-
-  async function handleRunTranscription() {
-    if (!activeProject) {
-      return;
-    }
-    try {
-      const result = await runProjectTranscription(activeProject.id, {
-        ...transcriptionSettings,
-        batch_size: Math.max(1, Math.floor(transcriptionSettings.batch_size)),
-        initial_prompt: transcriptionSettings.initial_prompt?.trim() || null,
-      });
-      setSourceBatch({ kind: "asr", jobs: result.jobs });
-      await loadRecordings(activeProject.id);
-    } catch (error) {
-      const failedAt = new Date().toISOString();
-      setPrepJobs((current) => [
-        {
-          id: `asr-request-failed-${Date.now()}`,
-          kind: "source_transcription",
-          status: "failed",
-          input_payload: transcriptionSettings,
-          output_payload: null,
-          error_message: getErrorMessage(error, "ASR request failed."),
-          created_at: failedAt,
-          completed_at: failedAt,
-        },
-        ...current,
-      ]);
-    }
-  }
-
-  async function handleRunAlignment() {
-    if (!activeProject) {
-      return;
-    }
-    try {
-      const result = await runProjectAlignment(activeProject.id, {
-        ...alignmentSettings,
-        batch_size: Math.max(1, Math.floor(alignmentSettings.batch_size)),
-      });
-      setSourceBatch({ kind: "alignment", jobs: result.jobs });
-      await loadRecordings(activeProject.id);
-    } catch (error) {
-      const failedAt = new Date().toISOString();
-      setPrepJobs((current) => [
-        {
-          id: `alignment-request-failed-${Date.now()}`,
-          kind: "source_alignment",
-          status: "failed",
-          input_payload: alignmentSettings,
-          output_payload: null,
-          error_message: getErrorMessage(error, "Alignment request failed."),
           created_at: failedAt,
           completed_at: failedAt,
         },
@@ -700,145 +451,9 @@ export default function OverviewPage({
             </button>
           </section>
 
-          <section className="panel overview-prep-panel">
-            <div className="panel-header">
-              <div>
-                <p className="eyebrow">Speech metadata</p>
-                <h3>ASR and alignment</h3>
-              </div>
-            </div>
-            <div className="overview-control-grid">
-              <label>
-                <span>ASR model size</span>
-                <select
-                  value={transcriptionSettings.model_size}
-                  onChange={(event) =>
-                    setTranscriptionSettings((current) => ({
-                      ...current,
-                      model_size: event.target.value as ProjectTranscriptionSettings["model_size"],
-                    }))
-                  }
-                >
-                  <option value="base">base</option>
-                  <option value="small">small</option>
-                  <option value="medium">medium</option>
-                  <option value="large-v3">large-v3</option>
-                  <option value="turbo">turbo</option>
-                </select>
-              </label>
-              <label>
-                <span>ASR batch size</span>
-                <input
-                  className="search-input"
-                  type="number"
-                  min="1"
-                  max="128"
-                  value={transcriptionSettings.batch_size}
-                  onChange={(event) =>
-                    setTranscriptionSettings((current) => ({
-                      ...current,
-                      batch_size: Number(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>Alignment model</span>
-                <select
-                  value={alignmentSettings.acoustic_model}
-                  onChange={(event) =>
-                    setAlignmentSettings((current) => ({
-                      ...current,
-                      acoustic_model: event.target.value,
-                    }))
-                  }
-                >
-                  <option value="Wav2Vec2-Large-Robust-960h">Wav2Vec2-Large-Robust-960h</option>
-                  <option value="torchaudio_forced_align_worker">Torchaudio forced align worker</option>
-                </select>
-              </label>
-              <label>
-                <span>Text normalization</span>
-                <select
-                  value={alignmentSettings.text_normalization_strategy}
-                  onChange={(event) =>
-                    setAlignmentSettings((current) => ({
-                      ...current,
-                      text_normalization_strategy:
-                        event.target.value as ProjectAlignmentSettings["text_normalization_strategy"],
-                    }))
-                  }
-                >
-                  <option value="strict">strict</option>
-                  <option value="loose">loose</option>
-                  <option value="spoken_form">spoken form</option>
-                </select>
-              </label>
-              <label>
-                <span>Alignment batch size</span>
-                <input
-                  className="search-input"
-                  type="number"
-                  min="1"
-                  max="128"
-                  value={alignmentSettings.batch_size}
-                  onChange={(event) =>
-                    setAlignmentSettings((current) => ({
-                      ...current,
-                      batch_size: Number(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>Initial prompt</span>
-                <textarea
-                  className="search-input overview-textarea"
-                  value={transcriptionSettings.initial_prompt ?? ""}
-                  onChange={(event) =>
-                    setTranscriptionSettings((current) => ({
-                      ...current,
-                      initial_prompt: event.target.value,
-                    }))
-                  }
-                  placeholder="Optional Whisper style prompt"
-                />
-              </label>
-            </div>
-            <div className="overview-prep-actions">
-              <button
-                className="primary-button"
-                type="button"
-                onClick={handleRunTranscription}
-                disabled={!hasPreparedScope || Boolean(activePrepJob) || transcriptionActive || alignmentActive}
-              >
-                Run ASR
-              </button>
-              <button
-                className="primary-button"
-                type="button"
-                onClick={handleRunAlignment}
-                disabled={!canRunAlignment || Boolean(activePrepJob)}
-              >
-                Run alignment
-              </button>
-              <span>
-                {hasPreparedScope
-                  ? `${preparedTranscribedCount}/${preparedScope.length} transcribed, ${preparedAlignedCount}/${preparedScope.length} aligned`
-                  : "Create prepared output before ASR and alignment."}
-              </span>
-            </div>
-          </section>
-
           <JobActivityPanel
             title="Preparation activity"
-            job={
-              sourceBatchForActivity
-                ? sourceBatchToActivity(sourceBatchForActivity)
-                : prepJobs[0]
-                  ? jobToActivity(prepJobs[0], "Preparation")
-                  : null
-            }
+            job={prepJobs[0] ? jobToActivity(prepJobs[0], "Preparation") : null}
           />
         </main>
 

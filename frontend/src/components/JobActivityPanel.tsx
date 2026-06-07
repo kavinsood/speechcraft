@@ -9,7 +9,7 @@ export type JobActivityLogLine = {
 export type JobActivity = {
   id: string;
   name: string;
-  type: "preparation" | "slicing" | "qc" | "export" | "mock";
+  type: "preparation" | "processing" | "slicing" | "qc" | "export" | "mock";
   state: JobActivityState;
   startedAt?: string | null;
   completedAt?: string | null;

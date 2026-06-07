@@ -158,8 +158,8 @@ export default function LabelPage({
         if (cancelled) {
           return;
         }
-        if (run.slicer_run_id !== labHandoff.slicerRunId || run.project_id !== activeProject?.id) {
-          setHandoffNotice("QC handoff did not match this project and slicer run. Showing source-order Lab queue.");
+        if (run.slicer_run_id !== labHandoff.datasetRunId || run.project_id !== activeProject?.id) {
+          setHandoffNotice("QC handoff did not match this project and dataset run. Showing source-order Lab queue.");
           return;
         }
         setHandoffQcRun(run);
@@ -175,7 +175,7 @@ export default function LabelPage({
     return () => {
       cancelled = true;
     };
-  }, [activeProject?.id, labHandoff?.qcRunId, labHandoff?.slicerRunId]);
+  }, [activeProject?.id, labHandoff?.qcRunId, labHandoff?.datasetRunId]);
 
   function getWorkspaceEmptyMessage(nextSlices: SliceSummary[], nextRecordings: SourceRecordingQueue[]): string | null {
     if (nextSlices.length > 0) {

@@ -46,8 +46,12 @@ button {
 }
 
 button:disabled {
-  cursor: wait;
+  cursor: not-allowed;
   opacity: 0.7;
+}
+
+button:disabled.is-busy {
+  cursor: wait;
 }
 
 #root {
@@ -2174,6 +2178,290 @@ button:disabled {
   resize: vertical;
 }
 
+.processing-page {
+  display: grid;
+  gap: 1rem;
+}
+
+.processing-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.85rem 1rem;
+  border: 1px solid rgba(31, 95, 102, 0.2);
+  border-radius: 0.9rem;
+  background: rgba(226, 242, 243, 0.84);
+  color: #244953;
+}
+
+.processing-topline div,
+.processing-main,
+.processing-sidebar {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.processing-topline p,
+.processing-topline span {
+  margin: 0;
+}
+
+.processing-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.processing-sidebar,
+.processing-controls,
+.processing-artifacts {
+  padding: 1rem;
+}
+
+.processing-source-list,
+.processing-run-list {
+  display: grid;
+  gap: 0.55rem;
+  max-height: 19rem;
+  overflow: auto;
+}
+
+.processing-source-list label,
+.processing-run-list button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: start;
+  padding: 0.7rem;
+  border: 1px solid rgba(97, 91, 74, 0.13);
+  border-radius: 0.65rem;
+  background: rgba(246, 242, 233, 0.76);
+  color: #253339;
+}
+
+.processing-source-list span,
+.processing-run-list button {
+  text-align: left;
+}
+
+.processing-source-list span,
+.processing-run-list button,
+.processing-run-list button span {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.processing-source-list small,
+.processing-run-list span,
+.processing-artifacts small {
+  color: #66757c;
+}
+
+.processing-run-list button[aria-pressed="true"] {
+  border-color: rgba(31, 95, 102, 0.55);
+  background: rgba(226, 242, 243, 0.92);
+}
+
+.processing-run-header {
+  margin-top: 0.6rem;
+}
+
+.processing-stage-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.processing-stage-strip span {
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  background: rgba(31, 95, 102, 0.12);
+  color: #1f5f66;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.processing-stage-strip .disabled {
+  background: rgba(94, 101, 95, 0.1);
+  color: #6a726d;
+}
+
+.processing-quick-settings,
+.processing-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.processing-settings-section {
+  display: grid;
+  gap: 0.7rem;
+  padding: 0.7rem;
+  border: 1px solid rgba(31, 95, 102, 0.16);
+  border-radius: 0.75rem;
+  background: rgba(255, 252, 246, 0.68);
+}
+
+.processing-settings-section summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  cursor: pointer;
+  color: #253339;
+  font-weight: 800;
+}
+
+.processing-settings-section summary small,
+.processing-settings-group small {
+  color: #66757c;
+  font-weight: 600;
+}
+
+.processing-settings-group {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.processing-settings-group > div:first-child {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.processing-nemo-disabled {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px dashed rgba(94, 101, 95, 0.25);
+  border-radius: 0.7rem;
+  opacity: 0.72;
+}
+
+.processing-nemo-disabled legend {
+  padding: 0 0.35rem;
+  color: #66757c;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.processing-nemo-disabled label {
+  display: grid;
+  gap: 0.25rem;
+  color: #66757c;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.processing-fixed-rule {
+  background: rgba(226, 242, 243, 0.72);
+}
+
+.processing-setting {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.65rem;
+  border: 1px solid rgba(97, 91, 74, 0.11);
+  border-radius: 0.65rem;
+  background: rgba(246, 242, 233, 0.72);
+  color: #42565e;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.processing-setting input,
+.processing-setting select {
+  width: 100%;
+  min-width: 0;
+}
+
+.processing-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.processing-input-row small {
+  color: #66757c;
+}
+
+.processing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  align-items: center;
+  color: #66757c;
+}
+
+.processing-handoff {
+  margin-top: 0.35rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.processing-handoff p {
+  margin: 0;
+  flex: 1 1 100%;
+  color: #9eb0b8;
+}
+
+.processing-artifacts ul {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.processing-artifacts li {
+  display: grid;
+  gap: 0.18rem;
+  padding: 0.65rem;
+  border: 1px solid rgba(97, 91, 74, 0.11);
+  border-radius: 0.6rem;
+  background: rgba(246, 242, 233, 0.72);
+  word-break: break-word;
+}
+
+.dataset-slicer-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(210px, 260px);
+  gap: 1rem;
+  align-items: start;
+}
+
+.dataset-slicer-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.dataset-slicer-reasons {
+  padding: 1rem;
+}
+
+.dataset-slicer-reasons > div:last-child {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.dataset-slicer-reasons p {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.7rem;
+  margin: 0;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid rgba(97, 91, 74, 0.11);
+  border-radius: 0.55rem;
+  background: rgba(246, 242, 233, 0.72);
+}
 @media (max-width: 1080px) {
   .shell-header,
   .step-page-header,
@@ -2197,6 +2485,8 @@ button:disabled {
   }
 
   .stage-layout,
+  .processing-layout,
+  .dataset-slicer-layout,
   .workspace-grid {
     grid-template-columns: 1fr;
   }
@@ -2212,6 +2502,9 @@ button:disabled {
   .ingest-action-grid,
   .pipeline-card-grid,
   .overview-control-grid,
+  .processing-settings-grid,
+  .processing-nemo-disabled,
+  .dataset-slicer-stats,
   .resolve-dock-items {
     grid-template-columns: 1fr 1fr;
   }
@@ -2276,6 +2569,11 @@ button:disabled {
   .ingest-action-grid,
   .pipeline-card-grid,
   .overview-control-grid,
+  .processing-settings-grid,
+  .processing-nemo-disabled,
+  .processing-artifacts ul,
+  .dataset-slicer-stats,
+  .dataset-slicer-reasons > div:last-child,
   .job-meta-grid,
   .resolve-dock-items {
     grid-template-columns: 1fr;

@@ -1,5 +1,12 @@
 import type {
   ClipLabItem,
+  DatasetPreflight,
+  DatasetSpeakerResults,
+  DatasetRun,
+  DatasetRunCreateRequest,
+  DatasetRunLog,
+  DatasetSpeakerSelection,
+  DatasetSlicerResults,
   ExportPreview,
   ExportRun,
   ImportBatch,
@@ -20,15 +27,12 @@ import type {
   ReviewStatus,
   Slice,
   SliceSummary,
-  SlicerRun,
-  SlicerRunDeleteResult,
-  SlicerRunRequest,
   SourceRecording,
   SourceRecordingQueue,
   WaveformPeaks,
 } from "./types";
 
-export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8010";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -40,6 +44,23 @@ export class ApiError extends Error {
     this.status = status;
     this.url = url;
   }
+}
+
+function backendUnreachableMessage(): string {
+  return `Backend API is unreachable at ${API_BASE}. Restart make dev-backend, then refresh.`;
+}
+
+async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(input, init);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new ApiError(backendUnreachableMessage(), 0, input);
+    }
+    throw error;
+  }
+  return await parseJson<T>(response);
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
@@ -94,38 +115,33 @@ export function buildReferenceCandidateAudioUrl(runId: string, candidateId: stri
 }
 
 export async function fetchHealthStrict(): Promise<{ status: string }> {
-  const response = await fetch(`${API_BASE}/healthz`);
-  return await parseJson<{ status: string }>(response);
+  return await requestJson<{ status: string }>(`${API_BASE}/healthz`);
 }
 
 export async function fetchProjects(): Promise<ImportBatch[]> {
-  const response = await fetch(`${API_BASE}/api/projects`);
-  return await parseJson<ImportBatch[]>(response);
+  return await requestJson<ImportBatch[]>(`${API_BASE}/api/projects`);
 }
 
 export async function fetchProject(projectId: string): Promise<ImportBatch> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}`);
-  return await parseJson<ImportBatch>(response);
+  return await requestJson<ImportBatch>(`${API_BASE}/api/projects/${projectId}`);
 }
 
 export async function createImportBatch(payload: { id: string; name: string }): Promise<ImportBatch> {
-  const response = await fetch(`${API_BASE}/api/import-batches`, {
+  return await requestJson<ImportBatch>(`${API_BASE}/api/import-batches`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
   });
-  return await parseJson<ImportBatch>(response);
 }
 
 export async function deleteProject(
   projectId: string,
 ): Promise<{ project_id: string; deleted_file_count: number }> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}`, {
+  return await requestJson<{ project_id: string; deleted_file_count: number }>(`${API_BASE}/api/projects/${projectId}`, {
     method: "DELETE",
   });
-  return await parseJson<{ project_id: string; deleted_file_count: number }>(response);
 }
 
 export function uploadProjectSourceRecording(
@@ -176,8 +192,84 @@ export async function fetchProjectSlices(projectId: string): Promise<SliceSummar
 }
 
 export async function fetchProjectSourceRecordings(projectId: string): Promise<SourceRecording[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/source-recordings`);
-  return await parseJson<SourceRecording[]>(response);
+  return await requestJson<SourceRecording[]>(`${API_BASE}/api/projects/${projectId}/source-recordings`);
+}
+
+export async function fetchDatasetPreflight(): Promise<DatasetPreflight> {
+  return await requestJson<DatasetPreflight>(`${API_BASE}/api/system/preflight`);
+}
+
+export async function fetchProjectDatasetRuns(projectId: string): Promise<DatasetRun[]> {
+  return await requestJson<DatasetRun[]>(`${API_BASE}/api/projects/${projectId}/dataset-runs`);
+}
+
+export async function createProjectDatasetRun(
+  projectId: string,
+  payload: DatasetRunCreateRequest,
+): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/projects/${projectId}/dataset-runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function startDatasetRun(runId: string): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/start`, { method: "POST" });
+}
+
+export async function refreshDatasetRun(runId: string): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/refresh`, { method: "POST" });
+}
+
+export async function fetchDatasetRunLog(runId: string): Promise<DatasetRunLog> {
+  return await requestJson<DatasetRunLog>(`${API_BASE}/api/dataset-runs/${runId}/log`);
+}
+
+export async function fetchDatasetSpeakerResults(runId: string): Promise<DatasetSpeakerResults> {
+  return await requestJson<DatasetSpeakerResults>(`${API_BASE}/api/dataset-runs/${runId}/speakers`);
+}
+
+export async function saveDatasetSpeakerSelection(
+  runId: string,
+  targetSpeakerId: string,
+): Promise<DatasetSpeakerSelection> {
+  return await requestJson<DatasetSpeakerSelection>(`${API_BASE}/api/dataset-runs/${runId}/speaker-selection`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_speaker_id: targetSpeakerId }),
+  });
+}
+
+export async function resumeDatasetRunProcessing(
+  runId: string,
+  stopAfter: "buffers" | "normalization" | "mfa" | "alignment_qc" = "alignment_qc",
+): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/resume-processing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stop_after: stopAfter }),
+  });
+}
+
+export async function rerunDatasetSlicer(runId: string, config: Record<string, unknown>): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/slicer-rerun`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+}
+
+export async function fetchDatasetSlicerResults(runId: string): Promise<DatasetSlicerResults> {
+  return await requestJson<DatasetSlicerResults>(`${API_BASE}/api/dataset-runs/${runId}/slicer-results`);
+}
+
+export function buildCandidateReviewAudioUrl(runId: string, clipId: string): string {
+  return `${API_BASE}/media/dataset-runs/${runId}/candidate-review/${clipId}.wav`;
+}
+
+export function buildSpeakerSampleAudioUrl(runId: string, sampleId: string): string {
+  return `${API_BASE}/media/dataset-runs/${runId}/speaker-samples/${sampleId}.wav`;
 }
 
 export async function fetchProjectReferenceAssets(
@@ -316,35 +408,6 @@ export async function fetchProjectPreparationJobs(projectId: string): Promise<Pr
 export async function fetchProcessingJob(jobId: string): Promise<ProcessingJob> {
   const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
   return await parseJson<ProcessingJob>(response);
-}
-
-export async function fetchProjectSlicerRuns(projectId: string): Promise<SlicerRun[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slicer-runs`);
-  return await parseJson<SlicerRun[]>(response);
-}
-
-export async function createProjectSlicerRun(
-  projectId: string,
-  payload: SlicerRunRequest,
-): Promise<SlicerRun> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slicer-runs`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-  return await parseJson<SlicerRun>(response);
-}
-
-export async function deleteProjectSlicerRun(
-  projectId: string,
-  slicerRunId: string,
-): Promise<SlicerRunDeleteResult> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/slicer-runs/${slicerRunId}`, {
-    method: "DELETE",
-  });
-  return await parseJson<SlicerRunDeleteResult>(response);
 }
 
 export async function fetchProjectQcRuns(projectId: string, slicerRunId?: string): Promise<QcRun[]> {

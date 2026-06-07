@@ -31,11 +31,11 @@ class ApiIntegrationTests(LiveServerTestCase):
         self.assertEqual(len(projects), 1)
         self.assertEqual(projects[0]["id"], "phase1-demo")
 
-        slices_response = self.client.get("/api/projects/phase1-demo/slices")
-        self.assertEqual(slices_response.status_code, 200)
-        slices = slices_response.json()
-        self.assertEqual(len(slices), 1)
-        self.assertEqual(slices[0]["id"], "clip-001")
+        recordings_response = self.client.get("/api/projects/phase1-demo/recordings")
+        self.assertEqual(recordings_response.status_code, 200)
+        recordings = recordings_response.json()
+        self.assertGreaterEqual(len(recordings), 1)
+        self.assertEqual(recordings[0]["slice_count"], 0)
 
         preview_response = self.client.get("/api/projects/phase1-demo/export-preview")
         self.assertEqual(preview_response.status_code, 200)
@@ -100,7 +100,9 @@ class ApiIntegrationTests(LiveServerTestCase):
 
         recordings_response = self.client.get("/api/projects/upload-demo/source-recordings")
         self.assertEqual(recordings_response.status_code, 200)
-        self.assertEqual([item["id"] for item in recordings_response.json()], [recording["id"]])
+        listed_recordings = recordings_response.json()
+        self.assertEqual([item["id"] for item in listed_recordings], [recording["id"]])
+        self.assertEqual(listed_recordings[0]["display_name"], "sample.wav")
 
     def test_project_upload_rejects_non_wav_extension(self) -> None:
         create_response = self.client.post(
