@@ -34,10 +34,16 @@ export default function LabPage({ activeProject, projectLoadStatus, projectLoadE
   const [activeIndex, setActiveIndex] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
 
+  const onActiveClipItemChangeRef = useRef(onActiveClipItemChange);
+  const onHeaderActionsChangeRef = useRef(onHeaderActionsChange);
+  onActiveClipItemChangeRef.current = onActiveClipItemChange;
+  onHeaderActionsChangeRef.current = onHeaderActionsChange;
+
   useEffect(() => {
-    onActiveClipItemChange(null);
-    onHeaderActionsChange(null as ReactNode);
-  }, [onActiveClipItemChange, onHeaderActionsChange]);
+    onActiveClipItemChangeRef.current(null);
+    onHeaderActionsChangeRef.current(null as ReactNode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!runId) return;
