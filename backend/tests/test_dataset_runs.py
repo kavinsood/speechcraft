@@ -12,18 +12,22 @@ from sqlmodel import Session
 from app.dataset_runs import (
     create_dataset_run,
     get_candidate_review_media_path,
+    get_dataset_export_results,
     get_dataset_run_log,
     get_dataset_speaker_results,
     get_dataset_slicer_results,
+    get_native_export_media_path,
     get_speaker_sample_media_path,
     list_dataset_runs,
     refresh_dataset_run,
     resume_dataset_run_processing,
+    rerun_dataset_native_export,
     rerun_dataset_slicer,
     save_dataset_speaker_selection,
     start_dataset_run,
 )
 from app.models import (
+    DatasetExportRerunRequest,
     DatasetRunCreateRequest,
     DatasetSpeakerSelectionUpdateRequest,
     DatasetSlicerRerunRequest,
@@ -136,6 +140,7 @@ class DatasetRunTests(TestCase):
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
         process = Mock(pid=4321)
         with (
+            patch("app.dataset_runs.run_dataset_worker_preflight", return_value={"ok": True}),
             patch("app.dataset_runs.dataset_worker_python", return_value=Path("/bin/true")),
             patch("app.dataset_runs.dataset_worker_root", return_value=Path("/tmp/worker")),
             patch("app.dataset_runs.subprocess.Popen", return_value=process) as popen,
@@ -153,6 +158,7 @@ class DatasetRunTests(TestCase):
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest(single_speaker=False))
         process = Mock(pid=5432)
         with (
+            patch("app.dataset_runs.run_dataset_worker_preflight") as preflight,
             patch("app.dataset_runs.dataset_worker_python", return_value=Path("/bin/true")),
             patch("app.dataset_runs.dataset_worker_root", return_value=Path("/tmp/worker")),
             patch("app.dataset_runs.subprocess.Popen", return_value=process) as popen,
@@ -162,6 +168,30 @@ class DatasetRunTests(TestCase):
         command = popen.call_args.args[0]
         self.assertNotIn("--single-speaker", command)
         self.assertEqual(started.input_summary["active_stop_after"], "diarization")
+        preflight.assert_not_called()
+
+    def test_start_run_rejects_unavailable_selected_asr_model_before_launch(self) -> None:
+        run = create_dataset_run(
+            self.repository,
+            "project-1",
+            DatasetRunCreateRequest(config={"faster_whisper_model": "medium.en"}),
+        )
+
+        with (
+            patch(
+                "app.dataset_runs.run_dataset_worker_preflight",
+                return_value={
+                    "ok": False,
+                    "error": "ASR model snapshot is incomplete: missing model.bin",
+                    "asr_model": {"ok": False, "error": "ASR model snapshot is incomplete: missing model.bin"},
+                },
+            ),
+            patch("app.dataset_runs.subprocess.Popen") as popen,
+        ):
+            with self.assertRaisesRegex(ValueError, "missing model.bin"):
+                start_dataset_run(self.repository, run.id)
+
+        popen.assert_not_called()
 
     def test_create_run_rejects_backend_controlled_config(self) -> None:
         with self.assertRaisesRegex(ValueError, "backend-controlled keys"):
@@ -326,6 +356,38 @@ class DatasetRunTests(TestCase):
         with self.assertRaises(KeyError):
             get_candidate_review_media_path(self.repository, run.id, "not-in-manifest")
 
+    def test_export_results_and_native_media_are_manifest_guarded(self) -> None:
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        exports_dir = artifacts / "native_export_clips"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = exports_dir / "clip-1.wav"
+        clip_path.write_bytes(b"RIFF")
+        for relative in ("candidate_review_manifest.json", "source_audio_manifest.json", "audio_variants_manifest.json"):
+            (artifacts / relative).write_text("[]", encoding="utf-8")
+        (artifacts / "export_summary.json").write_text(json.dumps({"exported_clip_count": 1}), encoding="utf-8")
+        (artifacts / "export_manifest.json").write_text(
+            json.dumps([{"id": "clip-1", "audio_path": "artifacts/native_export_clips/clip-1.wav"}]),
+            encoding="utf-8",
+        )
+        (artifacts / "export_audit.json").write_text("[]", encoding="utf-8")
+
+        with (
+            patch("app.dataset_runs.dataset_worker_python", return_value=Path("/bin/true")),
+            patch("app.dataset_runs.dataset_worker_root", return_value=Path("/tmp/worker")),
+            patch("app.dataset_runs.subprocess.Popen", return_value=Mock(pid=6789)) as popen,
+        ):
+            started = rerun_dataset_native_export(self.repository, run.id, DatasetExportRerunRequest())
+
+        self.assertEqual(started.status, ProcessingRunStatus.RUNNING)
+        self.assertIn("speechcraft_dataset.rerun_export", popen.call_args.args[0])
+        results = get_dataset_export_results(self.repository, run.id)
+        self.assertEqual(results.export_summary["exported_clip_count"], 1)
+        self.assertEqual(get_native_export_media_path(self.repository, run.id, "clip-1"), clip_path)
+        with self.assertRaises(KeyError):
+            get_native_export_media_path(self.repository, run.id, "not-in-manifest")
+
     def test_speaker_results_selection_and_media_are_manifest_guarded(self) -> None:
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest(single_speaker=False))
         run_root = self.repository.media_root / str(run.artifact_root)
@@ -416,6 +478,7 @@ class DatasetRunTests(TestCase):
         )
         process = Mock(pid=7777)
         with (
+            patch("app.dataset_runs.run_dataset_worker_preflight", return_value={"ok": True}),
             patch("app.dataset_runs.dataset_worker_python", return_value=Path("/bin/true")),
             patch("app.dataset_runs.dataset_worker_root", return_value=Path("/tmp/worker")),
             patch("app.dataset_runs.subprocess.Popen", return_value=process) as popen,

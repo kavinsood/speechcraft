@@ -749,6 +749,20 @@ class DatasetSlicerResultsView(SQLModel):
     candidate_review_summary: dict[str, Any] = Field(default_factory=dict)
     candidate_review_manifest: list[dict[str, Any]] = Field(default_factory=list)
     candidate_review_rejected: list[dict[str, Any]] = Field(default_factory=list)
+    alignment_qc_by_buffer: list[dict[str, Any]] = Field(default_factory=list)
+    transcripts: list[dict[str, Any]] = Field(default_factory=list)
+    aligned_words: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DatasetExportRerunRequest(SQLModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class DatasetExportResultsView(SQLModel):
+    run_id: str
+    export_summary: dict[str, Any] = Field(default_factory=dict)
+    export_manifest: list[dict[str, Any]] = Field(default_factory=list)
+    export_audit: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ProjectPreparationRequest(SQLModel):
@@ -951,7 +965,8 @@ class ReferenceRunCreate(SQLModel):
     recording_ids: list[str]
     mode: str = "both"
     target_durations: list[float] | None = None
-    candidate_count_cap: int = 60
+    candidate_count_cap: int = 500
+    dataset_run_id: str | None = None
 
 
 class ReferenceRunView(SQLModel):

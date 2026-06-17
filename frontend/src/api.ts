@@ -1,6 +1,7 @@
 import type {
   ClipLabItem,
   DatasetPreflight,
+  DatasetExportResults,
   DatasetSpeakerResults,
   DatasetRun,
   DatasetRunCreateRequest,
@@ -195,8 +196,22 @@ export async function fetchProjectSourceRecordings(projectId: string): Promise<S
   return await requestJson<SourceRecording[]>(`${API_BASE}/api/projects/${projectId}/source-recordings`);
 }
 
-export async function fetchDatasetPreflight(): Promise<DatasetPreflight> {
-  return await requestJson<DatasetPreflight>(`${API_BASE}/api/system/preflight`);
+export async function fetchDatasetPreflight(options?: {
+  artifactRoot?: string;
+  asrModel?: string;
+  asrModelPath?: string;
+  asrCacheDir?: string;
+  asrDevice?: string;
+  asrComputeType?: string;
+}): Promise<DatasetPreflight> {
+  const url = new URL(`${API_BASE}/api/system/preflight`);
+  if (options?.artifactRoot) url.searchParams.set("artifact_root", options.artifactRoot);
+  if (options?.asrModel) url.searchParams.set("asr_model", options.asrModel);
+  if (options?.asrModelPath) url.searchParams.set("asr_model_path", options.asrModelPath);
+  if (options?.asrCacheDir) url.searchParams.set("asr_cache_dir", options.asrCacheDir);
+  if (options?.asrDevice) url.searchParams.set("asr_device", options.asrDevice);
+  if (options?.asrComputeType) url.searchParams.set("asr_compute_type", options.asrComputeType);
+  return await requestJson<DatasetPreflight>(url.toString());
 }
 
 export async function fetchProjectDatasetRuns(projectId: string): Promise<DatasetRun[]> {
@@ -264,8 +279,24 @@ export async function fetchDatasetSlicerResults(runId: string): Promise<DatasetS
   return await requestJson<DatasetSlicerResults>(`${API_BASE}/api/dataset-runs/${runId}/slicer-results`);
 }
 
+export async function rerunDatasetNativeExport(runId: string, config: Record<string, unknown> = {}): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/export-rerun`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+}
+
+export async function fetchDatasetExportResults(runId: string): Promise<DatasetExportResults> {
+  return await requestJson<DatasetExportResults>(`${API_BASE}/api/dataset-runs/${runId}/export-results`);
+}
+
 export function buildCandidateReviewAudioUrl(runId: string, clipId: string): string {
   return `${API_BASE}/media/dataset-runs/${runId}/candidate-review/${clipId}.wav`;
+}
+
+export function buildNativeExportAudioUrl(runId: string, clipId: string): string {
+  return `${API_BASE}/media/dataset-runs/${runId}/native-export/${clipId}.wav`;
 }
 
 export function buildSpeakerSampleAudioUrl(runId: string, sampleId: string): string {

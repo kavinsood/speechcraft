@@ -685,6 +685,18 @@ class RepositoryMediaTests(TestCase):
         self.assertEqual(preview_path_again, preview_path)
 
 
+    def test_reference_run_ids_are_derived_from_project_id(self) -> None:
+        first_run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        second_run = self.repository.create_reference_run(
+            "phase1-demo",
+            ReferenceRunCreate(recording_ids=["src-001"], mode="both", candidate_count_cap=8),
+        )
+        self.assertEqual(first_run.id, "reference-run-phase1-demo")
+        self.assertEqual(second_run.id, "reference-run-phase1-demo-2")
+
     def test_reference_run_candidate_ids_are_stable_for_same_config(self) -> None:
         first_run = self.repository.create_reference_run(
             "phase1-demo",

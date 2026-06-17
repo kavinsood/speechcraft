@@ -2,16 +2,19 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   buildCandidateReviewAudioUrl,
+  buildNativeExportAudioUrl,
+  fetchDatasetExportResults,
   fetchDatasetRunLog,
   fetchDatasetSlicerResults,
   fetchProjectDatasetRuns,
   refreshDatasetRun,
+  rerunDatasetNativeExport,
   rerunDatasetSlicer,
 } from "../api";
 import JobActivityPanel, { type JobActivity } from "../components/JobActivityPanel";
 import { usePipelineContext } from "../pipeline/PipelineContext";
 import { hasCandidateClipArtifacts, isSlicerInputReady } from "../pipeline/datasetRunHelpers";
-import type { DatasetRun, DatasetRunLog, DatasetSlicerResults, Project } from "../types";
+import type { DatasetExportResults, DatasetRun, DatasetRunLog, DatasetSlicerResults, Project } from "../types";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
 
 type Props = {
@@ -86,6 +89,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
   const { selectedSlicerDatasetRunId, selectSlicerDatasetRun } = usePipelineContext();
   const [runs, setRuns] = useState<DatasetRun[]>([]);
   const [results, setResults] = useState<DatasetSlicerResults | null>(null);
+  const [exportResults, setExportResults] = useState<DatasetExportResults | null>(null);
   const [log, setLog] = useState<DatasetRunLog | null>(null);
   const [settings, setSettings] = useState(defaults);
   const [error, setError] = useState<string | null>(null);
@@ -107,13 +111,15 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
 
   async function loadSelected(runId: string, refresh = false, polling = false) {
     try {
-      const [run, nextResults, nextLog] = await Promise.all([
+      const [run, nextResults, nextExportResults, nextLog] = await Promise.all([
         refresh ? refreshDatasetRun(runId) : Promise.resolve(runs.find((item) => item.id === runId) ?? null),
         fetchDatasetSlicerResults(runId),
+        fetchDatasetExportResults(runId).catch(() => ({ run_id: runId, export_summary: {}, export_manifest: [], export_audit: [] })),
         fetchDatasetRunLog(runId),
       ]);
       if (run) setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
       setResults(nextResults);
+      setExportResults(nextExportResults);
       setLog(nextLog);
       setPollWarning(null);
       setPollFailureCount(0);
@@ -139,6 +145,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
     if (selectedSlicerDatasetRunId) void loadSelected(selectedSlicerDatasetRunId);
     else {
       setResults(null);
+      setExportResults(null);
       setLog(null);
     }
   }, [selectedSlicerDatasetRunId]);
@@ -165,6 +172,21 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
     }
   }
 
+  async function exportNative() {
+    if (!selectedRun) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const run = await rerunDatasetNativeExport(selectedRun.id, {});
+      setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      await loadSelected(run.id, true);
+    } catch (exportError) {
+      setError(errorMessage(exportError, "Native export failed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (projectLoadStatus === "error") return <WorkspaceStatePanel title="Projects unavailable" message={projectLoadError ?? "Project load failed."} actionLabel="Retry" onAction={onRetryProjects} />;
   if (projectLoadStatus === "loading") return <WorkspaceStatePanel title="Loading projects" message="Fetching project context." />;
   if (!activeProject) return <WorkspaceStatePanel title="No project selected" message="Select a project before slicing." />;
@@ -175,7 +197,10 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
   const rejectionReasons = safe.rejection_reason_counts && typeof safe.rejection_reason_counts === "object" ? Object.entries(safe.rejection_reason_counts as Record<string, unknown>) : [];
   const slicerReady = isSlicerInputReady(selectedRun);
   const hasCandidates = hasCandidateClipArtifacts(selectedRun, results);
+  const exportManifest = exportResults?.export_manifest ?? [];
+  const exportSummary = exportResults?.export_summary ?? {};
   const generateDisabled = !selectedRun || !slicerReady || selectedRun.status === "running" || busy;
+  const exportDisabled = !selectedRun || manifest.length === 0 || selectedRun.status === "running" || busy;
   const generateLabel = busy
     ? "Starting..."
     : hasCandidates
@@ -212,6 +237,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
             </div>
             <div className="processing-actions">
               <button className="primary-button" type="button" disabled={generateDisabled} onClick={() => void generateOrRegenerate()}>{generateLabel}</button>
+              <button className="action-button" type="button" disabled={exportDisabled} onClick={() => void exportNative()}>Export native-rate clips</button>
               <span>Only slicer artifacts are regenerated. ASR and MFA remain untouched.</span>
             </div>
           </section>
@@ -220,6 +246,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
             <article className="panel pipeline-card"><p className="eyebrow">SafeCutPoints</p><h3>{count(safe, "accepted_cutpoints")}</h3><p>{count(safe, "rejected_cutpoint_candidates")} rejected · {(count(safe, "acceptance_rate") * 100).toFixed(1)}% accepted</p></article>
             <article className="panel pipeline-card"><p className="eyebrow">Candidate yield</p><h3>{count(clips, "candidate_review_clips")} clips</h3><p>{count(clips, "total_duration_sec").toFixed(1)} sec · {count(clips, "clips_needing_review")} review flagged</p></article>
             <article className="panel pipeline-card"><p className="eyebrow">Rejected spans</p><h3>{count(clips, "rejected_spans")}</h3><p>Buffers or spans not assembled automatically.</p></article>
+            <article className="panel pipeline-card"><p className="eyebrow">Native export</p><h3>{count(exportSummary, "exported_clip_count")}</h3><p>{count(exportSummary, "total_duration_sec").toFixed(1)} sec · {((exportSummary.sample_rates as number[] | undefined)?.join(", ") ?? "—")} Hz</p></article>
           </section>
 
           <JobActivityPanel title="Slicer terminal" job={activity(selectedRun, log)} maxLogLines={500} />
@@ -247,6 +274,32 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
                       <p className="eyebrow">{clipId}</p>
                       <p><strong>{durationSec.toFixed(2)} sec</strong>{needsReview ? " · needs review" : ""}</p>
                       <audio controls preload="none" src={buildCandidateReviewAudioUrl(selectedRun.id, clipId)} />
+                      <p>{text || "No transcript text recorded."}</p>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="panel dataset-slicer-candidates">
+            <div className="panel-header"><div><p className="eyebrow">Native export clips</p><h3>Original-rate output</h3></div></div>
+            {!selectedRun ? (
+              <p>Select a dataset run to inspect native exports.</p>
+            ) : exportManifest.length === 0 ? (
+              <p>No native-rate clips exported yet.</p>
+            ) : (
+              <div className="processing-run-list">
+                {exportManifest.map((clip) => {
+                  const clipId = textValue(clip, "id");
+                  const text = textValue(clip, "training_text");
+                  const durationSec = Number(clip.duration_sec ?? 0);
+                  const sampleRate = Number(clip.sample_rate ?? 0);
+                  return (
+                    <article key={clipId} className="panel">
+                      <p className="eyebrow">{clipId}</p>
+                      <p><strong>{durationSec.toFixed(2)} sec</strong>{sampleRate ? ` · ${sampleRate} Hz` : ""}</p>
+                      <audio controls preload="none" src={buildNativeExportAudioUrl(selectedRun.id, clipId)} />
                       <p>{text || "No transcript text recorded."}</p>
                     </article>
                   );

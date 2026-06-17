@@ -11,10 +11,10 @@ import {
 } from "./pipeline/PipelineContext";
 import ExportPage from "./pages/ExportPage";
 import IngestPage from "./pages/IngestPage";
-import LabPage from "./pages/LabPage";
+import LegacyLabPage from "./legacy/LegacyLabPage";
+import LegacyQcPage from "./legacy/LegacyQcPage";
 import OverviewPage from "./pages/OverviewPage";
 import ProcessingPage from "./pages/ProcessingPage";
-import QcPage from "./pages/QcPage";
 import ReferencePage from "./pages/ReferencePage";
 import SpeakersPage from "./pages/SpeakersPage";
 import SlicerPage from "./pages/SlicerPage";
@@ -590,7 +590,7 @@ export default function App() {
     pageContent = <SlicerPage {...pageProps} onOpenQc={() => navigate("qc")} />;
   } else if (route.step === "qc") {
     pageContent = (
-      <QcPage
+      <LegacyQcPage
         {...pageProps}
         onOpenLab={(handoff) => {
           const nextPipelineSelection = {
@@ -606,7 +606,7 @@ export default function App() {
     );
   } else if (route.step === "lab") {
     pageContent = (
-      <LabPage
+      <LegacyLabPage
         {...pageProps}
         activeClipItem={route.clipItem}
         onActiveClipItemChange={(clipItem) => {

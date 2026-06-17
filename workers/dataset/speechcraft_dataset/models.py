@@ -87,6 +87,37 @@ def resolve_asr_model_reference(config: dict[str, Any]) -> str:
         return model_name
 
 
+def validate_asr_model_snapshot(
+    *,
+    model_reference: str,
+    model_path: str | None = None,
+) -> dict[str, Any]:
+    path = Path(model_reference)
+    if not path.exists():
+        return {
+            "ok": False,
+            "required_files": ["model.bin", "config.json"],
+            "missing_files": ["model.bin", "config.json"],
+            "error": f"ASR model snapshot path does not exist: {path}",
+        }
+
+    config_path = path / "config.json"
+    weight_candidates = ("model.bin", "pytorch_model.bin", "model.safetensors")
+    weight_path = next((path / name for name in weight_candidates if (path / name).exists()), None)
+    missing: list[str] = []
+    if not config_path.exists():
+        missing.append("config.json")
+    if weight_path is None:
+        missing.append("model.bin")
+    return {
+        "ok": not missing,
+        "required_files": ["model.bin", "config.json"],
+        "missing_files": missing,
+        "weight_file": None if weight_path is None else weight_path.name,
+        "error": None if not missing else f"ASR model snapshot is incomplete: missing {', '.join(missing)}",
+    }
+
+
 def check_asr_model(
     *,
     model: str,
@@ -150,6 +181,14 @@ def check_asr_model(
                 "load_checked": False,
                 "error": f"{type(exc).__name__}: {exc}",
             }
+    if result["ok"]:
+        snapshot_check = validate_asr_model_snapshot(
+            model_reference=str(result["snapshot_path"] or result["reference"]),
+            model_path=model_path,
+        )
+        result["snapshot_check"] = snapshot_check
+        if not snapshot_check["ok"]:
+            result.update({"ok": False, "error": snapshot_check["error"]})
     if not result["ok"] or not load_model:
         return result
 

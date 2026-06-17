@@ -143,12 +143,33 @@ export type DatasetSlicerResults = {
   candidate_review_summary: Record<string, unknown>;
   candidate_review_manifest: Array<Record<string, unknown>>;
   candidate_review_rejected: Array<Record<string, unknown>>;
+  alignment_qc_by_buffer?: Array<Record<string, unknown>>;
+  transcripts?: Array<Record<string, unknown>>;
+  aligned_words?: Array<Record<string, unknown>>;
+};
+
+export type DatasetExportResults = {
+  run_id: string;
+  export_summary: Record<string, unknown>;
+  export_manifest: Array<Record<string, unknown>>;
+  export_audit: Array<Record<string, unknown>>;
 };
 
 export type DatasetPreflight = {
   ok: boolean;
   reason_codes?: string[];
   error?: string;
+  asr_model?: {
+    ok: boolean;
+    model?: string;
+    error?: string | null;
+    snapshot_check?: {
+      ok: boolean;
+      missing_files?: string[];
+      error?: string | null;
+    };
+    [key: string]: unknown;
+  };
   [key: string]: unknown;
 };
 

@@ -12,19 +12,24 @@ from .dataset_worker_client import run_dataset_worker_preflight
 from .dataset_runs import (
     create_dataset_run,
     get_candidate_review_media_path,
+    get_dataset_export_results,
     get_dataset_run,
     get_dataset_run_log,
     get_dataset_speaker_results,
     get_dataset_slicer_results,
+    get_native_export_media_path,
     get_speaker_sample_media_path,
     list_dataset_runs,
     refresh_dataset_run,
     resume_dataset_run_processing,
+    rerun_dataset_native_export,
     rerun_dataset_slicer,
     save_dataset_speaker_selection,
     start_dataset_run,
 )
 from .models import (
+    DatasetExportResultsView,
+    DatasetExportRerunRequest,
     DatasetRunCreateRequest,
     DatasetRunResumeRequest,
     DatasetRunLogView,
@@ -121,8 +126,22 @@ def healthcheck() -> dict[str, str]:
 
 
 @app.get("/api/system/preflight")
-def system_preflight(artifact_root: str | None = None) -> dict[str, object]:
-    return run_dataset_worker_preflight(artifact_root=artifact_root)
+def system_preflight(
+    artifact_root: str | None = None,
+    asr_model: str | None = None,
+    asr_model_path: str | None = None,
+    asr_cache_dir: str | None = None,
+    asr_device: str | None = None,
+    asr_compute_type: str | None = None,
+) -> dict[str, object]:
+    return run_dataset_worker_preflight(
+        artifact_root=artifact_root,
+        asr_model=asr_model,
+        asr_model_path=asr_model_path,
+        asr_cache_dir=asr_cache_dir,
+        asr_device=asr_device,
+        asr_compute_type=asr_compute_type,
+    )
 
 
 @app.get("/api/projects/{project_id}/dataset-runs", response_model=list[DatasetRunView])
@@ -229,10 +248,37 @@ def read_dataset_slicer_results(run_id: str) -> DatasetSlicerResultsView:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/dataset-runs/{run_id}/export-rerun", response_model=DatasetRunView, status_code=202)
+def rerun_project_dataset_export(run_id: str, payload: DatasetExportRerunRequest) -> DatasetRunView:
+    try:
+        return rerun_dataset_native_export(repository, run_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/dataset-runs/{run_id}/export-results", response_model=DatasetExportResultsView)
+def read_dataset_export_results(run_id: str) -> DatasetExportResultsView:
+    try:
+        return get_dataset_export_results(repository, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/media/dataset-runs/{run_id}/candidate-review/{clip_id}.wav")
 def get_dataset_candidate_review_media(run_id: str, clip_id: str) -> FileResponse:
     try:
         path = get_candidate_review_media_path(repository, run_id, clip_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
+@app.get("/media/dataset-runs/{run_id}/native-export/{clip_id}.wav")
+def get_dataset_native_export_media(run_id: str, clip_id: str) -> FileResponse:
+    try:
+        path = get_native_export_media_path(repository, run_id, clip_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(path=path, media_type="audio/wav")

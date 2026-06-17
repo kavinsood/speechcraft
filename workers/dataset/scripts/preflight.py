@@ -188,7 +188,7 @@ def asr_model_check(args: argparse.Namespace) -> dict[str, Any]:
             model_path=args.asr_model_path,
             cache_dir=args.asr_cache_dir,
             local_only=True,
-            load_model=args.check_asr_model_load,
+            load_model=True,
             device=args.asr_device,
             compute_type=args.asr_compute_type,
             timeout_seconds=args.asr_model_timeout_seconds,

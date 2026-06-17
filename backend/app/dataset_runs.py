@@ -11,8 +11,10 @@ from uuid import uuid4
 
 from sqlmodel import Session, delete, select
 
-from .dataset_worker_client import dataset_worker_python, dataset_worker_root
+from .dataset_worker_client import dataset_worker_python, dataset_worker_root, run_dataset_worker_preflight
 from .models import (
+    DatasetExportResultsView,
+    DatasetExportRerunRequest,
     DatasetRunArtifactView,
     DatasetRunCreateRequest,
     DatasetRunResumeRequest,
@@ -239,6 +241,31 @@ def _launch_worker(repository: Any, run: ProcessingRun, *, stop_after: str) -> i
     return process.pid
 
 
+def _stop_after_requires_asr(stop_after: str) -> bool:
+    return stop_after not in {"diarization", "buffers"}
+
+
+def _assert_asr_model_available(repository: Any, run: ProcessingRun) -> None:
+    config = _read_json_object(_run_root(repository, run) / "config.json")
+    preflight = run_dataset_worker_preflight(
+        artifact_root=str(run.artifact_root),
+        asr_model=str(config.get("faster_whisper_model") or "small.en"),
+        asr_model_path=str(config.get("faster_whisper_model_path") or "") or None,
+        asr_cache_dir=str(config.get("faster_whisper_cache_dir") or "") or None,
+        asr_device=str(config.get("faster_whisper_device") or "cpu"),
+        asr_compute_type=str(config.get("faster_whisper_compute_type") or "int8"),
+    )
+    if preflight.get("ok") is True:
+        return
+    asr_model = preflight.get("asr_model")
+    message = None
+    if isinstance(asr_model, dict):
+        message = asr_model.get("error")
+    if not message:
+        message = preflight.get("error")
+    raise ValueError(str(message or "ASR model preflight failed"))
+
+
 def _view(session: Session, run: ProcessingRun) -> DatasetRunView:
     artifacts = list(session.exec(select(RunArtifact).where(RunArtifact.run_id == run.id)))
     return DatasetRunView(
@@ -304,6 +331,8 @@ def start_dataset_run(repository: Any, run_id: str) -> DatasetRunView:
             selection = _read_speaker_selection(repository, run)
             if not bool(selection.get("selected")):
                 stop_after = "diarization"
+        if _stop_after_requires_asr(stop_after):
+            _assert_asr_model_available(repository, run)
         _launch_worker(repository, run, stop_after=stop_after)
         session.add(run)
         session.commit()
@@ -433,6 +462,8 @@ def resume_dataset_run_processing(
             or "alignment_qc"
         )
         run.input_summary = {**run.input_summary, "requested_stop_after": requested_stop_after}
+        if _stop_after_requires_asr(requested_stop_after):
+            _assert_asr_model_available(repository, run)
         _launch_worker(repository, run, stop_after=requested_stop_after)
         session.add(run)
         session.commit()
@@ -493,6 +524,61 @@ def rerun_dataset_slicer(repository: Any, run_id: str, request: DatasetSlicerRer
         return _view(session, run)
 
 
+def rerun_dataset_native_export(repository: Any, run_id: str, request: DatasetExportRerunRequest) -> DatasetRunView:
+    with Session(repository.engine, expire_on_commit=False) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        if run.status == ProcessingRunStatus.RUNNING:
+            raise ValueError("Dataset run is already running")
+        run_root = _run_root(repository, run)
+        required = (
+            "artifacts/candidate_review_manifest.json",
+            "artifacts/source_audio_manifest.json",
+            "artifacts/audio_variants_manifest.json",
+        )
+        missing = [path for path in required if not (run_root / path).exists()]
+        if missing:
+            raise ValueError(f"Dataset run is not export-ready; missing: {', '.join(missing)}")
+        worker_python = dataset_worker_python()
+        if not worker_python.exists():
+            raise ValueError(f"Dataset worker python not found: {worker_python}")
+        config_path = run_root / "config.json"
+        config = _read_json_object(config_path)
+        config.update(request.config)
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+        status_path = run_root / "status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "ok": None,
+                    "stage": "native_export",
+                    "started_at": utc_now().isoformat(),
+                    "completed_at": None,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        command = [str(worker_python), "-m", "speechcraft_dataset.rerun_export", "--run-root", str(run_root), "--config", str(config_path)]
+        log_path = run_root / "logs" / "dataset_worker_process.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(dataset_worker_root())
+        with log_path.open("ab") as log_handle:
+            process = subprocess.Popen(command, cwd=str(dataset_worker_root()), env=env, stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
+        run.status = ProcessingRunStatus.RUNNING
+        run.stage = RfcStage.EXPORT
+        run.started_at = utc_now()
+        run.completed_at = None
+        run.reason_codes = []
+        run.input_summary = {**run.input_summary, "worker_pid": process.pid, "worker_command": command}
+        session.add(run)
+        session.commit()
+        return _view(session, run)
+
+
 def get_dataset_slicer_results(repository: Any, run_id: str) -> DatasetSlicerResultsView:
     with Session(repository.engine) as session:
         run = session.get(ProcessingRun, run_id)
@@ -505,6 +591,23 @@ def get_dataset_slicer_results(repository: Any, run_id: str) -> DatasetSlicerRes
             candidate_review_summary=_read_json_object(root / "artifacts/candidate_review_summary.json"),
             candidate_review_manifest=_read_json_list(root / "artifacts/candidate_review_manifest.json"),
             candidate_review_rejected=_read_json_list(root / "artifacts/candidate_review_rejected.json"),
+            alignment_qc_by_buffer=_read_json_list(root / "artifacts/alignment_qc_by_buffer.json"),
+            transcripts=_read_json_list(root / "artifacts/transcripts.json"),
+            aligned_words=_read_json_list(root / "artifacts/aligned_words.jsonl"),
+        )
+
+
+def get_dataset_export_results(repository: Any, run_id: str) -> DatasetExportResultsView:
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+        return DatasetExportResultsView(
+            run_id=run_id,
+            export_summary=_read_json_object(root / "artifacts/export_summary.json"),
+            export_manifest=_read_json_list(root / "artifacts/export_manifest.json"),
+            export_audit=_read_json_list(root / "artifacts/export_audit.json"),
         )
 
 
@@ -519,6 +622,20 @@ def get_candidate_review_media_path(repository: Any, run_id: str, clip_id: str) 
         path = resolve_run_artifact_path(dataset_storage_root(repository), run.artifact_root, str(clip["audio_path"]))
     if not path.exists() or not path.is_file():
         raise KeyError("Candidate review audio not found")
+    return path
+
+
+def get_native_export_media_path(repository: Any, run_id: str, clip_id: str) -> Path:
+    results = get_dataset_export_results(repository, run_id)
+    clip = next((row for row in results.export_manifest if str(row.get("id")) == clip_id), None)
+    if clip is None:
+        raise KeyError("Native export clip not found")
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        assert run is not None and run.artifact_root is not None
+        path = resolve_run_artifact_path(dataset_storage_root(repository), run.artifact_root, str(clip["audio_path"]))
+    if not path.exists() or not path.is_file():
+        raise KeyError("Native export audio not found")
     return path
 
 

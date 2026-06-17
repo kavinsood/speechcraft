@@ -22,7 +22,7 @@ class DatasetWorkerClientTests(TestCase):
         self.assertIn("Dataset worker python not found", result["error"])
         self.assertEqual(result["worker_root"], str(worker_root.resolve()))
 
-    def test_preflight_passes_artifact_root_and_parses_worker_json(self) -> None:
+    def test_preflight_passes_selected_asr_args_and_parses_worker_json(self) -> None:
         with TemporaryDirectory() as temp_dir_raw:
             worker_root = Path(temp_dir_raw)
             worker_python = worker_root / ".venv" / "bin" / "python"
@@ -33,7 +33,19 @@ class DatasetWorkerClientTests(TestCase):
             preflight.write_text("#!/usr/bin/env python\n", encoding="utf-8")
 
             completed = subprocess.CompletedProcess(
-                [str(worker_python), str(preflight), "--json", "--artifact-root", "runs/run-1"],
+                [
+                    str(worker_python),
+                    str(preflight),
+                    "--json",
+                    "--artifact-root",
+                    "runs/run-1",
+                    "--asr-model",
+                    "medium.en",
+                    "--asr-device",
+                    "cuda",
+                    "--asr-compute-type",
+                    "float16",
+                ],
                 0,
                 stdout=json.dumps({"ok": True, "python": {"version": "3.11.0"}}),
                 stderr="",
@@ -41,14 +53,31 @@ class DatasetWorkerClientTests(TestCase):
 
             with patch.dict("os.environ", {"SPEECHCRAFT_DATASET_WORKER_ROOT": str(worker_root)}, clear=False):
                 with patch("app.dataset_worker_client.subprocess.run", return_value=completed) as run:
-                    result = run_dataset_worker_preflight(artifact_root="runs/run-1")
+                    result = run_dataset_worker_preflight(
+                        artifact_root="runs/run-1",
+                        asr_model="medium.en",
+                        asr_device="cuda",
+                        asr_compute_type="float16",
+                    )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["returncode"], 0)
         self.assertEqual(result["python"]["version"], "3.11.0")
         self.assertEqual(
             run.call_args.args[0],
-            [str(worker_python.resolve()), str(preflight.resolve()), "--json", "--artifact-root", "runs/run-1"],
+            [
+                str(worker_python.resolve()),
+                str(preflight.resolve()),
+                "--json",
+                "--artifact-root",
+                "runs/run-1",
+                "--asr-model",
+                "medium.en",
+                "--asr-device",
+                "cuda",
+                "--asr-compute-type",
+                "float16",
+            ],
         )
         self.assertEqual(run.call_args.kwargs["cwd"], str(worker_root.resolve()))
 

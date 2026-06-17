@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from speechcraft_dataset.alignment_qc import run_alignment_qc
+from speechcraft_dataset.analyze_vad_mfa_gaps import analyze_vad_mfa_gaps
 from speechcraft_dataset.assembly import assemble_candidate_review_clips
 from speechcraft_dataset.asr import run_asr
 from speechcraft_dataset.buffers import run_processing_buffers
@@ -693,6 +694,76 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
             transcript = read_json(artifacts / "transcripts.json")[0]
             self.assertEqual(transcript["asr_model_reference"], str(model_dir.resolve()))
 
+    def test_asr_requested_model_failure_raises_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw)
+            artifacts = run_root / "artifacts"
+            audio_dir = artifacts / "asr_mfa_queue"
+            audio_dir.mkdir(parents=True)
+            write_silent_wav(audio_dir / "buffer_000000.wav", sample_rate=16000, duration_sec=6.0)
+            (artifacts / "asr_mfa_queue.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "buffer_id": "buffer_000000",
+                            "queue_audio_path": "artifacts/asr_mfa_queue/buffer_000000.wav",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            init_refs: list[str] = []
+
+            class FakeModel:
+                def __init__(self, model_ref: str, **_kwargs) -> None:
+                    init_refs.append(model_ref)
+                    raise RuntimeError("missing model.bin")
+
+                def transcribe(self, _path: str, **_kwargs):
+                    raise AssertionError("transcribe should not be reached when model load fails")
+
+            def fake_resolve_asr_model_reference(model_config: dict) -> str:
+                model = str(model_config.get("faster_whisper_model"))
+                self.assertEqual(model, "medium.en")
+                return "broken-medium-ref"
+
+            fake_torch = types.ModuleType("torch")
+            fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None)
+            fake_fw = types.ModuleType("faster_whisper")
+            fake_fw.WhisperModel = FakeModel
+            old_torch = sys.modules.get("torch")
+            old_fw = sys.modules.get("faster_whisper")
+            sys.modules["torch"] = fake_torch
+            sys.modules["faster_whisper"] = fake_fw
+            try:
+                with patch("speechcraft_dataset.asr.resolve_asr_model_reference", side_effect=fake_resolve_asr_model_reference):
+                    with self.assertRaises(RuntimeError) as context:
+                        run_asr(
+                            run_root,
+                            {
+                                "config_hash": "sha256:test",
+                                "faster_whisper_model": "medium.en",
+                                "faster_whisper_device": "cpu",
+                                "faster_whisper_compute_type": "int8",
+                            },
+                        )
+            finally:
+                if old_torch is None:
+                    sys.modules.pop("torch", None)
+                else:
+                    sys.modules["torch"] = old_torch
+                if old_fw is None:
+                    sys.modules.pop("faster_whisper", None)
+                else:
+                    sys.modules["faster_whisper"] = old_fw
+
+            self.assertIn("requested='medium.en'", str(context.exception))
+            self.assertIn("resolved='broken-medium-ref'", str(context.exception))
+            self.assertIn("missing model.bin", str(context.exception))
+            self.assertEqual(init_refs, ["broken-medium-ref"])
+            self.assertFalse((artifacts / "transcripts.json").exists())
+
     def test_asr_model_check_reports_missing_local_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:
             missing = Path(temp_dir_raw) / "missing-model"
@@ -701,6 +772,21 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["source"], "local_path")
             self.assertIn("does not exist", result["error"])
+
+    def test_asr_model_check_reports_incomplete_snapshot_before_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            snapshot = Path(temp_dir_raw) / "broken-medium"
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
+            result = check_asr_model(model="medium.en", model_path=str(snapshot), local_only=True, load_model=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["source"], "local_path")
+            self.assertIn("snapshot_check", result)
+            self.assertEqual(result["snapshot_check"]["missing_files"], ["model.bin"])
+            self.assertEqual(result["error"], "ASR model snapshot is incomplete: missing model.bin")
+            self.assertFalse(result["load_checked"])
 
     @unittest.skipUnless(HAS_WORKER_AUDIO_DEPS, "requires worker audio deps")
     def test_mfa_stage_handles_empty_corpus_without_calling_mfa(self) -> None:
@@ -1781,6 +1867,183 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
             self.assertIn("%", normalized["symbols"])
             self.assertEqual(summary["buffers_with_symbol_hazards"], 1)
             self.assertEqual(summary["symbol_buffer_counts"]["$"], 1)
+
+    @unittest.skipUnless(HAS_WORKER_AUDIO_DEPS, "requires worker audio deps")
+    def test_gap_analysis_reports_vad_mfa_agreement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            run_root = temp_dir / "run"
+            artifacts = run_root / "artifacts"
+            queue_dir = artifacts / "asr_mfa_queue"
+            queue_dir.mkdir(parents=True)
+            buffer_audio = queue_dir / "buffer_000000.wav"
+            write_silent_wav(buffer_audio, duration_sec=0.35)
+
+            (artifacts / "asr_mfa_queue.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "buffer_id": "buffer_000000",
+                            "source_audio_id": "source_0",
+                            "audio_path": "artifacts/buffers/buffer_000000.wav",
+                            "queue_audio_path": "artifacts/asr_mfa_queue/buffer_000000.wav",
+                            "source_start_sample": 0,
+                            "source_end_sample": 5600,
+                            "trusted_start_sample": 0,
+                            "trusted_end_sample": 5600,
+                            "trusted_local_start_sample": 0,
+                            "trusted_local_end_sample": 5600,
+                            "duration_sec": 0.35,
+                            "sample_rate": 16000,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (artifacts / "vad_segments.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "id": "s0_vad_0",
+                                "source_audio_id": "source_0",
+                                "analysis_start_sample": 0,
+                                "analysis_end_sample": 1600,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "id": "s0_vad_1",
+                                "source_audio_id": "source_0",
+                                "analysis_start_sample": 2400,
+                                "analysis_end_sample": 4000,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (artifacts / "aligned_words.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "id": "w0",
+                                "buffer_id": "buffer_000000",
+                                "word": "hello",
+                                "local_start_sample": 0,
+                                "local_end_sample": 1200,
+                                "source_start_sample": 0,
+                                "source_end_sample": 1200,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "id": "w1",
+                                "buffer_id": "buffer_000000",
+                                "word": "there",
+                                "local_start_sample": 1800,
+                                "local_end_sample": 2200,
+                                "source_start_sample": 1800,
+                                "source_end_sample": 2200,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "id": "w2",
+                                "buffer_id": "buffer_000000",
+                                "word": "friend",
+                                "local_start_sample": 3000,
+                                "local_end_sample": 3400,
+                                "source_start_sample": 3000,
+                                "source_end_sample": 3400,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (artifacts / "safe_cutpoints.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "id": "buffer_000000-cut-0000",
+                                "buffer_id": "buffer_000000",
+                                "cut_local_sample": 1700,
+                                "source_sample": 1700,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "id": "buffer_000000-cut-0001",
+                                "buffer_id": "buffer_000000",
+                                "cut_local_sample": 2300,
+                                "source_sample": 2300,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (artifacts / "rejected_cutpoint_candidates.jsonl").write_text(
+                json.dumps({"buffer_id": "buffer_000000", "reason_codes": ["usable_gap_too_short"]}) + "\n",
+                encoding="utf-8",
+            )
+            (artifacts / "candidate_review_manifest.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "candidate_review_clip_000000",
+                            "buffer_id": "buffer_000000",
+                            "word_ids": ["w0", "w1"],
+                            "training_text": "hello there",
+                            "needs_review": False,
+                            "review_reason_codes": [],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (artifacts / "alignment_qc_by_buffer.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "buffer_id": "buffer_000000",
+                            "fatal_reason_codes": [],
+                            "warning_reason_codes": [],
+                            "automatic_cutpoints_disabled": False,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (artifacts / "safe_cutpoint_summary.json").write_text(
+                json.dumps({"thresholds": {"min_gap_sec": 0.08}}),
+                encoding="utf-8",
+            )
+
+            out_dir = temp_dir / "report"
+            summary = analyze_vad_mfa_gaps(run_root, out_dir, max_examples_per_bucket=5)
+
+            self.assertEqual(summary["mfa_gap_count"], 2)
+            self.assertEqual(summary["vad_gap_count"], 2)
+            self.assertEqual(summary["mfa_gap_with_vad_gap_count"], 2)
+            self.assertEqual(summary["vad_gap_with_mfa_gap_count"], 1)
+            self.assertEqual(summary["safe_cutpoints_inside_vad_gap_count"], 2)
+            self.assertEqual(summary["vad_cuttable_gap_count"], 1)
+            self.assertEqual(summary["vad_cuttable_gap_without_mfa_gap_count"], 1)
+            self.assertAlmostEqual(summary["mfa_gap_vad_coverage_ratio"], 1.0, places=6)
+            self.assertAlmostEqual(summary["vad_gap_mfa_coverage_ratio"], 0.5, places=6)
+            self.assertAlmostEqual(summary["safe_cutpoints_inside_vad_gap_ratio"], 1.0, places=6)
+            self.assertAlmostEqual(summary["false_safe_vad_gap_ratio"], 1.0, places=6)
+            self.assertTrue((out_dir / "gap_agreement_summary.json").exists())
+            self.assertTrue((out_dir / "gap_agreement_examples.json").exists())
+            self.assertTrue((out_dir / "gap_agreement_by_buffer.csv").exists())
+            self.assertTrue((out_dir / "gap_context_wavs").exists())
 
 
 if __name__ == "__main__":

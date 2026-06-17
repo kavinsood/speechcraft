@@ -91,6 +91,40 @@ normalization hazard tracker instead.
 NeMo, speaker-purity QC, dataset QC, review-decision persistence, and VoxCPM
 manifest export remain after this stage contract is stable.
 
+## Offline CTC transcript QC experiment
+
+Standalone tool for manually validating whether Wav2Vec2 CTC confidence ranks
+candidate review clips by transcript/audio agreement. This does not change the
+production pipeline or frontend.
+
+```bash
+cd workers/dataset
+uv sync --locked
+
+PYTHONPATH=workers/dataset .venv/bin/python \
+  -m speechcraft_dataset.analyze_ctc_transcript_qc \
+  --run-root ../../backend/data/media/dataset-runs/mb-mq3wkz25/dataset-17d22e1684db \
+  --out /tmp/ctc-qc-madison \
+  --export-worst 50
+```
+
+Outputs under `--out`:
+
+- `ctc_transcript_qc.json`
+- `ctc_transcript_qc_summary.json`
+- `ctc_transcript_qc_by_score.csv`
+- `worst_clips/` and `best_clips/` (wav + sidecar txt for ear-checking)
+
+If `import ctc_segmentation` fails with a NumPy 2 ABI error after install,
+rebuild the extension from source against the current NumPy:
+
+```bash
+cd /tmp && curl -sL https://files.pythonhosted.org/packages/source/c/ctc_segmentation/ctc_segmentation-1.7.4.tar.gz -o ctc_segmentation-1.7.4.tar.gz
+tar xf ctc_segmentation-1.7.4.tar.gz && cd ctc_segmentation-1.7.4
+NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION ../workers/dataset/.venv/bin/python setup.py build_ext --inplace
+cp ctc_segmentation/ctc_segmentation_dyn*.so ../workers/dataset/.venv/lib/python3.12/site-packages/ctc_segmentation/
+```
+
 ## Backend Run Lifecycle
 
 The FastAPI backend now owns the coarse `ProcessingRun` lifecycle without

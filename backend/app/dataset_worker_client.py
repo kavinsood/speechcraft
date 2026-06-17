@@ -33,12 +33,30 @@ def dataset_worker_preflight_script() -> Path:
     return dataset_worker_root() / "scripts" / "preflight.py"
 
 
-def run_dataset_worker_preflight(*, artifact_root: str | None = None) -> dict[str, Any]:
+def run_dataset_worker_preflight(
+    *,
+    artifact_root: str | None = None,
+    asr_model: str | None = None,
+    asr_model_path: str | None = None,
+    asr_cache_dir: str | None = None,
+    asr_device: str | None = None,
+    asr_compute_type: str | None = None,
+) -> dict[str, Any]:
     worker_python = dataset_worker_python()
     preflight_script = dataset_worker_preflight_script()
     command = [str(worker_python), str(preflight_script), "--json"]
     if artifact_root:
         command.extend(["--artifact-root", artifact_root])
+    if asr_model:
+        command.extend(["--asr-model", asr_model])
+    if asr_model_path:
+        command.extend(["--asr-model-path", asr_model_path])
+    if asr_cache_dir:
+        command.extend(["--asr-cache-dir", asr_cache_dir])
+    if asr_device:
+        command.extend(["--asr-device", asr_device])
+    if asr_compute_type:
+        command.extend(["--asr-compute-type", asr_compute_type])
 
     if not worker_python.exists():
         return _failed_preflight(command, f"Dataset worker python not found: {worker_python}")

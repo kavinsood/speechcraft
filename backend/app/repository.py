@@ -25,6 +25,25 @@ from sqlalchemy import update as sql_update
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, SQLModel, create_engine, delete, select
 
+from .reference_acoustic_signature import (
+    ACOUSTIC_SIGNATURE_V2_ID,
+    hdbscan_min_cluster_size_for_count,
+    acoustic_signature_v2_features,
+    cluster_risk_flag_for_label,
+    crop_mono_samples,
+    dumb_cluster_display_labels,
+    embedding_space_descriptor_v2,
+    hdbscan_cluster_labels,
+    mono_pcm16_samples_from_wav_bytes,
+    nms_candidate_indices,
+    normalize_embedding_vector,
+    zscore_rows,
+)
+from .reference_cutpoint_assembly import (
+    analysis_to_native_seconds,
+    build_source_audio_maps,
+    load_cutpoint_windows,
+)
 from .models import (
     ExportRun,
     ExportPreview,
@@ -34,6 +53,8 @@ from .models import (
     JobStatus,
     ProcessingJob,
     ProcessingJobView,
+    ProcessingRun,
+    ProcessingRunStatus,
     ProjectPreparationRequest,
     ProjectPreparationRun,
     ProjectRecordingJobsRun,
@@ -78,6 +99,9 @@ DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS = 4
 DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL = 5
 LATEST_DATA_VERSION = DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL
 REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION = 2
+REFERENCE_CANDIDATE_COUNT_CAP_DEFAULT = 500
+REFERENCE_CANDIDATE_COUNT_CAP_MIN = 8
+REFERENCE_CANDIDATE_COUNT_CAP_MAX = 2000
 REFERENCE_ASSET_EMBEDDING_ARTIFACT_SCHEMA_VERSION = 1
 LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE = "legacy_seed_clip_source"
 
@@ -242,7 +266,7 @@ class SQLiteRepository:
                 if recording.batch_id != project_id:
                     raise ValueError("Reference run recordings must belong to the selected project")
 
-            run_id = self._new_id("reference-run")
+            run_id = self._new_reference_run_id(session, project_id)
             artifact_root = self._reference_run_artifact_root(run_id)
             artifact_root.mkdir(parents=True, exist_ok=True)
             config = {
@@ -252,8 +276,13 @@ class SQLiteRepository:
                     payload.target_durations,
                     payload.mode,
                 ),
-                "candidate_count_cap": max(8, min(int(payload.candidate_count_cap or 60), 200)),
+                "candidate_count_cap": self._normalize_reference_candidate_count_cap(payload.candidate_count_cap),
                 "overlap_stride_ratio": 0.5,
+                "dataset_run_id": payload.dataset_run_id,
+                "cutpoint_stride": 2,
+                "nms_overlap_threshold": 0.6,
+                "hdbscan_min_cluster_size": "dynamic:max(5, int(n*0.03))",
+                "candidate_assembly_backend": "auto",
             }
             run = ReferencePickerRun(
                 id=run_id,
@@ -297,10 +326,16 @@ class SQLiteRepository:
             artifact_root = Path(run.artifact_root)
 
         try:
-            candidates = self._build_reference_run_candidates(run_id, project_id, config)
-            embeddings = self._build_reference_run_candidate_embeddings(candidates)
+            candidates, embeddings, embedding_space = self._build_reference_run_candidate_set(
+                run_id,
+                project_id,
+                config,
+            )
             embedding_dimension = len(embeddings[0]) if embeddings else 17
-            embedding_space = self._current_reference_embedding_space_descriptor(embedding_dimension)
+            if embedding_space is None:
+                embedding_space = self._current_reference_embedding_space_descriptor(embedding_dimension)
+            else:
+                config["candidate_assembly_backend"] = "cutpoint_overlap"
             candidates = [
                 candidate.model_copy(update={"embedding_space_id": embedding_space["id"]})
                 for candidate in candidates
@@ -2397,6 +2432,12 @@ class SQLiteRepository:
             return "both"
         return normalized
 
+    def _normalize_reference_candidate_count_cap(self, raw_cap: int | None) -> int:
+        return max(
+            REFERENCE_CANDIDATE_COUNT_CAP_MIN,
+            min(int(raw_cap or REFERENCE_CANDIDATE_COUNT_CAP_DEFAULT), REFERENCE_CANDIDATE_COUNT_CAP_MAX),
+        )
+
     def _normalize_reference_target_durations(
         self,
         raw_durations: list[float] | None,
@@ -2545,6 +2586,255 @@ class SQLiteRepository:
                 return candidate
         raise KeyError(candidate_id)
 
+    def _build_reference_run_candidate_set(
+        self,
+        run_id: str,
+        project_id: str,
+        config: dict[str, Any],
+    ) -> tuple[list[ReferenceCandidateSummary], list[list[float]], dict[str, Any] | None]:
+        recording_ids = self._normalize_reference_run_recording_ids(list(config.get("recording_ids") or []))
+        backend = str(config.get("candidate_assembly_backend") or "auto")
+        dataset_run_root = self._resolve_reference_dataset_run_root(
+            project_id,
+            recording_ids,
+            config.get("dataset_run_id"),
+        )
+        if backend in {"auto", "cutpoint_overlap"} and dataset_run_root is not None:
+            candidates, embeddings = self._build_reference_run_candidates_from_cutpoints(
+                run_id,
+                project_id,
+                config,
+                recording_ids,
+                dataset_run_root,
+            )
+            dimension = len(embeddings[0]) if embeddings else 25
+            return candidates, embeddings, embedding_space_descriptor_v2(dimension)
+        candidates = self._build_reference_run_candidates_from_vad_windows(run_id, project_id, config)
+        embeddings = self._build_reference_run_candidate_embeddings(candidates)
+        return candidates, embeddings, None
+
+    def _resolve_reference_dataset_run_root(
+        self,
+        project_id: str,
+        recording_ids: list[str],
+        dataset_run_id: str | None,
+    ) -> Path | None:
+        with self._session() as session:
+            selected = set(recording_ids)
+            if dataset_run_id:
+                run = session.get(ProcessingRun, dataset_run_id)
+                if run is None:
+                    raise KeyError(f"Dataset run not found: {dataset_run_id}")
+                if run.project_id != project_id:
+                    raise ValueError("Dataset run must belong to the same project as the reference run")
+                run_root = (self.media_root / run.artifact_root).resolve()
+                if not (run_root / "artifacts" / "safe_cutpoints.jsonl").exists():
+                    raise ValueError("Dataset run is missing artifacts/safe_cutpoints.jsonl")
+                return run_root
+
+            runs = session.exec(
+                select(ProcessingRun)
+                .where(ProcessingRun.project_id == project_id)
+                .where(ProcessingRun.status == ProcessingRunStatus.COMPLETED)
+                .order_by(ProcessingRun.created_at.desc())
+            ).all()
+            for run in runs:
+                run_recording_ids = set(run.input_summary.get("source_recording_ids") or [])
+                if not selected.issubset(run_recording_ids):
+                    continue
+                run_root = (self.media_root / run.artifact_root).resolve()
+                if (run_root / "artifacts" / "safe_cutpoints.jsonl").exists():
+                    return run_root
+        return None
+
+    def _dataset_run_recording_path_map(self, recording_ids: list[str]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        with self._session() as session:
+            for recording_id in recording_ids:
+                recording = self._get_source_recording(session, recording_id)
+                mapping[str(self._get_source_recording_audio_path(recording))] = recording_id
+        return mapping
+
+    def _load_native_recording_samples(self, recording: SourceRecording) -> tuple[np.ndarray, int]:
+        audio_path = self._get_source_recording_audio_path(recording)
+        samples, sample_rate = mono_pcm16_samples_from_wav_bytes(audio_path.read_bytes())
+        return samples, sample_rate
+
+    def _build_reference_run_candidates_from_cutpoints(
+        self,
+        run_id: str,
+        project_id: str,
+        config: dict[str, Any],
+        recording_ids: list[str],
+        dataset_run_root: Path,
+    ) -> tuple[list[ReferenceCandidateSummary], list[list[float]]]:
+        durations = self._normalize_reference_target_durations(
+            config.get("target_durations"),
+            str(config.get("mode") or "both"),
+        )
+        candidate_count_cap = self._normalize_reference_candidate_count_cap(config.get("candidate_count_cap"))
+        stride_cutpoints = max(int(config.get("cutpoint_stride") or 2), 1)
+        overlap_threshold = float(config.get("nms_overlap_threshold") or 0.6)
+        overlap_threshold = max(0.3, min(overlap_threshold, 0.95))
+        selected_recording_ids = set(recording_ids)
+
+        path_map = self._dataset_run_recording_path_map(recording_ids)
+        source_maps = build_source_audio_maps(dataset_run_root, path_map)
+        variant_manifest = json.loads(
+            (dataset_run_root / "artifacts" / "audio_variants_manifest.json").read_text(encoding="utf-8")
+        )
+        variants = {
+            str(row["source_audio_id"]): row
+            for row in variant_manifest.get("variants", [])
+            if str(row.get("kind")) == "analysis_audio"
+        }
+        windows = load_cutpoint_windows(
+            dataset_run_root,
+            target_durations=durations,
+            stride_cutpoints=stride_cutpoints,
+        )
+
+        with self._session() as session:
+            recordings = {
+                recording_id: self._get_source_recording(session, recording_id)
+                for recording_id in recording_ids
+            }
+
+        native_samples_by_recording: dict[str, tuple[np.ndarray, int]] = {}
+        raw_candidates: list[ReferenceCandidateSummary] = []
+        raw_embeddings: list[list[float]] = []
+        raw_feature_vectors: list[list[float]] = []
+        raw_scores: list[float] = []
+        raw_starts: list[float] = []
+        raw_ends: list[float] = []
+        raw_recording_ids: list[str] = []
+
+        for window in windows:
+            source_map = source_maps.get(window.source_audio_id)
+            variant = variants.get(window.source_audio_id)
+            if source_map is None or variant is None:
+                continue
+            if source_map.recording_id not in selected_recording_ids:
+                continue
+            recording = recordings[source_map.recording_id]
+            start_seconds = round(analysis_to_native_seconds(window.analysis_start_sample, variant), 3)
+            end_seconds = round(analysis_to_native_seconds(window.analysis_end_sample, variant), 3)
+            if end_seconds - start_seconds < 1.0:
+                continue
+            if source_map.recording_id not in native_samples_by_recording:
+                native_samples_by_recording[source_map.recording_id] = self._load_native_recording_samples(recording)
+            samples, sample_rate = native_samples_by_recording[source_map.recording_id]
+            clip_samples = crop_mono_samples(samples, sample_rate, start_seconds, end_seconds)
+            feature_vector = acoustic_signature_v2_features(clip_samples, sample_rate)
+            embedding = normalize_embedding_vector(feature_vector)
+            risk_flags = self._reference_candidate_risk_flags(
+                recording.duration_s,
+                start_seconds,
+                end_seconds,
+                window.transcript_text,
+            )
+            default_scores = self._reference_candidate_default_scores(
+                recording.duration_s,
+                start_seconds,
+                end_seconds,
+                window.transcript_text,
+                risk_flags,
+            )
+            candidate = ReferenceCandidateSummary(
+                candidate_id=self._reference_candidate_id(
+                    recording.id,
+                    start_seconds,
+                    end_seconds,
+                    f"{window.start_cutpoint_id}:{window.end_cutpoint_id}",
+                ),
+                run_id=run_id,
+                source_media_kind=ReferenceSourceKind.SOURCE_RECORDING,
+                source_recording_id=recording.id,
+                source_variant_id=None,
+                source_start_seconds=start_seconds,
+                source_end_seconds=end_seconds,
+                duration_seconds=round(end_seconds - start_seconds, 3),
+                transcript_text=window.transcript_text,
+                speaker_name=None,
+                language=None,
+                risk_flags=risk_flags,
+                default_scores=default_scores,
+                embedding_space_id=ACOUSTIC_SIGNATURE_V2_ID,
+            )
+            raw_candidates.append(candidate)
+            raw_embeddings.append(embedding)
+            raw_feature_vectors.append(feature_vector)
+            raw_scores.append(float(default_scores.get("both", 0.0)))
+            raw_starts.append(start_seconds)
+            raw_ends.append(end_seconds)
+            raw_recording_ids.append(recording.id)
+
+        if not raw_candidates:
+            raise ValueError("No overlapping SafeCutPoint reference candidates were generated for this dataset run")
+
+        zscored = zscore_rows(raw_embeddings)
+        centroid = np.mean(np.asarray(zscored, dtype=np.float64), axis=0)
+        adjusted_scores: list[float] = []
+        for index, embedding in enumerate(zscored):
+            distance = float(np.linalg.norm(np.asarray(embedding, dtype=np.float64) - centroid))
+            adjusted_scores.append(raw_scores[index] + max(0.0, 0.15 - distance * 0.03))
+
+        kept_indices: list[int] = []
+        for recording_id in sorted(selected_recording_ids):
+            indices = [index for index, value in enumerate(raw_recording_ids) if value == recording_id]
+            if not indices:
+                continue
+            local_kept = nms_candidate_indices(
+                [raw_starts[index] for index in indices],
+                [raw_ends[index] for index in indices],
+                [adjusted_scores[index] for index in indices],
+                overlap_threshold=overlap_threshold,
+            )
+            kept_indices.extend(indices[index] for index in local_kept)
+
+        surviving_candidates = [raw_candidates[index] for index in kept_indices]
+        surviving_embeddings = [raw_embeddings[index] for index in kept_indices]
+        hdbscan_min_cluster_size = hdbscan_min_cluster_size_for_count(len(surviving_embeddings))
+        config["hdbscan_min_cluster_size"] = hdbscan_min_cluster_size
+        cluster_labels = hdbscan_cluster_labels(
+            surviving_embeddings,
+            min_cluster_size=hdbscan_min_cluster_size,
+        )
+        cluster_display_by_id = dumb_cluster_display_labels(cluster_labels)
+        enriched_candidates: list[ReferenceCandidateSummary] = []
+        for index, candidate in enumerate(surviving_candidates):
+            hdbscan_cluster_id = cluster_labels[index]
+            display_label = cluster_display_by_id.get(hdbscan_cluster_id, "unknown")
+            enriched_scores = dict(candidate.default_scores)
+            enriched_scores["mood_cluster"] = float(hdbscan_cluster_id)
+            mood_flags = list(candidate.risk_flags)
+            cluster_flag = cluster_risk_flag_for_label(display_label)
+            if cluster_flag not in mood_flags:
+                mood_flags.append(cluster_flag)
+            enriched_candidates.append(
+                candidate.model_copy(
+                    update={
+                        "default_scores": enriched_scores,
+                        "risk_flags": mood_flags,
+                    }
+                )
+            )
+
+        ranked_indices = sorted(
+            range(len(enriched_candidates)),
+            key=lambda index: (
+                -adjusted_scores[kept_indices[index]],
+                enriched_candidates[index].source_recording_id or "",
+                enriched_candidates[index].source_start_seconds,
+            ),
+        )[:candidate_count_cap]
+        final_candidates = [
+            enriched_candidates[index].model_copy(update={"embedding_index": position})
+            for position, index in enumerate(ranked_indices)
+        ]
+        final_embeddings = [normalize_embedding_vector(surviving_embeddings[index]) for index in ranked_indices]
+        return final_candidates, final_embeddings
+
     def _build_reference_run_candidate_embeddings(
         self,
         candidates: list[ReferenceCandidateSummary],
@@ -2578,7 +2868,7 @@ class SQLiteRepository:
             embeddings.append(self._embed_audio_bytes_for_reference_space(audio_bytes))
         return embeddings
 
-    def _build_reference_run_candidates(
+    def _build_reference_run_candidates_from_vad_windows(
         self,
         run_id: str,
         project_id: str,
@@ -2589,7 +2879,7 @@ class SQLiteRepository:
             config.get("target_durations"),
             str(config.get("mode") or "both"),
         )
-        candidate_count_cap = max(8, min(int(config.get("candidate_count_cap") or 60), 200))
+        candidate_count_cap = self._normalize_reference_candidate_count_cap(config.get("candidate_count_cap"))
         stride_ratio = float(config.get("overlap_stride_ratio") or 0.5)
         stride_ratio = max(0.2, min(stride_ratio, 0.9))
 
@@ -3350,6 +3640,16 @@ class SQLiteRepository:
 
     def _new_id(self, prefix: str) -> str:
         return f"{prefix}-{uuid4().hex}"
+
+    def _new_reference_run_id(self, session: Session, project_id: str) -> str:
+        safe_project_id = self._validate_managed_media_id(project_id)
+        base = self._validate_managed_media_id(f"reference-run-{safe_project_id}")
+        run_id = base
+        suffix = 2
+        while session.get(ReferencePickerRun, run_id) is not None:
+            run_id = self._validate_managed_media_id(f"{base}-{suffix}")
+            suffix += 1
+        return run_id
 
     def _validate_audio_asset(
         self,

@@ -105,12 +105,22 @@ def run_asr(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     condition_on_previous_text = bool(config.get("asr_condition_on_previous_text", False))
     transcripts: list[dict[str, Any]] = []
     model = None
+
     try:
         try:
             with timeout_after(model_load_timeout, "ASR model load"):
                 model = WhisperModel(model_reference, device=device, compute_type=compute_type)
         except TimeoutError as exc:
-            raise RuntimeError(f"ASR model load timed out: {exc}") from exc
+            raise RuntimeError(
+                f"ASR model load timed out: requested={model_name!r}, "
+                f"resolved={model_reference!r}, device={device!r}, compute_type={compute_type!r}: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"ASR model unavailable: requested={model_name!r}, "
+                f"resolved={model_reference!r}, device={device!r}, compute_type={compute_type!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         for buffer in queue:
             audio_path = resolve_under_root(run_root, str(buffer.get("queue_audio_path") or buffer["audio_path"]))
             try:

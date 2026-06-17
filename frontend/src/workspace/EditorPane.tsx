@@ -20,6 +20,7 @@ type EditorPaneProps = {
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
   activeClip: ClipLabItem | null;
+  disableWaveformPeaks?: boolean;
   activeClipAudioUrl: string | null;
   canUndo: boolean;
   canRedo: boolean;
@@ -57,6 +58,7 @@ export default function EditorPane({
   workspaceError,
   workspaceEmptyMessage,
   activeClip,
+  disableWaveformPeaks = false,
   activeClipAudioUrl,
   canUndo,
   canRedo,
@@ -145,6 +147,12 @@ export default function EditorPane({
   useEffect(() => {
     if (!activeClip) {
       setWaveformPeaks(null);
+      return;
+    }
+
+    if (disableWaveformPeaks) {
+      setWaveformPeaks(null);
+      setWaveformError(null);
       return;
     }
 

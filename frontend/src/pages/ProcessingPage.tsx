@@ -138,13 +138,14 @@ function launchBlockReason(input: {
   selectedCount: number;
   preflightLoading: boolean;
   preflightOk: boolean;
+  preflightError: string | null;
 }): string | null {
   if (input.busy) return "Starting dataset worker…";
   if (input.runningRun) return "A dataset worker is already active.";
   if (input.pendingRun) return "A pending run must be started before creating another.";
   if (input.selectedCount === 0) return "Select at least one source WAV in the sidebar.";
   if (input.preflightLoading) return "Waiting for dataset worker preflight.";
-  if (!input.preflightOk) return "Dataset worker preflight must pass before launching.";
+  if (!input.preflightOk) return input.preflightError || "Dataset worker preflight must pass before launching.";
   return null;
 }
 
@@ -245,7 +246,12 @@ export default function ProcessingPage({
   async function loadPreflight() {
     setPreflightLoading(true);
     try {
-      setPreflight(await fetchDatasetPreflight());
+      const nextPreflight = await fetchDatasetPreflight({
+        asrModel: model,
+        asrDevice,
+        asrComputeType,
+      });
+      setPreflight(nextPreflight);
     } catch (preflightError) {
       setPreflight({ ok: false, error: getErrorMessage(preflightError, "Dataset worker preflight failed.") });
     } finally {
@@ -290,9 +296,14 @@ export default function ProcessingPage({
     setLog(null);
     if (activeProject) {
       void load(activeProject.id);
-      void loadPreflight();
     }
   }, [activeProject?.id]);
+
+  useEffect(() => {
+    if (activeProject) {
+      void loadPreflight();
+    }
+  }, [activeProject?.id, model, asrDevice, asrComputeType]);
 
   useEffect(() => {
     if (activityRun) void refreshRun(activityRun.id, { updateLog: true });
@@ -411,6 +422,7 @@ export default function ProcessingPage({
     selectedCount: selectedRecordingIds.length,
     preflightLoading,
     preflightOk,
+    preflightError: preflight?.error ?? null,
   });
   const launchDisabled = launchBlockedReason !== null;
   const readyForSlicerHandoff = selectedRun ? isReadyForSlicerHandoff(selectedRun) : false;
@@ -427,8 +439,14 @@ export default function ProcessingPage({
       <div className="processing-topline">
         <div>
           <p className="eyebrow">Environment</p>
-          <strong>{preflightLoading ? "Checking dataset worker" : preflight?.ok ? "Dataset worker ready" : "Dataset worker needs attention"}</strong>
-          <span>{preflightLoading ? "Running dependency and tool checks without blocking run history." : preflight?.ok ? "Heavy dependencies and configured tools passed preflight." : preflight?.error ?? "Run preflight to inspect the worker environment."}</span>
+          <strong>{preflightLoading ? `Checking ASR model ${model}` : preflight?.ok ? "Dataset worker ready" : "ASR model unavailable"}</strong>
+          <span>
+            {preflightLoading
+              ? `Verifying the selected ASR model (${model}) can load before launch.`
+              : preflight?.ok
+                ? `Selected ASR model ${model} and configured tools passed preflight.`
+                : preflight?.error ?? "Run preflight to inspect the worker environment."}
+          </span>
           <small>API: {API_BASE}</small>
         </div>
         <button className="secondary-button" type="button" onClick={() => { void load(activeProject.id); void loadPreflight(); }}>Refresh all</button>

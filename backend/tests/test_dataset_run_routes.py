@@ -9,15 +9,20 @@ from fastapi import HTTPException
 from app.main import (
     create_project_dataset_run,
     list_project_dataset_runs,
+    read_dataset_export_results,
     read_dataset_run,
     read_dataset_run_log,
     read_dataset_slicer_results,
     read_dataset_speakers,
+    rerun_project_dataset_export,
     rerun_project_dataset_slicer,
     resume_project_dataset_run,
+    system_preflight,
     update_dataset_speaker_selection,
 )
 from app.models import (
+    DatasetExportResultsView,
+    DatasetExportRerunRequest,
     DatasetRunArtifactView,
     DatasetRunCreateRequest,
     DatasetRunLogView,
@@ -54,6 +59,23 @@ def run_view() -> DatasetRunView:
 
 
 class DatasetRunRouteTests(TestCase):
+    def test_system_preflight_passes_selected_asr_model(self) -> None:
+        with patch("app.main.run_dataset_worker_preflight", return_value={"ok": True}) as preflight:
+            result = system_preflight(asr_model="medium.en", asr_device="cuda", asr_compute_type="float16")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            preflight.call_args.kwargs,
+            {
+                "artifact_root": None,
+                "asr_model": "medium.en",
+                "asr_model_path": None,
+                "asr_cache_dir": None,
+                "asr_device": "cuda",
+                "asr_compute_type": "float16",
+            },
+        )
+
     def test_create_list_get_and_log_routes_serialize(self) -> None:
         run = run_view()
         payload = DatasetRunCreateRequest(source_recording_ids=["recording-1"], single_speaker=True)
@@ -118,6 +140,25 @@ class DatasetRunRouteTests(TestCase):
         self.assertEqual(rerun_response.id, run.id)
         self.assertEqual(results_response.safe_cutpoint_summary["accepted_cutpoints"], 3)
         self.assertEqual(rerun.call_args.args[2].config["cutpoint_min_gap_ms"], 40)
+
+    def test_export_rerun_and_results_routes_serialize(self) -> None:
+        run = run_view()
+        results = DatasetExportResultsView(
+            run_id=run.id,
+            export_summary={"exported_clip_count": 2},
+            export_manifest=[{"id": "clip-1"}],
+            export_audit=[],
+        )
+        with (
+            patch("app.main.rerun_dataset_native_export", return_value=run) as rerun,
+            patch("app.main.get_dataset_export_results", return_value=results),
+        ):
+            rerun_response = rerun_project_dataset_export(run.id, DatasetExportRerunRequest())
+            results_response = read_dataset_export_results(run.id)
+
+        self.assertEqual(rerun_response.id, run.id)
+        self.assertEqual(results_response.export_summary["exported_clip_count"], 2)
+        self.assertEqual(rerun.call_args.args[2].config, {})
 
     def test_speaker_routes_serialize(self) -> None:
         run = run_view()

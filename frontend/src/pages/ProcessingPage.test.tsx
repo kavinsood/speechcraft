@@ -180,13 +180,20 @@ describe("ProcessingPage", () => {
   });
 
   it("blocks launch when dataset worker preflight fails", async () => {
-    vi.mocked(fetchDatasetPreflight).mockResolvedValue({ ok: false, error: "CUDA unavailable" });
+    vi.mocked(fetchDatasetPreflight).mockResolvedValue({
+      ok: false,
+      error: "ASR model snapshot is incomplete: missing model.bin",
+      asr_model: {
+        ok: false,
+        model: "medium.en",
+        snapshot_check: { ok: false, missing_files: ["model.bin"] },
+      },
+    });
     renderPage();
 
-    await screen.findByText("Dataset worker needs attention");
+    await screen.findByText("ASR model unavailable");
     expect((screen.getByRole("button", { name: "Create and start single-speaker run" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText("Dataset worker preflight must pass before launching.")).not.toBeNull();
-    expect(screen.getByText("CUDA unavailable")).not.toBeNull();
+    expect(screen.getAllByText("ASR model snapshot is incomplete: missing model.bin").length).toBeGreaterThan(0);
   });
 
   it("loads run history without waiting for slow preflight", async () => {
@@ -199,7 +206,7 @@ describe("ProcessingPage", () => {
     renderPage();
 
     expect(await screen.findByText("No dataset runs yet.")).not.toBeNull();
-    expect(screen.getByText("Checking dataset worker")).not.toBeNull();
+    expect(screen.getByText("Checking ASR model small.en")).not.toBeNull();
     expect((screen.getByRole("button", { name: "Create and start single-speaker run" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText("Waiting for dataset worker preflight.")).not.toBeNull();
     finishPreflight({ ok: true });
@@ -210,11 +217,32 @@ describe("ProcessingPage", () => {
     vi.mocked(fetchDatasetPreflight).mockRejectedValue(new Error("Backend API is unreachable at http://127.0.0.1:8010. Restart make dev-backend, then refresh."));
     renderPage();
 
-    expect(await screen.findByText("Dataset worker needs attention")).not.toBeNull();
+    expect(await screen.findByText("ASR model unavailable")).not.toBeNull();
     expect(
-      screen.getByText("Backend API is unreachable at http://127.0.0.1:8010. Restart make dev-backend, then refresh."),
-    ).not.toBeNull();
+      screen.getAllByText("Backend API is unreachable at http://127.0.0.1:8010. Restart make dev-backend, then refresh.").length,
+    ).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "Create and start single-speaker run" })).not.toBeNull();
+  });
+
+  it("requests preflight for the selected ASR model and updates when the model changes", async () => {
+    renderPage();
+
+    await screen.findByRole("button", { name: "Create and start single-speaker run" });
+    expect(fetchDatasetPreflight).toHaveBeenCalledWith({
+      asrModel: "small.en",
+      asrDevice: "cuda",
+      asrComputeType: "float16",
+    });
+
+    fireEvent.change(screen.getByLabelText("Whisper model"), { target: { value: "medium.en" } });
+
+    await waitFor(() =>
+      expect(fetchDatasetPreflight).toHaveBeenLastCalledWith({
+        asrModel: "medium.en",
+        asrDevice: "cuda",
+        asrComputeType: "float16",
+      }),
+    );
   });
 
   it("keeps processing parameter controls available while hiding VAD controls", async () => {

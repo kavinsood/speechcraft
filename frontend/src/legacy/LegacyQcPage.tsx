@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ApiError, createProjectQcRun, fetchProjectQcRuns, fetchQcRun } from "../api";
+import { ApiError, createProjectQcRun, fetchDatasetSlicerResults, fetchProjectQcRuns, fetchQcRun } from "../api";
 import JobActivityPanel, { type JobActivity } from "../components/JobActivityPanel";
 import { usePipelineContext, type LabHandoffContext } from "../pipeline/PipelineContext";
 import type { Project, QcBucket, QcRun, SliceQcResult } from "../types";
@@ -28,6 +28,8 @@ const filterToBucket: Partial<Record<BucketFilter, QcBucket>> = {
   "needs-review": "needs_review",
   "auto-rejected": "auto_rejected",
 };
+const HIDDEN_REJECT_THRESHOLD = 0.35;
+const HISTOGRAM_BIN_COUNT = 56;
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
@@ -79,7 +81,7 @@ function getResultDuration(result: SliceQcResult): number {
 }
 
 function classifyVisibleBucket(result: SliceQcResult, keepThreshold: number, rejectThreshold: number): QcBucket {
-  if (result.reason_codes.length > 0 || result.aggregate_score < rejectThreshold) {
+  if (result.reason_codes.length > 0 || result.bucket === "auto_rejected") {
     return "auto_rejected";
   }
   if (result.aggregate_score >= keepThreshold) {
@@ -97,6 +99,175 @@ function countBuckets(results: SliceQcResult[], keepThreshold: number, rejectThr
     },
     { auto_kept: 0, needs_review: 0, auto_rejected: 0 },
   );
+}
+
+function datasetClipReasonCodes(row: Record<string, unknown>): string[] {
+  return [
+    ...(((row.review_reason_codes as unknown[]) ?? []).filter((value): value is string => typeof value === "string")),
+  ];
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function combinedAsrScore(avgLogprob: number | null, noSpeechProb: number | null): number | null {
+  if (avgLogprob === null && noSpeechProb === null) {
+    return null;
+  }
+  const logprobScore = avgLogprob === null ? 0.5 : clamp01((avgLogprob + 1.5) / 1.5);
+  const noSpeechScore = noSpeechProb === null ? 0.5 : clamp01(1 - noSpeechProb);
+  return Number((0.7 * logprobScore + 0.3 * noSpeechScore).toFixed(3));
+}
+
+function syntheticQcScore(input: {
+  asrScore: number | null;
+  needsReview: boolean;
+  fatalCount: number;
+  warningCount: number;
+  oovCount: number;
+  numericHazardCount: number;
+  symbolHazardCount: number;
+  reviewReasonCount: number;
+}): number {
+  const {
+    asrScore,
+    needsReview,
+    fatalCount,
+    warningCount,
+    oovCount,
+    numericHazardCount,
+    symbolHazardCount,
+    reviewReasonCount,
+  } = input;
+  if (fatalCount > 0) {
+    return Number(Math.max(0.08, 0.24 - fatalCount * 0.04).toFixed(3));
+  }
+  let score = asrScore ?? (needsReview ? 0.72 : 0.9);
+  if (needsReview) score -= 0.06;
+  score -= Math.min(0.18, warningCount * 0.035);
+  score -= Math.min(0.12, oovCount * 0.06);
+  score -= Math.min(0.12, numericHazardCount * 0.045);
+  score -= Math.min(0.12, symbolHazardCount * 0.05);
+  score -= Math.min(0.08, Math.max(0, reviewReasonCount - 1) * 0.025);
+  return Number(clamp01(score).toFixed(3));
+}
+
+function buildSyntheticQcRun(
+  projectId: string,
+  slicerRunId: string,
+  candidateRows: Array<Record<string, unknown>>,
+  alignmentQcRows: Array<Record<string, unknown>>,
+  transcriptRows: Array<Record<string, unknown>>,
+  alignedWords: Array<Record<string, unknown>>,
+  keepThreshold: number,
+  rejectThreshold: number,
+  preset: string,
+): QcRun {
+  const createdAt = new Date().toISOString();
+  const runId = `dataset-qc-${slicerRunId}`;
+  const qcByBuffer = new Map(alignmentQcRows.map((row) => [String(row.buffer_id ?? ""), row]));
+  const transcriptByBuffer = new Map(transcriptRows.map((row) => [String(row.buffer_id ?? ""), row]));
+  const wordById = new Map(alignedWords.map((row) => [String(row.id ?? ""), row]));
+  const results: SliceQcResult[] = candidateRows.map((row, index) => {
+    const durationSeconds = Number(row.duration_sec ?? 0) || 0;
+    const reviewReasons = datasetClipReasonCodes(row);
+    const needsReview = Boolean(row.needs_review) || reviewReasons.length > 0;
+    const bufferId = String(row.buffer_id ?? "");
+    const qcRow = qcByBuffer.get(bufferId) ?? {};
+    const transcriptRow = transcriptByBuffer.get(bufferId) ?? {};
+    const fatalFlags = ((qcRow.fatal_reason_codes as unknown[]) ?? []).filter((value): value is string => typeof value === "string");
+    const warningFlags = ((qcRow.warning_reason_codes as unknown[]) ?? []).filter((value): value is string => typeof value === "string");
+    const avgLogprobRaw = qcRow.asr_min_avg_logprob;
+    const noSpeechProbRaw = qcRow.asr_max_no_speech_prob;
+    const avgLogprob = typeof avgLogprobRaw === "number" && Number.isFinite(avgLogprobRaw) ? avgLogprobRaw : null;
+    const noSpeechProb = typeof noSpeechProbRaw === "number" && Number.isFinite(noSpeechProbRaw) ? noSpeechProbRaw : null;
+    const asrScore = combinedAsrScore(avgLogprob, noSpeechProb);
+    const candidateWordIds = Array.isArray(row.word_ids) ? row.word_ids.map(String) : [];
+    const wordRows = candidateWordIds.map((wordId) => wordById.get(wordId)).filter((value): value is Record<string, unknown> => Boolean(value));
+    const oovCount = wordRows.filter((word) => Boolean(word.is_oov)).length;
+    const numericHazardCount = wordRows.filter((word) => Boolean(word.contains_numeric)).length;
+    const symbolHazardCount = wordRows.filter((word) => Boolean(word.contains_danger_symbol)).length;
+    const aggregateScore = syntheticQcScore({
+      asrScore,
+      needsReview,
+      fatalCount: fatalFlags.length,
+      warningCount: warningFlags.length,
+      oovCount,
+      numericHazardCount,
+      symbolHazardCount,
+      reviewReasonCount: reviewReasons.length,
+    });
+    const bucket: QcBucket =
+      fatalFlags.length > 0 ? "auto_rejected" : needsReview ? "needs_review" : "auto_kept";
+    const sampleRate = Number(row.sample_rate ?? 16000) || 16000;
+    const startSeconds = Number(row.source_start_sample ?? 0) / sampleRate;
+    const endSeconds = Number(row.source_end_sample ?? 0) / sampleRate;
+    return {
+      id: `${runId}-${String(row.id ?? index)}`,
+      qc_run_id: runId,
+      slice_id: String(row.id ?? `candidate-${index}`),
+      source_recording_id: String(row.source_audio_id ?? ""),
+      source_order_index: index,
+      source_start_seconds: Number.isFinite(startSeconds) ? startSeconds : null,
+      source_end_seconds: Number.isFinite(endSeconds) ? endSeconds : null,
+      aggregate_score: Number(aggregateScore.toFixed(3)),
+      bucket,
+      raw_metrics: {
+        transcript_text: String(row.training_text ?? ""),
+        duration_seconds: durationSeconds,
+        word_count: Array.isArray(row.word_ids) ? row.word_ids.length : 0,
+        needs_review: needsReview,
+        review_reason_count: reviewReasons.length,
+        buffer_warning_reason_count: Array.isArray(row.buffer_warning_reason_codes) ? row.buffer_warning_reason_codes.length : 0,
+        asr_score: asrScore,
+        asr_min_avg_logprob: avgLogprob,
+        asr_max_no_speech_prob: noSpeechProb,
+        alignment_qc_fatal_count: fatalFlags.length,
+        alignment_qc_warning_count: warningFlags.length,
+        alignment_qc_fatal_flags: fatalFlags,
+        alignment_qc_warning_flags: warningFlags,
+        oov_count: oovCount,
+        numeric_hazard_count: numericHazardCount,
+        symbol_hazard_count: symbolHazardCount,
+        slicer_review_reason_codes: reviewReasons,
+        transcript_language_probability:
+          typeof transcriptRow.language_probability === "number" && Number.isFinite(transcriptRow.language_probability)
+            ? transcriptRow.language_probability
+            : null,
+      },
+      reason_codes: [...fatalFlags, ...reviewReasons],
+      human_review_status: "unresolved",
+      is_locked: false,
+      created_at: createdAt,
+    };
+  });
+  const bucketCounts = results.reduce<Partial<Record<QcBucket, number>>>((counts, result) => {
+    counts[result.bucket] = (counts[result.bucket] ?? 0) + 1;
+    return counts;
+  }, {});
+  return {
+    id: runId,
+    project_id: projectId,
+    slicer_run_id: slicerRunId,
+    status: "completed",
+    threshold_config: {
+      keep_threshold: keepThreshold,
+      reject_threshold: rejectThreshold,
+      preset,
+    },
+    slice_population_hash: slicerRunId,
+    transcript_basis_hash: slicerRunId,
+    audio_basis_hash: slicerRunId,
+    is_stale: false,
+    stale_reason: null,
+    error_message: null,
+    created_at: createdAt,
+    completed_at: createdAt,
+    result_count: results.length,
+    bucket_counts: bucketCounts,
+    results,
+  };
 }
 
 function runToActivity(run: QcRun | null, isRunning: boolean, error: string | null): JobActivity | null {
@@ -145,7 +316,7 @@ function runToActivity(run: QcRun | null, isRunning: boolean, error: string | nu
       {
         id: `${run.id}-thresholds`,
         timestamp: "config",
-        message: `Keep ${run.threshold_config.keep_threshold ?? "n/a"}, reject ${run.threshold_config.reject_threshold ?? "n/a"}`,
+        message: `Keep ${run.threshold_config.keep_threshold ?? "n/a"}`,
       },
       {
         id: `${run.id}-buckets`,
@@ -173,29 +344,49 @@ export default function QcPage({
   const [qcRuns, setQcRuns] = useState<QcRun[]>([]);
   const [activeRun, setActiveRun] = useState<QcRun | null>(null);
   const [keepThreshold, setKeepThreshold] = useState(0.72);
-  const [rejectThreshold, setRejectThreshold] = useState(0.35);
   const [preset, setPreset] = useState("balanced");
   const [bucketFilter, setBucketFilter] = useState<BucketFilter>("all");
   const [sortMode, setSortMode] = useState<QcSortMode>("source-order");
-  const [showAdvancedMetrics, setShowAdvancedMetrics] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [isRunningQc, setIsRunningQc] = useState(false);
+  const [datasetFallbackMode, setDatasetFallbackMode] = useState(false);
 
   async function loadQcRuns(projectId: string, slicerRunId: string) {
     setLoadStatus("loading");
     setLoadError(null);
     try {
       const runs = await fetchProjectQcRuns(projectId, slicerRunId);
+      setDatasetFallbackMode(false);
       setQcRuns(runs);
       setLoadStatus("ready");
       if (!selectedQcRunId && runs[0]) {
         selectQcRun(runs[0].id);
       }
     } catch (error) {
-      setQcRuns([]);
-      setActiveRun(null);
-      setLoadStatus("error");
-      setLoadError(getErrorMessage(error, "QC runs could not be loaded."));
+      try {
+        const results = await fetchDatasetSlicerResults(slicerRunId);
+        const syntheticRun = buildSyntheticQcRun(
+          projectId,
+          slicerRunId,
+          results.candidate_review_manifest,
+          results.alignment_qc_by_buffer ?? [],
+          results.transcripts ?? [],
+          results.aligned_words ?? [],
+          keepThreshold,
+          HIDDEN_REJECT_THRESHOLD,
+          preset,
+        );
+        setDatasetFallbackMode(true);
+        setQcRuns([syntheticRun]);
+        setActiveRun(syntheticRun);
+        setLoadStatus("ready");
+        selectQcRun(syntheticRun.id);
+      } catch (datasetError) {
+        setQcRuns([]);
+        setActiveRun(null);
+        setLoadStatus("error");
+        setLoadError(getErrorMessage(datasetError ?? error, "QC runs could not be loaded."));
+      }
     }
   }
 
@@ -215,6 +406,10 @@ export default function QcPage({
       setActiveRun(null);
       return;
     }
+    if (datasetFallbackMode) {
+      setActiveRun(qcRuns.find((run) => run.id === selectedQcRunId) ?? null);
+      return;
+    }
     const qcRunId = selectedQcRunId;
     let cancelled = false;
     async function loadRunDetail() {
@@ -225,7 +420,6 @@ export default function QcPage({
         }
         setActiveRun(run);
         setKeepThreshold(Number(run.threshold_config.keep_threshold ?? 0.72));
-        setRejectThreshold(Number(run.threshold_config.reject_threshold ?? 0.35));
         setPreset(String(run.threshold_config.preset ?? "balanced"));
       } catch (error) {
         if (!cancelled) {
@@ -237,17 +431,17 @@ export default function QcPage({
     return () => {
       cancelled = true;
     };
-  }, [selectedQcRunId]);
+  }, [datasetFallbackMode, qcRuns, selectedQcRunId]);
 
   const results = activeRun?.results ?? [];
   const visibleBucketCounts = useMemo(
-    () => countBuckets(results, keepThreshold, rejectThreshold),
-    [results, keepThreshold, rejectThreshold],
+    () => countBuckets(results, keepThreshold, HIDDEN_REJECT_THRESHOLD),
+    [results, keepThreshold],
   );
   const visibleYield = results.length ? visibleBucketCounts.auto_kept / results.length : 0;
   const totalDuration = results.reduce((sum, result) => sum + getResultDuration(result), 0);
   const keptDuration = results.reduce((sum, result) => {
-    return classifyVisibleBucket(result, keepThreshold, rejectThreshold) === "auto_kept"
+    return classifyVisibleBucket(result, keepThreshold, HIDDEN_REJECT_THRESHOLD) === "auto_kept"
       ? sum + getResultDuration(result)
       : sum;
   }, 0);
@@ -257,7 +451,7 @@ export default function QcPage({
   const filteredResults = useMemo(() => {
     const bucket = filterToBucket[bucketFilter];
     const nextResults = bucket
-      ? results.filter((result) => classifyVisibleBucket(result, keepThreshold, rejectThreshold) === bucket)
+      ? results.filter((result) => classifyVisibleBucket(result, keepThreshold, HIDDEN_REJECT_THRESHOLD) === bucket)
       : [...results];
 
     if (sortMode === "source-order") {
@@ -268,17 +462,60 @@ export default function QcPage({
       nextResults.sort((left, right) => right.aggregate_score - left.aggregate_score);
     }
     return nextResults;
-  }, [bucketFilter, keepThreshold, rejectThreshold, results, sortMode]);
+  }, [bucketFilter, keepThreshold, results, sortMode]);
 
   const histogramBins = useMemo(() => {
-    const bins = Array.from({ length: 10 }, (_, index) => ({ label: `${index / 10}-${(index + 1) / 10}`, count: 0 }));
-    for (const result of results) {
-      const index = Math.max(0, Math.min(9, Math.floor(result.aggregate_score * 10)));
-      bins[index].count += 1;
+    const scores = results.map((result) => result.aggregate_score).filter((value) => Number.isFinite(value));
+    if (scores.length === 0) {
+      return Array.from({ length: HISTOGRAM_BIN_COUNT }, (_, index) => ({
+        label: `${(index / HISTOGRAM_BIN_COUNT).toFixed(2)}`,
+        count: 0,
+        start: index / HISTOGRAM_BIN_COUNT,
+        end: (index + 1) / HISTOGRAM_BIN_COUNT,
+        bucketCounts: { auto_kept: 0, needs_review: 0, auto_rejected: 0 } as Record<QcBucket, number>,
+        dominantBucket: "needs_review" as QcBucket,
+      }));
     }
-    return bins;
-  }, [results]);
+    const rawMin = Math.min(...scores);
+    const rawMax = Math.max(...scores);
+    const padding = Math.max(0.02, (rawMax - rawMin) * 0.08);
+    const domainMin = Math.max(0, rawMin - padding);
+    const domainMax = Math.min(1, rawMax + padding);
+    const width = Math.max(0.001, domainMax - domainMin);
+    const bins = Array.from({ length: HISTOGRAM_BIN_COUNT }, (_, index) => {
+      const start = domainMin + (width * index) / HISTOGRAM_BIN_COUNT;
+      const end = domainMin + (width * (index + 1)) / HISTOGRAM_BIN_COUNT;
+      return {
+        label: `${start.toFixed(2)}`,
+        count: 0,
+        start,
+        end,
+        bucketCounts: { auto_kept: 0, needs_review: 0, auto_rejected: 0 } as Record<QcBucket, number>,
+        dominantBucket: "needs_review" as QcBucket,
+      };
+    });
+    results.forEach((result) => {
+      const score = result.aggregate_score;
+      const normalized = (score - domainMin) / width;
+      const index = Math.max(0, Math.min(HISTOGRAM_BIN_COUNT - 1, Math.floor(normalized * HISTOGRAM_BIN_COUNT)));
+      bins[index].count += 1;
+      const bucket = classifyVisibleBucket(result, keepThreshold, HIDDEN_REJECT_THRESHOLD);
+      bins[index].bucketCounts[bucket] += 1;
+    });
+    bins.forEach((bin) => {
+      const ordered = (Object.entries(bin.bucketCounts) as Array<[QcBucket, number]>).sort((left, right) => right[1] - left[1]);
+      bin.dominantBucket = ordered[0]?.[0] ?? "needs_review";
+    });
+    return bins.filter((bin) => bin.count > 0);
+  }, [keepThreshold, results]);
   const histogramMax = Math.max(1, ...histogramBins.map((bin) => bin.count));
+  const histogramTicks = useMemo(() => {
+    const top = histogramMax;
+    if (top <= 1) return [1];
+    if (top <= 4) return Array.from({ length: top }, (_, index) => top - index);
+    const mid = Math.max(1, Math.round(top / 2));
+    return [top, mid, 1];
+  }, [histogramMax]);
   const sourceTimelineResults = useMemo(() => [...results].sort(compareSourceOrder), [results]);
 
   async function handleRunQc() {
@@ -288,10 +525,28 @@ export default function QcPage({
     setRunError(null);
     setIsRunningQc(true);
     try {
+      if (datasetFallbackMode) {
+        const results = await fetchDatasetSlicerResults(selectedSlicerRunId);
+        const syntheticRun = buildSyntheticQcRun(
+          activeProject.id,
+          selectedSlicerRunId,
+          results.candidate_review_manifest,
+          results.alignment_qc_by_buffer ?? [],
+          results.transcripts ?? [],
+          results.aligned_words ?? [],
+          keepThreshold,
+          HIDDEN_REJECT_THRESHOLD,
+          preset,
+        );
+        setActiveRun(syntheticRun);
+        setQcRuns([syntheticRun]);
+        selectQcRun(syntheticRun.id);
+        return;
+      }
       const run = await createProjectQcRun(activeProject.id, {
         slicer_run_id: selectedSlicerRunId,
         keep_threshold: keepThreshold,
-        reject_threshold: rejectThreshold,
+        reject_threshold: HIDDEN_REJECT_THRESHOLD,
         preset,
       });
       setActiveRun(run);
@@ -315,7 +570,7 @@ export default function QcPage({
       bucketFilter,
       sort: sortMode,
       keepThreshold,
-      rejectThreshold,
+      rejectThreshold: HIDDEN_REJECT_THRESHOLD,
       preset,
     });
   }
@@ -409,30 +664,6 @@ export default function QcPage({
             <h3>{activeRun ? activeRun.id : "No QC run selected"}</h3>
             <div className="qc-threshold-grid">
               <label>
-                <span>Keep threshold</span>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.01"
-                  value={keepThreshold}
-                  onChange={(event) => setKeepThreshold(Number(event.target.value))}
-                />
-                <strong>{formatPercent(keepThreshold)}</strong>
-              </label>
-              <label>
-                <span>Reject threshold</span>
-                <input
-                  type="range"
-                  min="0"
-                  max={keepThreshold}
-                  step="0.01"
-                  value={rejectThreshold}
-                  onChange={(event) => setRejectThreshold(Number(event.target.value))}
-                />
-                <strong>{formatPercent(rejectThreshold)}</strong>
-              </label>
-              <label>
                 <span>Preset</span>
                 <select className="search-input" value={preset} onChange={(event) => setPreset(event.target.value)}>
                   <option value="balanced">Balanced</option>
@@ -444,6 +675,9 @@ export default function QcPage({
             <button className="primary-button" type="button" onClick={handleRunQc} disabled={isRunningQc}>
               Run QC
             </button>
+            <p className="qc-threshold-note">
+              Clips with fatal alignment issues are auto-rejected. Everything else stays auto-kept or needs review.
+            </p>
             {runError ? <p className="shell-notice shell-notice-error">{runError}</p> : null}
             {activeRun?.is_stale ? (
               <p className="shell-notice shell-notice-warning">
@@ -482,20 +716,60 @@ export default function QcPage({
             <div className="panel-header">
               <div>
                 <p className="eyebrow">Distribution</p>
-                <h3>Scores and source timeline</h3>
+                <h3>Keep line and source timeline</h3>
               </div>
             </div>
-            <div className="qc-histogram" aria-label="QC score distribution">
-              {histogramBins.map((bin) => (
-                <div key={bin.label} className="qc-histogram-bin">
-                  <span style={{ height: `${Math.max(8, (bin.count / histogramMax) * 100)}%` }} />
-                  <small>{bin.count}</small>
+            <div className="qc-histogram-card">
+              <div className="qc-histogram-head">
+                <div>
+                  <strong>Score buckets</strong>
+                  <span>Higher bars mean more clips landed in that range.</span>
                 </div>
-              ))}
+                <div className="qc-keep-badge">Keep ≥ {formatPercent(keepThreshold)}</div>
+              </div>
+              <div className="qc-histogram" aria-label="QC score distribution">
+                <div className="qc-histogram-yaxis" aria-hidden="true">
+                  {histogramTicks.map((tick) => (
+                    <span key={tick}>{tick}</span>
+                  ))}
+                </div>
+                <div className="qc-histogram-bars">
+                  {histogramBins.map((bin) => {
+                    const aboveKeep = bin.end >= keepThreshold;
+                    return (
+                      <div
+                        key={`${bin.label}-${bin.count}`}
+                        className={`qc-histogram-bin qc-histogram-bin-${bin.dominantBucket} ${aboveKeep ? "qc-histogram-bin-keep" : ""}`}
+                      >
+                        <small>{bin.count}</small>
+                        <span style={{ height: `${Math.max(12, (bin.count / histogramMax) * 100)}%` }} />
+                        <label>{bin.label}</label>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
+            <div className="qc-distribution-legend">
+              <span><i className="qc-chip qc-bucket-auto_kept" /> auto-kept</span>
+              <span><i className="qc-chip qc-bucket-needs_review" /> needs review</span>
+              <span><i className="qc-chip qc-bucket-auto_rejected" /> hard reject</span>
+            </div>
+            <label className="qc-inline-threshold">
+              <span>Keep threshold</span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={keepThreshold}
+                onChange={(event) => setKeepThreshold(Number(event.target.value))}
+              />
+              <strong>{formatPercent(keepThreshold)}</strong>
+            </label>
             <div className="qc-timeline-strip" aria-label="QC source-order timeline">
               {sourceTimelineResults.map((result) => {
-                const bucket = classifyVisibleBucket(result, keepThreshold, rejectThreshold);
+                const bucket = classifyVisibleBucket(result, keepThreshold, HIDDEN_REJECT_THRESHOLD);
                 return (
                   <span
                     key={result.id}
@@ -514,44 +788,29 @@ export default function QcPage({
                 <p className="eyebrow">Preview</p>
                 <h3>Slice QC results</h3>
               </div>
-              <label className="overview-checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={showAdvancedMetrics}
-                  onChange={(event) => setShowAdvancedMetrics(event.target.checked)}
-                />
-                <span>Advanced metrics</span>
-              </label>
             </div>
             <div className="qc-preview-table">
               <div className="qc-preview-row qc-preview-header">
-                <span>Slice</span>
+                <span>Transcript</span>
                 <span>Score</span>
+                <span>ASR</span>
                 <span>Visible bucket</span>
                 <span>Machine bucket</span>
-                <span>Review snapshot</span>
                 <span>Reasons</span>
-                {showAdvancedMetrics ? <span>Metrics</span> : null}
               </div>
               {filteredResults.slice(0, 80).map((result) => {
-                const visibleBucket = classifyVisibleBucket(result, keepThreshold, rejectThreshold);
-                const reviewed = result.human_review_status && result.human_review_status !== "unresolved";
+                const visibleBucket = classifyVisibleBucket(result, keepThreshold, HIDDEN_REJECT_THRESHOLD);
                 return (
                   <div
-                    className={`qc-preview-row ${reviewed ? "qc-reviewed" : "qc-unreviewed"}`}
+                    className="qc-preview-row"
                     key={result.id}
                   >
-                    <span>{result.slice_id}</span>
+                    <span>{String(result.raw_metrics.transcript_text ?? result.slice_id)}</span>
                     <span>{result.aggregate_score.toFixed(3)}</span>
+                    <span>{typeof result.raw_metrics.asr_score === "number" ? Number(result.raw_metrics.asr_score).toFixed(3) : "—"}</span>
                     <span className={`qc-bucket-label qc-bucket-${visibleBucket}`}>{bucketLabels[visibleBucket]}</span>
                     <span>{bucketLabels[result.bucket]}</span>
-                    <span>{reviewed ? result.human_review_status : "snapshot unresolved"}</span>
                     <span>{result.reason_codes.length ? result.reason_codes.join(", ") : "none"}</span>
-                    {showAdvancedMetrics ? (
-                      <span>
-                        {numericMetric(result, "duration_seconds").toFixed(2)}s · {numericMetric(result, "word_count")} words
-                      </span>
-                    ) : null}
                   </div>
                 );
               })}
@@ -593,7 +852,7 @@ export default function QcPage({
             <li>
               <strong>Threshold context</strong>
               <span>
-                Keep {formatPercent(keepThreshold)}, reject {formatPercent(rejectThreshold)}, {preset}
+                Keep {formatPercent(keepThreshold)}, {preset}
               </span>
             </li>
             {activeRun?.is_stale ? (
