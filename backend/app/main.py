@@ -27,9 +27,13 @@ from .dataset_runs import (
     save_dataset_speaker_selection,
     start_dataset_run,
 )
+from .dataset_qc import finalize_dataset_qc, get_dataset_qc
 from .models import (
     DatasetExportResultsView,
     DatasetExportRerunRequest,
+    DatasetQcFinalizeRequest,
+    DatasetQcFinalizeResponse,
+    DatasetQcPayloadView,
     DatasetRunCreateRequest,
     DatasetRunResumeRequest,
     DatasetRunLogView,
@@ -264,6 +268,24 @@ def read_dataset_export_results(run_id: str) -> DatasetExportResultsView:
         return get_dataset_export_results(repository, run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/dataset-runs/{run_id}/qc", response_model=DatasetQcPayloadView)
+def read_dataset_qc(run_id: str) -> DatasetQcPayloadView:
+    try:
+        return get_dataset_qc(repository, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/dataset-runs/{run_id}/qc/finalize", response_model=DatasetQcFinalizeResponse)
+def finalize_dataset_qc_route(run_id: str, payload: DatasetQcFinalizeRequest) -> DatasetQcFinalizeResponse:
+    try:
+        return finalize_dataset_qc(repository, run_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/media/dataset-runs/{run_id}/candidate-review/{clip_id}.wav")

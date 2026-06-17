@@ -8,8 +8,10 @@ from fastapi import HTTPException
 
 from app.main import (
     create_project_dataset_run,
+    finalize_dataset_qc_route,
     list_project_dataset_runs,
     read_dataset_export_results,
+    read_dataset_qc,
     read_dataset_run,
     read_dataset_run_log,
     read_dataset_slicer_results,
@@ -23,6 +25,11 @@ from app.main import (
 from app.models import (
     DatasetExportResultsView,
     DatasetExportRerunRequest,
+    DatasetQcFinalizeRequest,
+    DatasetQcFinalizeResponse,
+    DatasetQcFinalizeSummaryView,
+    DatasetQcPayloadView,
+    DatasetQcThresholdsRequest,
     DatasetRunArtifactView,
     DatasetRunCreateRequest,
     DatasetRunLogView,
@@ -200,3 +207,33 @@ class DatasetRunRouteTests(TestCase):
         self.assertEqual(results_response.speaker_regions_summary["speaker_count"], 2)
         self.assertEqual(selection_response.target_speaker_id, "speaker_0")
         self.assertEqual(resume_response.id, run.id)
+
+    def test_qc_routes_serialize(self) -> None:
+        run = run_view()
+        payload = DatasetQcPayloadView(run_id=run.id, ready=True)
+        finalize_response = DatasetQcFinalizeResponse(
+            run_id=run.id,
+            dataset_qc_path="artifacts/dataset_qc.json",
+            summary=DatasetQcFinalizeSummaryView(
+                accepted_count=2,
+                rejected_count=1,
+                accepted_duration_sec=12.5,
+                rejected_duration_sec=3.2,
+            ),
+        )
+        with (
+            patch("app.main.get_dataset_qc", return_value=payload) as get_qc,
+            patch("app.main.finalize_dataset_qc", return_value=finalize_response) as finalize,
+        ):
+            qc_payload = read_dataset_qc(run.id)
+            finalize_result = finalize_dataset_qc_route(
+                run.id,
+                DatasetQcFinalizeRequest(
+                    thresholds=DatasetQcThresholdsRequest(transcript_match_min=85, speaker_check_min=70),
+                ),
+            )
+
+        self.assertTrue(qc_payload.ready)
+        self.assertEqual(finalize_result.summary.accepted_count, 2)
+        get_qc.assert_called_once()
+        finalize.assert_called_once()

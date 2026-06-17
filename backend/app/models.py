@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.orm import validates
+from pydantic import field_validator
 from sqlmodel import Column, Field, JSON, Relationship, SQLModel
 
 
@@ -241,8 +242,13 @@ class RunArtifactKind(str, Enum):
     CANDIDATE_REVIEW_REJECTED_JSON = "candidate_review_rejected_json"
     CANDIDATE_REVIEW_SUMMARY_JSON = "candidate_review_summary_json"
     QUALITY_DROPPED_JSON = "quality_dropped_json"
+    TRANSCRIPT_QC_JSON = "transcript_qc_json"
+    TRANSCRIPT_QC_SUMMARY_JSON = "transcript_qc_summary_json"
+    TARGET_VOICEPRINT_JSON = "target_voiceprint_json"
     SPEAKER_PURITY_JSON = "speaker_purity_json"
+    SPEAKER_PURITY_SUMMARY_JSON = "speaker_purity_summary_json"
     DATASET_QC_JSON = "dataset_qc_json"
+    DATASET_QC_SUMMARY_JSON = "dataset_qc_summary_json"
     VOXCPM_MANIFEST_JSONL = "voxcpm_manifest_jsonl"
     EXPORT_MANIFEST_JSON = "export_manifest_json"
     EXPORT_AUDIT_JSON = "export_audit_json"
@@ -763,6 +769,89 @@ class DatasetExportResultsView(SQLModel):
     export_summary: dict[str, Any] = Field(default_factory=dict)
     export_manifest: list[dict[str, Any]] = Field(default_factory=list)
     export_audit: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DatasetQcDefaultsView(SQLModel):
+    transcript_match_threshold: int = 85
+    speaker_check_threshold: int = 70
+
+
+class DatasetQcWeakSpanView(SQLModel):
+    start_sec: float
+    end_sec: float
+    text: str | None = None
+    score: float | None = None
+
+
+class DatasetQcClipView(SQLModel):
+    clip_id: str
+    audio_path: str
+    audio_url: str
+    duration_sec: float
+    training_text: str
+    alignment_text: str | None = None
+    # Null means the score is missing/unscored; frontend must treat null as rejected.
+    transcript_match: int | None = None
+    speaker_check: int | None = None
+    transcript_reason_codes: list[str] = Field(default_factory=list)
+    speaker_reason_codes: list[str] = Field(default_factory=list)
+    candidate_reason_codes: list[str] = Field(default_factory=list)
+    qc_reason_codes: list[str] = Field(default_factory=list)
+    weak_transcript_spans: list[DatasetQcWeakSpanView] = Field(default_factory=list)
+    weak_speaker_spans: list[DatasetQcWeakSpanView] = Field(default_factory=list)
+    manual_override: Literal["force_keep", "force_reject"] | None = None
+
+
+class DatasetQcFinalizedThresholdsView(SQLModel):
+    transcript_match_min: int
+    speaker_check_min: int
+
+
+class DatasetQcPayloadView(SQLModel):
+    run_id: str
+    ready: bool
+    missing_artifacts: list[str] = Field(default_factory=list)
+    invalid_artifacts: list[str] = Field(default_factory=list)
+    defaults: DatasetQcDefaultsView = Field(default_factory=DatasetQcDefaultsView)
+    finalized: bool = False
+    finalized_thresholds: DatasetQcFinalizedThresholdsView | None = None
+    clips: list[DatasetQcClipView] = Field(default_factory=list)
+
+
+class DatasetQcThresholdsRequest(SQLModel):
+    transcript_match_min: int = Field(ge=0, le=100)
+    speaker_check_min: int = Field(ge=0, le=100)
+
+    @field_validator("transcript_match_min", "speaker_check_min", mode="before")
+    @classmethod
+    def strict_integer_threshold(cls, value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("threshold must be an integer 0-100")
+        return value
+
+
+class DatasetQcManualOverrideRequest(SQLModel):
+    clip_id: str
+    override: Literal["force_keep", "force_reject"]
+    reason: str = ""
+
+
+class DatasetQcFinalizeRequest(SQLModel):
+    thresholds: DatasetQcThresholdsRequest
+    manual_overrides: list[DatasetQcManualOverrideRequest] = Field(default_factory=list)
+
+
+class DatasetQcFinalizeSummaryView(SQLModel):
+    accepted_count: int
+    rejected_count: int
+    accepted_duration_sec: float
+    rejected_duration_sec: float
+
+
+class DatasetQcFinalizeResponse(SQLModel):
+    run_id: str
+    dataset_qc_path: str
+    summary: DatasetQcFinalizeSummaryView
 
 
 class ProjectPreparationRequest(SQLModel):

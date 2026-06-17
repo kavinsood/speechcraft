@@ -117,6 +117,13 @@ ARTIFACT_KINDS = {
     "artifacts/candidate_review_manifest.json": RunArtifactKind.CANDIDATE_REVIEW_MANIFEST_JSON,
     "artifacts/candidate_review_rejected.json": RunArtifactKind.CANDIDATE_REVIEW_REJECTED_JSON,
     "artifacts/candidate_review_summary.json": RunArtifactKind.CANDIDATE_REVIEW_SUMMARY_JSON,
+    "artifacts/transcript_qc.json": RunArtifactKind.TRANSCRIPT_QC_JSON,
+    "artifacts/transcript_qc_summary.json": RunArtifactKind.TRANSCRIPT_QC_SUMMARY_JSON,
+    "artifacts/target_voiceprint.json": RunArtifactKind.TARGET_VOICEPRINT_JSON,
+    "artifacts/speaker_purity.json": RunArtifactKind.SPEAKER_PURITY_JSON,
+    "artifacts/speaker_purity_summary.json": RunArtifactKind.SPEAKER_PURITY_SUMMARY_JSON,
+    "artifacts/dataset_qc.json": RunArtifactKind.DATASET_QC_JSON,
+    "artifacts/dataset_qc_summary.json": RunArtifactKind.DATASET_QC_SUMMARY_JSON,
     "artifacts/export_manifest.json": RunArtifactKind.EXPORT_MANIFEST_JSON,
     "artifacts/export_audit.json": RunArtifactKind.EXPORT_AUDIT_JSON,
     "artifacts/export_summary.json": RunArtifactKind.EXPORT_SUMMARY_JSON,
@@ -139,6 +146,9 @@ SUMMARY_ARTIFACT_KINDS = {
     RunArtifactKind.ALIGNMENT_QC_SUMMARY_JSON,
     RunArtifactKind.SAFE_CUTPOINT_SUMMARY_JSON,
     RunArtifactKind.CANDIDATE_REVIEW_SUMMARY_JSON,
+    RunArtifactKind.TRANSCRIPT_QC_SUMMARY_JSON,
+    RunArtifactKind.SPEAKER_PURITY_SUMMARY_JSON,
+    RunArtifactKind.DATASET_QC_SUMMARY_JSON,
     RunArtifactKind.EXPORT_SUMMARY_JSON,
 }
 SPEAKER_SELECTION_REQUIRED = "speaker_selection_required"
