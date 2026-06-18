@@ -11,6 +11,7 @@ from sqlmodel import Session
 
 from app.dataset_runs import (
     create_dataset_run,
+    generate_dataset_qc_scores,
     get_candidate_review_media_path,
     get_dataset_export_results,
     get_dataset_run_log,
@@ -260,6 +261,35 @@ class DatasetRunTests(TestCase):
         self.assertIn(RunArtifactKind.CANDIDATE_REVIEW_REJECTED_JSON, {artifact.kind for artifact in refreshed.artifacts})
         self.assertIn(RunArtifactKind.RUN_STATUS_JSON, {artifact.kind for artifact in refreshed.artifacts})
 
+    def test_candidate_review_media_path_accepts_clip_id_rows(self) -> None:
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        clip_dir = artifacts / "candidate_review_clips"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = clip_dir / "candidate_review_clip_000000.wav"
+        clip_path.write_bytes(b"RIFF")
+        (artifacts / "candidate_review_manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "clip_id": "candidate_review_clip_000000",
+                        "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000000.wav",
+                        "duration_sec": 1.0,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        resolved = get_candidate_review_media_path(
+            self.repository,
+            run.id,
+            "candidate_review_clip_000000",
+        )
+
+        self.assertEqual(resolved, clip_path)
+
     def test_log_response_is_bounded_and_falls_back_to_process_log(self) -> None:
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
         run_root = self.repository.media_root / str(run.artifact_root)
@@ -335,6 +365,72 @@ class DatasetRunTests(TestCase):
         status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
         self.assertIsNone(status["ok"])
         self.assertEqual(status["stage"], "safe_cutpoints")
+
+    def test_qc_score_generation_launches_worker(self) -> None:
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+        (artifacts / "speaker_selection.json").write_text(json.dumps({"target_speaker_id": "speaker_0"}), encoding="utf-8")
+        (artifacts / "speaker_regions.jsonl").write_text("", encoding="utf-8")
+        (artifacts / "audio_variants_manifest.json").write_text(json.dumps({"variants": []}), encoding="utf-8")
+        process = Mock(pid=9876)
+        with (
+            patch("app.dataset_runs.dataset_worker_python", return_value=Path("/bin/true")),
+            patch("app.dataset_runs.dataset_worker_root", return_value=Path("/tmp/worker")),
+            patch("app.dataset_runs.subprocess.Popen", return_value=process) as popen,
+        ):
+            started = generate_dataset_qc_scores(self.repository, run.id)
+
+        self.assertEqual(started.status, ProcessingRunStatus.RUNNING)
+        self.assertEqual(started.stage, RfcStage.TRANSCRIPT_QC)
+        self.assertIn("speechcraft_dataset.generate_qc_scores", popen.call_args.args[0])
+        status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+        self.assertIsNone(status["ok"])
+        self.assertEqual(status["stage"], "transcript_qc")
+
+    def test_qc_score_generation_rejects_finalized_qc_without_force(self) -> None:
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+        (artifacts / "speaker_selection.json").write_text(json.dumps({"target_speaker_id": "speaker_0"}), encoding="utf-8")
+        (artifacts / "speaker_regions.jsonl").write_text("", encoding="utf-8")
+        (artifacts / "audio_variants_manifest.json").write_text(json.dumps({"variants": []}), encoding="utf-8")
+        (artifacts / "dataset_qc.json").write_text(
+            json.dumps({"schema_version": 1, "stage": "dataset_qc", "clips": [], "thresholds": {}, "score_methods": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "dataset_qc_already_finalized"):
+            generate_dataset_qc_scores(self.repository, run.id)
+
+    def test_qc_score_generation_allows_force_when_finalized_qc_exists(self) -> None:
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+        (artifacts / "speaker_selection.json").write_text(json.dumps({"target_speaker_id": "speaker_0"}), encoding="utf-8")
+        (artifacts / "speaker_regions.jsonl").write_text("", encoding="utf-8")
+        (artifacts / "audio_variants_manifest.json").write_text(json.dumps({"variants": []}), encoding="utf-8")
+        (artifacts / "dataset_qc.json").write_text(
+            json.dumps({"schema_version": 1, "stage": "dataset_qc", "clips": [], "thresholds": {}, "score_methods": {}}),
+            encoding="utf-8",
+        )
+        process = Mock(pid=9876)
+        with (
+            patch("app.dataset_runs.dataset_worker_python", return_value=Path("/bin/true")),
+            patch("app.dataset_runs.dataset_worker_root", return_value=Path("/tmp/worker")),
+            patch("app.dataset_runs.subprocess.Popen", return_value=process) as popen,
+        ):
+            started = generate_dataset_qc_scores(self.repository, run.id, force=True)
+
+        self.assertEqual(started.status, ProcessingRunStatus.RUNNING)
+        command = popen.call_args.args[0]
+        self.assertIn("--force", command)
 
     def test_slicer_results_and_candidate_media_are_manifest_guarded(self) -> None:
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())

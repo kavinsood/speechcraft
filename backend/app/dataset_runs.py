@@ -74,6 +74,8 @@ WORKER_STAGE_MAP = {
     "alignment_qc": RfcStage.MFA,
     "safe_cutpoints": RfcStage.SAFE_CUTPOINTS,
     "candidate_review_clips": RfcStage.CANDIDATE_CLIPS,
+    "transcript_qc": RfcStage.TRANSCRIPT_QC,
+    "speaker_purity": RfcStage.SPEAKER_PURITY,
     "native_export": RfcStage.EXPORT,
 }
 ARTIFACT_KINDS = {
@@ -589,6 +591,65 @@ def rerun_dataset_native_export(repository: Any, run_id: str, request: DatasetEx
         return _view(session, run)
 
 
+def generate_dataset_qc_scores(repository: Any, run_id: str, *, force: bool = False) -> DatasetRunView:
+    with Session(repository.engine, expire_on_commit=False) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        if run.status == ProcessingRunStatus.RUNNING:
+            raise ValueError("Dataset run is already running")
+        run_root = _run_root(repository, run)
+        if (run_root / "artifacts/dataset_qc.json").exists() and not force:
+            raise ValueError("dataset_qc_already_finalized")
+        required = (
+            "artifacts/candidate_review_manifest.json",
+            "artifacts/speaker_selection.json",
+            "artifacts/speaker_regions.jsonl",
+            "artifacts/audio_variants_manifest.json",
+        )
+        missing = [path for path in required if not (run_root / path).exists()]
+        if missing:
+            raise ValueError(f"Dataset run is not QC-score-ready; missing: {', '.join(missing)}")
+        worker_python = dataset_worker_python()
+        if not worker_python.exists():
+            raise ValueError(f"Dataset worker python not found: {worker_python}")
+        config_path = run_root / "config.json"
+        config = _read_json_object(config_path)
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+        status_path = run_root / "status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "ok": None,
+                    "stage": "transcript_qc",
+                    "started_at": utc_now().isoformat(),
+                    "completed_at": None,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        command = [str(worker_python), "-m", "speechcraft_dataset.generate_qc_scores", "--run-root", str(run_root), "--config", str(config_path)]
+        if force:
+            command.append("--force")
+        log_path = run_root / "logs" / "dataset_worker_process.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(dataset_worker_root())
+        with log_path.open("ab") as log_handle:
+            process = subprocess.Popen(command, cwd=str(dataset_worker_root()), env=env, stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
+        run.status = ProcessingRunStatus.RUNNING
+        run.stage = RfcStage.TRANSCRIPT_QC
+        run.started_at = utc_now()
+        run.completed_at = None
+        run.reason_codes = []
+        run.input_summary = {**run.input_summary, "worker_pid": process.pid, "worker_command": command}
+        session.add(run)
+        session.commit()
+        return _view(session, run)
+
+
 def get_dataset_slicer_results(repository: Any, run_id: str) -> DatasetSlicerResultsView:
     with Session(repository.engine) as session:
         run = session.get(ProcessingRun, run_id)
@@ -623,7 +684,14 @@ def get_dataset_export_results(repository: Any, run_id: str) -> DatasetExportRes
 
 def get_candidate_review_media_path(repository: Any, run_id: str, clip_id: str) -> Path:
     results = get_dataset_slicer_results(repository, run_id)
-    clip = next((row for row in results.candidate_review_manifest if str(row.get("id")) == clip_id), None)
+    clip = next(
+        (
+            row
+            for row in results.candidate_review_manifest
+            if str(row.get("id") or row.get("clip_id") or "") == clip_id
+        ),
+        None,
+    )
     if clip is None:
         raise KeyError("Candidate review clip not found")
     with Session(repository.engine) as session:

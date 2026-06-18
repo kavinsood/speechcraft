@@ -4,11 +4,14 @@ from datetime import datetime, timezone
 from unittest import TestCase
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
 from fastapi import HTTPException
 
 from app.main import (
+    app,
     create_project_dataset_run,
     finalize_dataset_qc_route,
+    generate_dataset_qc_scores_route,
     list_project_dataset_runs,
     read_dataset_export_results,
     read_dataset_qc,
@@ -28,6 +31,7 @@ from app.models import (
     DatasetQcFinalizeRequest,
     DatasetQcFinalizeResponse,
     DatasetQcFinalizeSummaryView,
+    DatasetQcGenerateRequest,
     DatasetQcPayloadView,
     DatasetQcThresholdsRequest,
     DatasetRunArtifactView,
@@ -237,3 +241,43 @@ class DatasetRunRouteTests(TestCase):
         self.assertEqual(finalize_result.summary.accepted_count, 2)
         get_qc.assert_called_once()
         finalize.assert_called_once()
+
+    def test_qc_generate_route_serializes(self) -> None:
+        run = run_view()
+        with patch("app.main.generate_dataset_qc_scores", return_value=run) as generate:
+            response = generate_dataset_qc_scores_route(run.id)
+
+        self.assertEqual(response.id, run.id)
+        self.assertEqual(generate.call_args.args[1], run.id)
+
+    def test_qc_generate_route_passes_force_flag(self) -> None:
+        run = run_view()
+        with patch("app.main.generate_dataset_qc_scores", return_value=run) as generate:
+            response = generate_dataset_qc_scores_route(run.id, DatasetQcGenerateRequest(force=True))
+
+        self.assertEqual(response.id, run.id)
+        self.assertTrue(generate.call_args.kwargs["force"])
+
+
+class DatasetQcGenerateRouteHttpTests(TestCase):
+    def test_qc_generate_accepts_post_without_body(self) -> None:
+        run = run_view()
+        client = TestClient(app)
+        with patch("app.main.generate_dataset_qc_scores", return_value=run) as generate:
+            response = client.post(f"/api/dataset-runs/{run.id}/qc/generate")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["id"], run.id)
+        self.assertFalse(generate.call_args.kwargs["force"])
+
+    def test_qc_generate_accepts_explicit_json_body(self) -> None:
+        run = run_view()
+        client = TestClient(app)
+        with patch("app.main.generate_dataset_qc_scores", return_value=run) as generate:
+            response = client.post(
+                f"/api/dataset-runs/{run.id}/qc/generate",
+                json={"force": False},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(generate.call_args.kwargs["force"])

@@ -185,6 +185,7 @@ class RfcStage(str, Enum):
     MFA = "mfa"
     SAFE_CUTPOINTS = "safe_cutpoints"
     CANDIDATE_CLIPS = "candidate_clips"
+    TRANSCRIPT_QC = "transcript_qc"
     SPEAKER_PURITY = "speaker_purity"
     DATASET_QC = "dataset_qc"
     EXPORT = "export"
@@ -271,7 +272,8 @@ RFC_PRETRAINING_JOB_DAG: tuple[tuple[RfcStage, tuple[RfcStage, ...]], ...] = (
     (RfcStage.MFA, (RfcStage.NORMALIZATION,)),
     (RfcStage.SAFE_CUTPOINTS, (RfcStage.MFA,)),
     (RfcStage.CANDIDATE_CLIPS, (RfcStage.SAFE_CUTPOINTS,)),
-    (RfcStage.SPEAKER_PURITY, (RfcStage.CANDIDATE_CLIPS,)),
+    (RfcStage.TRANSCRIPT_QC, (RfcStage.CANDIDATE_CLIPS,)),
+    (RfcStage.SPEAKER_PURITY, (RfcStage.TRANSCRIPT_QC,)),
     (RfcStage.DATASET_QC, (RfcStage.SPEAKER_PURITY,)),
     (RfcStage.EXPORT, (RfcStage.DATASET_QC,)),
 )
@@ -550,18 +552,6 @@ class SpeakerPurityMetrics(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class QCDecision(SQLModel, table=True):
-    id: str = Field(primary_key=True)
-    candidate_clip_id: str = Field(foreign_key="candidateclip.id", index=True)
-    bucket: QCDecisionBucket = Field(sa_column=Column(sql_enum(QCDecisionBucket), index=True))
-    aggregate_score: float | None = None
-    hard_failures: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    reason_codes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    subsystem_decisions: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    human_review_status: ReviewStatus | None = Field(default=None, sa_column=Column(sql_enum(ReviewStatus)))
-    created_at: datetime = Field(default_factory=utc_now)
-
-
 class ExportManifest(SQLModel, table=True):
     id: str = Field(primary_key=True)
     project_id: str = Field(foreign_key="importbatch.id", index=True)
@@ -673,6 +663,8 @@ class DatasetRunCreateRequest(SQLModel):
         "alignment_qc",
         "safe_cutpoints",
         "candidate_review_clips",
+        "transcript_qc",
+        "speaker_purity",
         "native_export",
     ] = "alignment_qc"
 
@@ -791,8 +783,8 @@ class DatasetQcClipView(SQLModel):
     training_text: str
     alignment_text: str | None = None
     # Null means the score is missing/unscored; frontend must treat null as rejected.
-    transcript_match: int | None = None
-    speaker_check: int | None = None
+    transcript_match: float | None = None
+    speaker_check: float | None = None
     transcript_reason_codes: list[str] = Field(default_factory=list)
     speaker_reason_codes: list[str] = Field(default_factory=list)
     candidate_reason_codes: list[str] = Field(default_factory=list)
@@ -839,6 +831,10 @@ class DatasetQcManualOverrideRequest(SQLModel):
 class DatasetQcFinalizeRequest(SQLModel):
     thresholds: DatasetQcThresholdsRequest
     manual_overrides: list[DatasetQcManualOverrideRequest] = Field(default_factory=list)
+
+
+class DatasetQcGenerateRequest(SQLModel):
+    force: bool = False
 
 
 class DatasetQcFinalizeSummaryView(SQLModel):

@@ -17,6 +17,7 @@ from .dataset_runs import (
     get_dataset_run_log,
     get_dataset_speaker_results,
     get_dataset_slicer_results,
+    generate_dataset_qc_scores,
     get_native_export_media_path,
     get_speaker_sample_media_path,
     list_dataset_runs,
@@ -33,6 +34,7 @@ from .models import (
     DatasetExportRerunRequest,
     DatasetQcFinalizeRequest,
     DatasetQcFinalizeResponse,
+    DatasetQcGenerateRequest,
     DatasetQcPayloadView,
     DatasetRunCreateRequest,
     DatasetRunResumeRequest,
@@ -276,6 +278,19 @@ def read_dataset_qc(run_id: str) -> DatasetQcPayloadView:
         return get_dataset_qc(repository, run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/dataset-runs/{run_id}/qc/generate", response_model=DatasetRunView, status_code=202)
+def generate_dataset_qc_scores_route(
+    run_id: str,
+    payload: DatasetQcGenerateRequest | None = None,
+) -> DatasetRunView:
+    try:
+        return generate_dataset_qc_scores(repository, run_id, force=bool(payload.force) if payload else False)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset-runs/{run_id}/qc/finalize", response_model=DatasetQcFinalizeResponse)

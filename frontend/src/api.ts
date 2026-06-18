@@ -2,6 +2,9 @@ import type {
   ClipLabItem,
   DatasetPreflight,
   DatasetExportResults,
+  DatasetQcFinalizeRequest,
+  DatasetQcFinalizeResponse,
+  DatasetQcPayload,
   DatasetSpeakerResults,
   DatasetRun,
   DatasetRunCreateRequest,
@@ -18,8 +21,6 @@ import type {
   ProjectPreparationRun,
   ProjectTranscriptionSettings,
   ProcessingJob,
-  QcRun,
-  QcRunCreateRequest,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
   ReferenceCandidate,
@@ -291,6 +292,32 @@ export async function fetchDatasetExportResults(runId: string): Promise<DatasetE
   return await requestJson<DatasetExportResults>(`${API_BASE}/api/dataset-runs/${runId}/export-results`);
 }
 
+export async function fetchDatasetQc(runId: string): Promise<DatasetQcPayload> {
+  return await requestJson<DatasetQcPayload>(`${API_BASE}/api/dataset-runs/${runId}/qc`);
+}
+
+export async function finalizeDatasetQc(
+  runId: string,
+  payload: DatasetQcFinalizeRequest,
+): Promise<DatasetQcFinalizeResponse> {
+  return await requestJson<DatasetQcFinalizeResponse>(`${API_BASE}/api/dataset-runs/${runId}/qc/finalize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function generateDatasetQcScores(
+  runId: string,
+  options?: { force?: boolean },
+): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/qc/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force: options?.force ?? false }),
+  });
+}
+
 export function buildCandidateReviewAudioUrl(runId: string, clipId: string): string {
   return `${API_BASE}/media/dataset-runs/${runId}/candidate-review/${clipId}.wav`;
 }
@@ -439,31 +466,6 @@ export async function fetchProjectPreparationJobs(projectId: string): Promise<Pr
 export async function fetchProcessingJob(jobId: string): Promise<ProcessingJob> {
   const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
   return await parseJson<ProcessingJob>(response);
-}
-
-export async function fetchProjectQcRuns(projectId: string, slicerRunId?: string): Promise<QcRun[]> {
-  const url = new URL(`${API_BASE}/api/projects/${projectId}/qc-runs`);
-  if (slicerRunId) {
-    url.searchParams.set("slicer_run_id", slicerRunId);
-  }
-  const response = await fetch(url.toString());
-  return await parseJson<QcRun[]>(response);
-}
-
-export async function createProjectQcRun(projectId: string, payload: QcRunCreateRequest): Promise<QcRun> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/qc-runs`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-  return await parseJson<QcRun>(response);
-}
-
-export async function fetchQcRun(qcRunId: string): Promise<QcRun> {
-  const response = await fetch(`${API_BASE}/api/qc-runs/${qcRunId}`);
-  return await parseJson<QcRun>(response);
 }
 
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {

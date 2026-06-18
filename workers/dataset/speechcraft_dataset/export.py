@@ -8,6 +8,71 @@ from typing import Any
 
 from .io import read_json_value, resolve_under_root, sha256_file, write_json
 
+QC_SOURCE_DATASET_QC = "artifacts/dataset_qc.json"
+QC_SOURCE_CANDIDATE_MANIFEST = "artifacts/candidate_review_manifest.json"
+VALID_DATASET_QC_STATUSES = {"accepted", "rejected"}
+VALID_MANUAL_OVERRIDES = {None, "force_keep", "force_reject"}
+
+
+def _load_dataset_qc(run_root: Path) -> dict[str, Any] | None:
+    path = resolve_under_root(run_root, QC_SOURCE_DATASET_QC)
+    if not path.exists():
+        return None
+    payload = read_json_value(path)
+    if not isinstance(payload, dict):
+        raise ValueError("dataset_qc.json must contain an object")
+    if payload.get("schema_version") != 1:
+        raise ValueError("dataset_qc.json must contain schema_version == 1")
+    if payload.get("stage") != "dataset_qc":
+        raise ValueError("dataset_qc.json must contain stage == 'dataset_qc'")
+    if not isinstance(payload.get("thresholds"), dict):
+        raise ValueError("dataset_qc.json must contain thresholds object")
+    if not isinstance(payload.get("score_methods"), dict):
+        raise ValueError("dataset_qc.json must contain score_methods object")
+    clips = payload.get("clips")
+    if not isinstance(clips, list):
+        raise ValueError("dataset_qc.json must contain clips[]")
+    for row in clips:
+        if not isinstance(row, dict):
+            raise ValueError("dataset_qc.json clips[] row must be an object")
+    return payload
+
+
+def _index_dataset_qc_clips(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for row in payload.get("clips", []):
+        clip_id = row.get("clip_id") or row.get("id")
+        if not isinstance(clip_id, str) or not clip_id:
+            raise ValueError("dataset_qc.json clips[] row must contain clip_id")
+        status = row.get("status")
+        if status not in VALID_DATASET_QC_STATUSES:
+            raise ValueError(f"dataset_qc.json clip has invalid status for {clip_id}: {status!r}")
+        manual_override = row.get("manual_override")
+        if manual_override not in VALID_MANUAL_OVERRIDES:
+            raise ValueError(
+                f"dataset_qc.json clip has invalid manual_override for {clip_id}: {manual_override!r}"
+            )
+        if clip_id in indexed:
+            raise ValueError(f"duplicate clip_id in dataset_qc.json: {clip_id}")
+        indexed[clip_id] = row
+    return indexed
+
+
+def _qc_override_counts(payload: dict[str, Any]) -> dict[str, int]:
+    counts = {"force_keep": 0, "force_reject": 0}
+    for row in payload.get("manual_overrides", []):
+        if not isinstance(row, dict):
+            raise ValueError("dataset_qc.json manual_overrides[] row must be an object")
+        override = row.get("override")
+        clip_id = row.get("clip_id")
+        if not isinstance(clip_id, str) or not clip_id:
+            raise ValueError("dataset_qc.json manual_overrides[] row must contain clip_id")
+        if override in counts:
+            counts[override] += 1
+        else:
+            raise ValueError(f"dataset_qc.json manual_overrides[] has invalid override: {override!r}")
+    return counts
+
 
 def _source_maps(run_root: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     source_manifest = read_json_value(resolve_under_root(run_root, "artifacts/source_audio_manifest.json"))
@@ -57,6 +122,12 @@ def export_native_candidate_clips(run_root: Path, config: dict[str, Any]) -> dic
     if not isinstance(candidate_manifest, list):
         raise ValueError("candidate_review_manifest.json must contain a list")
     sources, variants = _source_maps(run_root)
+    dataset_qc = _load_dataset_qc(run_root)
+    dataset_qc_by_id = _index_dataset_qc_clips(dataset_qc) if dataset_qc is not None else {}
+    qc_source = QC_SOURCE_DATASET_QC if dataset_qc is not None else QC_SOURCE_CANDIDATE_MANIFEST
+    qc_thresholds = dataset_qc.get("thresholds") if dataset_qc is not None and isinstance(dataset_qc.get("thresholds"), dict) else None
+    qc_score_methods = dataset_qc.get("score_methods") if dataset_qc is not None and isinstance(dataset_qc.get("score_methods"), dict) else None
+    qc_override_counts = _qc_override_counts(dataset_qc) if dataset_qc is not None else {"force_keep": 0, "force_reject": 0}
 
     export_statuses = set(config.get("native_export_statuses") or ["candidate_review", "accepted"])
     export_dir = resolve_under_root(run_root, "artifacts/native_export_clips")
@@ -68,16 +139,43 @@ def export_native_candidate_clips(run_root: Path, config: dict[str, Any]) -> dic
     rejected: list[dict[str, Any]] = []
     for candidate in candidate_manifest:
         clip_id = str(candidate.get("id") or "")
-        status = str(candidate.get("review_status") or candidate.get("status") or "")
-        if status not in export_statuses:
-            rejected.append(
-                {
-                    "candidate_id": clip_id,
-                    "status": status,
-                    "reason_codes": ["candidate_status_not_exportable"],
-                }
-            )
-            continue
+        manual_override = None
+        if dataset_qc is not None:
+            qc_row = dataset_qc_by_id.get(clip_id)
+            if qc_row is None:
+                rejected.append(
+                    {
+                        "candidate_id": clip_id,
+                        "qc_source": qc_source,
+                        "reason_codes": ["missing_dataset_qc_clip"],
+                    }
+                )
+                continue
+            status = str(qc_row.get("status") or "")
+            manual_override = qc_row.get("manual_override")
+            if status != "accepted":
+                rejected.append(
+                    {
+                        "candidate_id": clip_id,
+                        "qc_source": qc_source,
+                        "status": status,
+                        "manual_override": manual_override,
+                        "reason_codes": ["dataset_qc_status_not_accepted"],
+                    }
+                )
+                continue
+        else:
+            status = str(candidate.get("review_status") or candidate.get("status") or "")
+            if status not in export_statuses:
+                rejected.append(
+                    {
+                        "candidate_id": clip_id,
+                        "qc_source": qc_source,
+                        "status": status,
+                        "reason_codes": ["candidate_status_not_exportable"],
+                    }
+                )
+                continue
         source_audio_id = str(candidate.get("source_audio_id") or "")
         source = sources.get(source_audio_id)
         variant = variants.get(source_audio_id)
@@ -86,6 +184,7 @@ def export_native_candidate_clips(run_root: Path, config: dict[str, Any]) -> dic
                 {
                     "candidate_id": clip_id,
                     "source_audio_id": source_audio_id,
+                    "qc_source": qc_source,
                     "reason_codes": ["missing_source_or_analysis_variant"],
                 }
             )
@@ -129,6 +228,11 @@ def export_native_candidate_clips(run_root: Path, config: dict[str, Any]) -> dic
                 "end_cutpoint_ref": candidate.get("end_cutpoint_ref"),
                 "word_ids": list(candidate.get("word_ids") or []),
                 "export_status": "native_exported",
+                "qc_source": qc_source,
+                "qc_status": "accepted" if dataset_qc is not None else status,
+                "manual_override": manual_override,
+                "qc_thresholds": dict(qc_thresholds) if qc_thresholds is not None else None,
+                "qc_score_methods": dict(qc_score_methods) if qc_score_methods is not None else None,
             }
         )
 
@@ -138,14 +242,17 @@ def export_native_candidate_clips(run_root: Path, config: dict[str, Any]) -> dic
     write_json(export_audit_path, rejected)
     durations = [float(row["duration_sec"]) for row in exported]
     rejection_reason_counts = Counter(reason for row in rejected for reason in row["reason_codes"])
+    input_artifact_hashes = {
+        "candidate_review_manifest_json": sha256_file(manifest_path),
+        "source_audio_manifest_json": sha256_file(resolve_under_root(run_root, "artifacts/source_audio_manifest.json")),
+        "audio_variants_manifest_json": sha256_file(resolve_under_root(run_root, "artifacts/audio_variants_manifest.json")),
+    }
+    if dataset_qc is not None:
+        input_artifact_hashes["dataset_qc_json"] = sha256_file(resolve_under_root(run_root, QC_SOURCE_DATASET_QC))
     summary = {
         "stage": "native_export",
         "config_hash": str(config.get("config_hash") or ""),
-        "input_artifact_hashes": {
-            "candidate_review_manifest_json": sha256_file(manifest_path),
-            "source_audio_manifest_json": sha256_file(resolve_under_root(run_root, "artifacts/source_audio_manifest.json")),
-            "audio_variants_manifest_json": sha256_file(resolve_under_root(run_root, "artifacts/audio_variants_manifest.json")),
-        },
+        "input_artifact_hashes": input_artifact_hashes,
         "output_hashes": {
             "export_manifest_json": sha256_file(export_manifest_path),
             "export_audit_json": sha256_file(export_audit_path),
@@ -162,6 +269,10 @@ def export_native_candidate_clips(run_root: Path, config: dict[str, Any]) -> dic
         "rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
         "export_statuses": sorted(export_statuses),
         "output_dir": "artifacts/native_export_clips",
+        "qc_source": qc_source,
+        "qc_thresholds": dict(qc_thresholds) if qc_thresholds is not None else None,
+        "qc_score_methods": dict(qc_score_methods) if qc_score_methods is not None else None,
+        "manual_override_counts": qc_override_counts,
     }
     write_json(resolve_under_root(run_root, "artifacts/export_summary.json"), summary)
     return summary

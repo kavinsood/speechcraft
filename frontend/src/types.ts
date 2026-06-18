@@ -155,6 +155,73 @@ export type DatasetExportResults = {
   export_audit: Array<Record<string, unknown>>;
 };
 
+export type ManualOverride = "force_keep" | "force_reject";
+
+export type DatasetQcWeakSpan = {
+  start_sec: number;
+  end_sec: number;
+  text?: string | null;
+  score?: number | null;
+};
+
+export type DatasetQcClip = {
+  clip_id: string;
+  audio_path: string;
+  audio_url: string;
+  duration_sec: number;
+  training_text: string;
+  alignment_text?: string | null;
+  transcript_match: number | null;
+  speaker_check: number | null;
+  transcript_reason_codes: string[];
+  speaker_reason_codes: string[];
+  candidate_reason_codes: string[];
+  qc_reason_codes: string[];
+  weak_transcript_spans: DatasetQcWeakSpan[];
+  weak_speaker_spans: DatasetQcWeakSpan[];
+  manual_override?: ManualOverride | null;
+};
+
+export type DatasetQcPayload = {
+  run_id: string;
+  ready: boolean;
+  missing_artifacts: string[];
+  invalid_artifacts: string[];
+  defaults: {
+    transcript_match_threshold: number;
+    speaker_check_threshold: number;
+  };
+  finalized: boolean;
+  finalized_thresholds?: {
+    transcript_match_min: number;
+    speaker_check_min: number;
+  } | null;
+  clips: DatasetQcClip[];
+};
+
+export type DatasetQcFinalizeRequest = {
+  thresholds: {
+    transcript_match_min: number;
+    speaker_check_min: number;
+  };
+  manual_overrides: Array<{
+    clip_id: string;
+    override: ManualOverride;
+    reason?: string | null;
+  }>;
+};
+
+export type DatasetQcFinalizeResponse = {
+  run_id: string;
+  dataset_qc_path: string;
+  summary: {
+    accepted_count: number;
+    rejected_count: number;
+    accepted_duration_sec: number;
+    rejected_duration_sec: number;
+  };
+};
+
 export type DatasetPreflight = {
   ok: boolean;
   reason_codes?: string[];
@@ -240,56 +307,6 @@ export type ProjectRecordingJobsRun = {
   project_id: string;
   prepared_output_group_id: string;
   jobs: ProcessingJob[];
-};
-
-export type QcBucket = "auto_kept" | "needs_review" | "auto_rejected";
-
-export type QcRunCreateRequest = {
-  slicer_run_id: string;
-  keep_threshold: number;
-  reject_threshold: number;
-  preset: string;
-};
-
-export type SliceQcResult = {
-  id: string;
-  qc_run_id: string;
-  slice_id: string;
-  source_recording_id?: string | null;
-  source_order_index?: number | null;
-  source_start_seconds?: number | null;
-  source_end_seconds?: number | null;
-  aggregate_score: number;
-  bucket: QcBucket;
-  raw_metrics: Record<string, unknown>;
-  reason_codes: string[];
-  human_review_status?: ReviewStatus | null;
-  is_locked: boolean;
-  created_at: string;
-};
-
-export type QcRun = {
-  id: string;
-  project_id: string;
-  slicer_run_id: string;
-  status: "pending" | "running" | "completed" | "failed";
-  threshold_config: {
-    keep_threshold?: number;
-    reject_threshold?: number;
-    preset?: string;
-    [key: string]: unknown;
-  };
-  slice_population_hash: string;
-  transcript_basis_hash: string;
-  audio_basis_hash: string;
-  is_stale: boolean;
-  stale_reason?: string | null;
-  error_message?: string | null;
-  created_at: string;
-  completed_at?: string | null;
-  result_count: number;
-  bucket_counts: Partial<Record<QcBucket, number>>;
-  results: SliceQcResult[];
 };
 
 export type SourceRecordingQueue = SourceRecording & {

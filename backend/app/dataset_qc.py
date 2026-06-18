@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,6 +34,10 @@ SPEAKER_PURITY_SUMMARY_REL = "artifacts/speaker_purity_summary.json"
 DATASET_QC_REL = "artifacts/dataset_qc.json"
 DATASET_QC_SUMMARY_REL = "artifacts/dataset_qc_summary.json"
 CANDIDATE_MANIFEST_REL = "artifacts/candidate_review_manifest.json"
+EXPORT_MANIFEST_REL = "artifacts/export_manifest.json"
+EXPORT_AUDIT_REL = "artifacts/export_audit.json"
+EXPORT_SUMMARY_REL = "artifacts/export_summary.json"
+NATIVE_EXPORT_DIR_REL = "artifacts/native_export_clips"
 
 SCORE_METHODS = {
     "transcript_match": "min_meaningful_ctc_span",
@@ -73,15 +78,22 @@ def _clip_rows_from_artifact(payload: Any, *, artifact_name: str) -> list[dict[s
     return [row for row in clips if isinstance(row, dict)]
 
 
-def _validate_qc_score(raw: Any, field_name: str) -> int:
+def _validate_qc_score(raw: Any, field_name: str) -> float:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise DatasetQcValidationError(f"{field_name} must be a finite integer 0-100")
-    if isinstance(raw, float) and not raw.is_integer():
-        raise DatasetQcValidationError(f"{field_name} must be a finite integer 0-100")
-    score = int(raw)
-    if score < 0 or score > 100:
-        raise DatasetQcValidationError(f"{field_name} must be a finite integer 0-100")
-    return score
+        raise DatasetQcValidationError(f"{field_name} must be a finite number 0-100")
+    score = float(raw)
+    if not math.isfinite(score) or score < 0 or score > 100:
+        raise DatasetQcValidationError(f"{field_name} must be a finite number 0-100")
+    return round(score, 2)
+
+
+def _score_from_fraction(raw: Any, field_name: str) -> float:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise DatasetQcValidationError(f"{field_name} must be a finite number 0-1")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0 or value > 1:
+        raise DatasetQcValidationError(f"{field_name} must be a finite number 0-1")
+    return round(value * 100, 2)
 
 
 def _validate_duration_sec(raw: Any, field_name: str) -> float:
@@ -156,6 +168,26 @@ def _weak_speaker_spans(row: dict[str, Any]) -> list[DatasetQcWeakSpanView]:
     return spans
 
 
+def _transcript_score_from_row(row: dict[str, Any]) -> float:
+    for field_name in (
+        "ctc_min_span_score",
+        "ctc_min_aligned_token_score",
+        "ctc_min_window_score",
+        "ctc_mean_score",
+    ):
+        if field_name in row and row.get(field_name) is not None:
+            return _score_from_fraction(row.get(field_name), field_name)
+    return _validate_qc_score(row.get("transcript_match_score"), "transcript_match_score")
+
+
+def _speaker_score_from_row(row: dict[str, Any]) -> float:
+    if row.get("min_window_similarity") is not None:
+        return _score_from_fraction(row.get("min_window_similarity"), "min_window_similarity")
+    if row.get("speaker_check_score") is not None:
+        return _validate_qc_score(row.get("speaker_check_score"), "speaker_check_score")
+    raise DatasetQcValidationError("speaker_check_score missing")
+
+
 def _audio_url(run_id: str, clip_id: str) -> str:
     return f"/media/dataset-runs/{run_id}/candidate-review/{clip_id}.wav"
 
@@ -172,8 +204,8 @@ def _resolve_audio_path(repository: Any, run: ProcessingRun, audio_path: str) ->
 
 def _threshold_status(
     *,
-    transcript_match: int | None,
-    speaker_check: int | None,
+    transcript_match: float | None,
+    speaker_check: float | None,
     transcript_threshold: int,
     speaker_threshold: int,
     audio_missing: bool = False,
@@ -202,8 +234,8 @@ def _final_status(
 
 def _failed_checks(
     *,
-    transcript_match: int | None,
-    speaker_check: int | None,
+    transcript_match: float | None,
+    speaker_check: float | None,
     transcript_threshold: int,
     speaker_threshold: int,
     audio_missing: bool = False,
@@ -320,6 +352,46 @@ def _read_finalized_state(
     return True, finalized_thresholds, overrides_by_clip, False
 
 
+def _score_method_from_rows(
+    rows_by_id: dict[str, dict[str, Any]],
+    *,
+    row_field: str,
+) -> str | None:
+    for row in rows_by_id.values():
+        value = row.get(row_field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _dataset_qc_score_methods(
+    transcript_by_id: dict[str, dict[str, Any]],
+    speaker_by_id: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    transcript_method = _score_method_from_rows(
+        transcript_by_id,
+        row_field="transcript_score_method",
+    ) or SCORE_METHODS["transcript_match"]
+    speaker_method = _score_method_from_rows(
+        speaker_by_id,
+        row_field="speaker_score_method",
+    ) or SCORE_METHODS["speaker_check"]
+    return {
+        "transcript_match": transcript_method,
+        "speaker_check": speaker_method,
+    }
+
+
+def _clear_export_artifacts(root: Path) -> None:
+    for relative in (EXPORT_MANIFEST_REL, EXPORT_AUDIT_REL, EXPORT_SUMMARY_REL):
+        path = root / relative
+        if path.exists():
+            path.unlink()
+    export_dir = root / NATIVE_EXPORT_DIR_REL
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+
+
 def get_dataset_qc(repository: Any, run_id: str) -> DatasetQcPayloadView:
     with Session(repository.engine) as session:
         run = session.get(ProcessingRun, run_id)
@@ -414,8 +486,8 @@ def get_dataset_qc(repository: Any, run_id: str) -> DatasetQcPayloadView:
             transcript_row = transcript_by_id.get(clip_id)
             speaker_row = speaker_by_id.get(clip_id)
 
-            transcript_match: int | None = None
-            speaker_check: int | None = None
+            transcript_match: float | None = None
+            speaker_check: float | None = None
             transcript_reason_codes: list[str] = []
             speaker_reason_codes: list[str] = []
             qc_reason_codes: list[str] = []
@@ -429,10 +501,7 @@ def get_dataset_qc(repository: Any, run_id: str) -> DatasetQcPayloadView:
                 qc_reason_codes.append("missing_transcript_qc")
             else:
                 try:
-                    transcript_match = _validate_qc_score(
-                        transcript_row.get("transcript_match_score"),
-                        "transcript_match_score",
-                    )
+                    transcript_match = _transcript_score_from_row(transcript_row)
                     transcript_reason_codes = [
                         str(code) for code in (transcript_row.get("reason_codes") or []) if isinstance(code, str)
                     ]
@@ -444,18 +513,7 @@ def get_dataset_qc(repository: Any, run_id: str) -> DatasetQcPayloadView:
                 qc_reason_codes.append("missing_speaker_qc")
             else:
                 try:
-                    if "speaker_check_score" in speaker_row:
-                        speaker_check = _validate_qc_score(
-                            speaker_row.get("speaker_check_score"),
-                            "speaker_check_score",
-                        )
-                    elif isinstance(speaker_row.get("min_window_similarity"), (int, float)):
-                        speaker_check = _validate_qc_score(
-                            round(float(speaker_row["min_window_similarity"]) * 100),
-                            "speaker_check_score",
-                        )
-                    else:
-                        raise DatasetQcValidationError("speaker_check_score missing")
+                    speaker_check = _speaker_score_from_row(speaker_row)
                     speaker_reason_codes = [
                         str(code) for code in (speaker_row.get("reason_codes") or []) if isinstance(code, str)
                     ]
@@ -550,6 +608,23 @@ def finalize_dataset_qc(repository: Any, run_id: str, request: DatasetQcFinalize
     overrides = _validate_manual_overrides(request, known_clip_ids, clips_by_id)
     transcript_threshold = request.thresholds.transcript_match_min
     speaker_threshold = request.thresholds.speaker_check_min
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+        transcript_rows = _clip_rows_from_artifact(
+            _read_artifact_payload(root / TRANSCRIPT_QC_REL),
+            artifact_name=TRANSCRIPT_QC_REL,
+        )
+        speaker_rows = _clip_rows_from_artifact(
+            _read_artifact_payload(root / SPEAKER_PURITY_REL),
+            artifact_name=SPEAKER_PURITY_REL,
+        )
+        score_methods = _dataset_qc_score_methods(
+            _index_rows_by_clip_id(transcript_rows, artifact_name=TRANSCRIPT_QC_REL),
+            _index_rows_by_clip_id(speaker_rows, artifact_name=SPEAKER_PURITY_REL),
+        )
 
     now = utc_now().isoformat()
     clip_rows: list[dict[str, Any]] = []
@@ -663,7 +738,7 @@ def finalize_dataset_qc(repository: Any, run_id: str, request: DatasetQcFinalize
             "transcript_match_min": transcript_threshold,
             "speaker_check_min": speaker_threshold,
         },
-        "score_methods": dict(SCORE_METHODS),
+        "score_methods": dict(score_methods),
         "manual_overrides": manual_override_rows,
         "clips": clip_rows,
     }
@@ -702,6 +777,7 @@ def finalize_dataset_qc(repository: Any, run_id: str, request: DatasetQcFinalize
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         (root / DATASET_QC_REL).write_text(json.dumps(dataset_qc, indent=2, sort_keys=True), encoding="utf-8")
         (root / DATASET_QC_SUMMARY_REL).write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        _clear_export_artifacts(root)
         _index_artifacts(session, repository, run)
         session.commit()
 

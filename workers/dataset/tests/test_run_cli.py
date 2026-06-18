@@ -16,6 +16,7 @@ from speechcraft_dataset.assembly import assemble_candidate_review_clips
 from speechcraft_dataset.asr import run_asr
 from speechcraft_dataset.buffers import run_processing_buffers
 from speechcraft_dataset.export import export_native_candidate_clips
+from speechcraft_dataset.generate_qc_scores import main as generate_qc_scores_main
 from speechcraft_dataset.mfa import parse_mfa_textgrids, run_mfa_command
 from speechcraft_dataset.models import check_asr_model
 from speechcraft_dataset.rerun_slicer import main as rerun_slicer_main
@@ -39,6 +40,58 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def write_minimal_native_export_fixture(
+    run_root: Path,
+    temp_dir: Path,
+    candidates: list[dict],
+    *,
+    dataset_qc: dict | None = None,
+) -> Path:
+    artifacts = run_root / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    source = temp_dir / "source_48k.wav"
+    write_silent_wav(source, sample_rate=48000, duration_sec=5.0)
+    (artifacts / "source_audio_manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "source_audio_id": "source_audio_0000",
+                        "path": str(source),
+                        "sample_rate": 48000,
+                        "num_channels": 1,
+                        "sample_width_bytes": 2,
+                        "num_samples": 240000,
+                        "duration_sec": 5.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "audio_variants_manifest.json").write_text(
+        json.dumps(
+            {
+                "variants": [
+                    {
+                        "source_audio_id": "source_audio_0000",
+                        "kind": "analysis_audio",
+                        "source_sample_rate": 48000,
+                        "analysis_sample_rate": 16000,
+                        "source_num_samples": 240000,
+                        "analysis_num_samples": 80000,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "candidate_review_manifest.json").write_text(json.dumps(candidates), encoding="utf-8")
+    if dataset_qc is not None:
+        (artifacts / "dataset_qc.json").write_text(json.dumps(dataset_qc), encoding="utf-8")
+    return artifacts
+
+
 class DatasetWorkerRunCliTests(unittest.TestCase):
     def test_slicer_rerun_runs_only_safecut_and_candidate_assembly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:
@@ -56,6 +109,14 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
                     "speechcraft_dataset.rerun_slicer.assemble_candidate_review_clips",
                     return_value={"candidate_review_clips": 2},
                 ) as assembly,
+                patch(
+                    "speechcraft_dataset.rerun_slicer.run_transcript_qc_stage",
+                    return_value={"clip_count": 2, "scored_count": 2},
+                ) as transcript_qc,
+                patch(
+                    "speechcraft_dataset.rerun_slicer.run_speaker_purity_stage",
+                    return_value={"clip_count": 2, "scored_count": 2},
+                ) as speaker_purity,
             ):
                 exit_code = rerun_slicer_main(
                     ["--run-root", str(run_root), "--config", str(config_path)]
@@ -64,11 +125,179 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             safecut.assert_called_once()
             assembly.assert_called_once()
+            transcript_qc.assert_called_once()
+            speaker_purity.assert_called_once()
+            status = read_json(run_root / "status.json")
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["stage"], "speaker_purity")
+            self.assertEqual(status["summary"]["clip_count"], 2)
+            self.assertTrue(read_json(run_root / "config.json")["config_hash"])
+
+    def test_slicer_rerun_keeps_candidate_clips_when_qc_artifact_generation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw) / "run"
+            run_root.mkdir()
+            config_path = run_root / "input_config.json"
+            config_path.write_text(json.dumps({"cutpoint_min_gap_ms": 40}), encoding="utf-8")
+
+            with (
+                patch(
+                    "speechcraft_dataset.rerun_slicer.generate_safe_cutpoint_diagnostics",
+                    return_value={"accepted_cutpoints": 3},
+                ),
+                patch(
+                    "speechcraft_dataset.rerun_slicer.assemble_candidate_review_clips",
+                    return_value={"candidate_review_clips": 2},
+                ),
+                patch(
+                    "speechcraft_dataset.rerun_slicer.run_transcript_qc_stage",
+                    return_value={"clip_count": 2, "scored_count": 2},
+                ),
+                patch(
+                    "speechcraft_dataset.rerun_slicer.run_speaker_purity_stage",
+                    side_effect=RuntimeError("speaker model unavailable"),
+                ),
+            ):
+                exit_code = rerun_slicer_main(
+                    ["--run-root", str(run_root), "--config", str(config_path)]
+                )
+
+            self.assertEqual(exit_code, 0)
             status = read_json(run_root / "status.json")
             self.assertTrue(status["ok"])
             self.assertEqual(status["stage"], "candidate_review_clips")
             self.assertEqual(status["summary"]["candidate_review_clips"], 2)
-            self.assertTrue(read_json(run_root / "config.json")["config_hash"])
+            self.assertEqual(status["reason_codes"], ["qc_artifacts_failed"])
+
+    def test_slicer_rerun_clears_stale_downstream_qc_artifacts_before_regeneration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw) / "run"
+            artifacts = run_root / "artifacts"
+            artifacts.mkdir(parents=True)
+            config_path = run_root / "input_config.json"
+            config_path.write_text(json.dumps({"cutpoint_min_gap_ms": 40}), encoding="utf-8")
+            (artifacts / "speaker_purity.json").write_text("{}", encoding="utf-8")
+            (artifacts / "dataset_qc.json").write_text("{}", encoding="utf-8")
+
+            with (
+                patch(
+                    "speechcraft_dataset.rerun_slicer.generate_safe_cutpoint_diagnostics",
+                    return_value={"accepted_cutpoints": 3},
+                ),
+                patch(
+                    "speechcraft_dataset.rerun_slicer.assemble_candidate_review_clips",
+                    return_value={"candidate_review_clips": 2},
+                ),
+                patch(
+                    "speechcraft_dataset.rerun_slicer.run_transcript_qc_stage",
+                    return_value={"clip_count": 2, "scored_count": 2},
+                ),
+                patch(
+                    "speechcraft_dataset.rerun_slicer.run_speaker_purity_stage",
+                    side_effect=RuntimeError("speaker model unavailable"),
+                ),
+            ):
+                exit_code = rerun_slicer_main(
+                    ["--run-root", str(run_root), "--config", str(config_path)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((artifacts / "speaker_purity.json").exists())
+            self.assertFalse((artifacts / "dataset_qc.json").exists())
+
+    def test_generate_qc_scores_clears_stale_speaker_artifact_when_speaker_stage_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw) / "run"
+            artifacts = run_root / "artifacts"
+            artifacts.mkdir(parents=True)
+            config_path = run_root / "config.json"
+            config_path.write_text(json.dumps({}), encoding="utf-8")
+            (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+            (artifacts / "speaker_selection.json").write_text(json.dumps({"target_speaker_id": "speaker_0"}), encoding="utf-8")
+            (artifacts / "speaker_regions.jsonl").write_text("", encoding="utf-8")
+            (artifacts / "audio_variants_manifest.json").write_text(json.dumps({"variants": []}), encoding="utf-8")
+            (artifacts / "speaker_purity.json").write_text("{}", encoding="utf-8")
+
+            with (
+                patch(
+                    "speechcraft_dataset.generate_qc_scores.run_transcript_qc_stage",
+                    return_value={"clip_count": 0, "scored_count": 0},
+                ),
+                patch(
+                    "speechcraft_dataset.generate_qc_scores.run_speaker_purity_stage",
+                    side_effect=RuntimeError("speaker model unavailable"),
+                ),
+            ):
+                exit_code = generate_qc_scores_main(
+                    ["--run-root", str(run_root), "--config", str(config_path)]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse((artifacts / "speaker_purity.json").exists())
+            status = read_json(run_root / "status.json")
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["reason_codes"], ["dataset_qc_score_generation_failed"])
+
+    def test_generate_qc_scores_refuses_finalized_qc_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw) / "run"
+            artifacts = run_root / "artifacts"
+            artifacts.mkdir(parents=True)
+            config_path = run_root / "config.json"
+            config_path.write_text(json.dumps({}), encoding="utf-8")
+            (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+            (artifacts / "speaker_selection.json").write_text(json.dumps({"target_speaker_id": "speaker_0"}), encoding="utf-8")
+            (artifacts / "speaker_regions.jsonl").write_text("", encoding="utf-8")
+            (artifacts / "audio_variants_manifest.json").write_text(json.dumps({"variants": []}), encoding="utf-8")
+            (artifacts / "dataset_qc.json").write_text("{}", encoding="utf-8")
+
+            exit_code = generate_qc_scores_main(
+                ["--run-root", str(run_root), "--config", str(config_path)]
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue((artifacts / "dataset_qc.json").exists())
+            status = read_json(run_root / "status.json")
+            self.assertFalse(status["ok"])
+            self.assertIn("dataset_qc_already_finalized", status["error"])
+
+    def test_generate_qc_scores_clears_export_and_dataset_qc_artifacts_with_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw) / "run"
+            artifacts = run_root / "artifacts"
+            artifacts.mkdir(parents=True)
+            config_path = run_root / "config.json"
+            config_path.write_text(json.dumps({}), encoding="utf-8")
+            (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+            (artifacts / "speaker_selection.json").write_text(json.dumps({"target_speaker_id": "speaker_0"}), encoding="utf-8")
+            (artifacts / "speaker_regions.jsonl").write_text("", encoding="utf-8")
+            (artifacts / "audio_variants_manifest.json").write_text(json.dumps({"variants": []}), encoding="utf-8")
+            (artifacts / "dataset_qc.json").write_text("{}", encoding="utf-8")
+            (artifacts / "export_manifest.json").write_text("[]", encoding="utf-8")
+            (artifacts / "export_audit.json").write_text("[]", encoding="utf-8")
+            (artifacts / "export_summary.json").write_text("{}", encoding="utf-8")
+            (artifacts / "native_export_clips").mkdir()
+
+            with (
+                patch(
+                    "speechcraft_dataset.generate_qc_scores.run_transcript_qc_stage",
+                    return_value={"clip_count": 0, "scored_count": 0},
+                ),
+                patch(
+                    "speechcraft_dataset.generate_qc_scores.run_speaker_purity_stage",
+                    return_value={"clip_count": 0, "scored_count": 0},
+                ),
+            ):
+                exit_code = generate_qc_scores_main(
+                    ["--run-root", str(run_root), "--config", str(config_path), "--force"]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((artifacts / "dataset_qc.json").exists())
+            self.assertFalse((artifacts / "export_manifest.json").exists())
+            self.assertFalse((artifacts / "export_audit.json").exists())
+            self.assertFalse((artifacts / "export_summary.json").exists())
+            self.assertFalse((artifacts / "native_export_clips").exists())
 
     def test_single_speaker_run_writes_source_artifacts_status_and_log(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:
@@ -1754,6 +1983,252 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
             with wave.open(str(run_root / exported["audio_path"]), "rb") as handle:
                 self.assertEqual(handle.getframerate(), 48000)
                 self.assertEqual(handle.getnframes(), 96000)
+
+    def test_export_native_falls_back_to_manifest_status_without_dataset_qc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            run_root = temp_dir / "run"
+            artifacts = write_minimal_native_export_fixture(
+                run_root,
+                temp_dir,
+                [
+                    {
+                        "id": "candidate_review_clip_000000",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 16000,
+                        "source_end_sample": 32000,
+                        "status": "candidate_review",
+                        "training_text": "fallback export",
+                        "alignment_text": "fallback export",
+                    },
+                    {
+                        "id": "candidate_review_clip_000001",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 32000,
+                        "source_end_sample": 48000,
+                        "status": "rejected",
+                        "training_text": "do not export",
+                        "alignment_text": "do not export",
+                    },
+                ],
+            )
+
+            summary = export_native_candidate_clips(run_root, {"config_hash": "sha256:test"})
+            manifest = read_json(artifacts / "export_manifest.json")
+            audit = read_json(artifacts / "export_audit.json")
+
+            self.assertEqual(summary["qc_source"], "artifacts/candidate_review_manifest.json")
+            self.assertEqual(summary["exported_clip_count"], 1)
+            self.assertEqual(manifest[0]["id"], "candidate_review_clip_000000")
+            self.assertEqual(audit[0]["candidate_id"], "candidate_review_clip_000001")
+            self.assertEqual(audit[0]["reason_codes"], ["candidate_status_not_exportable"])
+
+    def test_export_native_prefers_dataset_qc_statuses_over_manifest_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            run_root = temp_dir / "run"
+            artifacts = write_minimal_native_export_fixture(
+                run_root,
+                temp_dir,
+                [
+                    {
+                        "id": "candidate_review_clip_000000",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 16000,
+                        "source_end_sample": 32000,
+                        "status": "candidate_review",
+                        "training_text": "manifest says keep",
+                        "alignment_text": "manifest says keep",
+                    },
+                    {
+                        "id": "candidate_review_clip_000001",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 32000,
+                        "source_end_sample": 48000,
+                        "status": "rejected",
+                        "training_text": "manifest says reject",
+                        "alignment_text": "manifest says reject",
+                    },
+                ],
+                dataset_qc={
+                    "schema_version": 1,
+                    "stage": "dataset_qc",
+                    "thresholds": {
+                        "transcript_match_min": 85,
+                        "speaker_check_min": 70,
+                    },
+                    "score_methods": {
+                        "transcript_match": "min_meaningful_ctc_span",
+                        "speaker_check": "min_valid_window_similarity",
+                    },
+                    "manual_overrides": [],
+                    "clips": [
+                        {
+                            "clip_id": "candidate_review_clip_000000",
+                            "status": "rejected",
+                            "manual_override": None,
+                        },
+                        {
+                            "clip_id": "candidate_review_clip_000001",
+                            "status": "accepted",
+                            "manual_override": None,
+                        },
+                    ],
+                },
+            )
+
+            summary = export_native_candidate_clips(run_root, {"config_hash": "sha256:test"})
+            manifest = read_json(artifacts / "export_manifest.json")
+            audit = read_json(artifacts / "export_audit.json")
+
+            self.assertEqual(summary["qc_source"], "artifacts/dataset_qc.json")
+            self.assertEqual(summary["qc_thresholds"]["transcript_match_min"], 85)
+            self.assertEqual(summary["qc_score_methods"]["speaker_check"], "min_valid_window_similarity")
+            self.assertEqual(summary["manual_override_counts"], {"force_keep": 0, "force_reject": 0})
+            self.assertIsNotNone(summary["input_artifact_hashes"]["dataset_qc_json"])
+            self.assertEqual(summary["exported_clip_count"], 1)
+            self.assertEqual(manifest[0]["id"], "candidate_review_clip_000001")
+            self.assertEqual(manifest[0]["qc_source"], "artifacts/dataset_qc.json")
+            self.assertEqual(manifest[0]["qc_status"], "accepted")
+            self.assertEqual(audit[0]["candidate_id"], "candidate_review_clip_000000")
+            self.assertEqual(audit[0]["reason_codes"], ["dataset_qc_status_not_accepted"])
+
+    def test_export_native_uses_finalized_overrides_only_via_dataset_qc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            run_root = temp_dir / "run"
+            artifacts = write_minimal_native_export_fixture(
+                run_root,
+                temp_dir,
+                [
+                    {
+                        "id": "candidate_review_clip_000000",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 16000,
+                        "source_end_sample": 32000,
+                        "status": "candidate_review",
+                        "training_text": "force kept clip",
+                        "alignment_text": "force kept clip",
+                    },
+                    {
+                        "id": "candidate_review_clip_000001",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 32000,
+                        "source_end_sample": 48000,
+                        "status": "candidate_review",
+                        "training_text": "force rejected clip",
+                        "alignment_text": "force rejected clip",
+                    },
+                ],
+                dataset_qc={
+                    "schema_version": 1,
+                    "stage": "dataset_qc",
+                    "thresholds": {
+                        "transcript_match_min": 85,
+                        "speaker_check_min": 70,
+                    },
+                    "score_methods": {
+                        "transcript_match": "min_meaningful_ctc_span",
+                        "speaker_check": "min_valid_window_similarity",
+                    },
+                    "manual_overrides": [
+                        {"clip_id": "candidate_review_clip_000000", "override": "force_keep"},
+                        {"clip_id": "candidate_review_clip_000001", "override": "force_reject"},
+                    ],
+                    "clips": [
+                        {
+                            "clip_id": "candidate_review_clip_000000",
+                            "status": "accepted",
+                            "manual_override": "force_keep",
+                        },
+                        {
+                            "clip_id": "candidate_review_clip_000001",
+                            "status": "rejected",
+                            "manual_override": "force_reject",
+                        },
+                    ],
+                },
+            )
+
+            summary = export_native_candidate_clips(run_root, {"config_hash": "sha256:test"})
+            manifest = read_json(artifacts / "export_manifest.json")
+            audit = read_json(artifacts / "export_audit.json")
+
+            self.assertEqual(summary["manual_override_counts"]["force_keep"], 1)
+            self.assertEqual(summary["manual_override_counts"]["force_reject"], 1)
+            self.assertEqual(manifest[0]["id"], "candidate_review_clip_000000")
+            self.assertEqual(manifest[0]["manual_override"], "force_keep")
+            self.assertEqual(audit[0]["candidate_id"], "candidate_review_clip_000001")
+            self.assertEqual(audit[0]["manual_override"], "force_reject")
+
+    def test_export_native_rejects_duplicate_dataset_qc_clip_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            run_root = temp_dir / "run"
+            write_minimal_native_export_fixture(
+                run_root,
+                temp_dir,
+                [
+                    {
+                        "id": "candidate_review_clip_000000",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 16000,
+                        "source_end_sample": 32000,
+                        "status": "candidate_review",
+                    }
+                ],
+                dataset_qc={
+                    "schema_version": 1,
+                    "stage": "dataset_qc",
+                    "thresholds": {"transcript_match_min": 85, "speaker_check_min": 70},
+                    "score_methods": {
+                        "transcript_match": "min_meaningful_ctc_span",
+                        "speaker_check": "min_valid_window_similarity",
+                    },
+                    "manual_overrides": [],
+                    "clips": [
+                        {"clip_id": "candidate_review_clip_000000", "status": "accepted", "manual_override": None},
+                        {"clip_id": "candidate_review_clip_000000", "status": "rejected", "manual_override": None},
+                    ],
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "duplicate clip_id in dataset_qc.json"):
+                export_native_candidate_clips(run_root, {"config_hash": "sha256:test"})
+
+    def test_export_native_rejects_invalid_dataset_qc_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            run_root = temp_dir / "run"
+            write_minimal_native_export_fixture(
+                run_root,
+                temp_dir,
+                [
+                    {
+                        "id": "candidate_review_clip_000000",
+                        "source_audio_id": "source_audio_0000",
+                        "source_start_sample": 16000,
+                        "source_end_sample": 32000,
+                        "status": "candidate_review",
+                    }
+                ],
+                dataset_qc={
+                    "schema_version": 1,
+                    "stage": "dataset_qc",
+                    "thresholds": {"transcript_match_min": 85, "speaker_check_min": 70},
+                    "score_methods": {
+                        "transcript_match": "min_meaningful_ctc_span",
+                        "speaker_check": "min_valid_window_similarity",
+                    },
+                    "manual_overrides": [],
+                    "clips": [
+                        {"clip_id": "candidate_review_clip_000000", "status": "maybe", "manual_override": None},
+                    ],
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "invalid status"):
+                export_native_candidate_clips(run_root, {"config_hash": "sha256:test"})
 
     @unittest.skipUnless(HAS_WORKER_AUDIO_DEPS, "requires worker audio deps")
     def test_asr_queue_rejects_short_buffers(self) -> None:
