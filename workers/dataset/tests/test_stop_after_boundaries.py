@@ -31,7 +31,16 @@ class StopAfterBoundaryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._temp_dir.cleanup()
 
-    def _run_with_stop_after(self, stop_after: str, *, safecut_side_effect=None, assembly_side_effect=None, export_side_effect=None):
+    def _run_with_stop_after(
+        self,
+        stop_after: str,
+        *,
+        safecut_side_effect=None,
+        assembly_side_effect=None,
+        transcript_qc_side_effect=None,
+        speaker_purity_side_effect=None,
+        export_side_effect=None,
+    ):
         source = self._temp_path / "source.wav"
         run_root = self._temp_path / "run"
         write_silent_wav(source)
@@ -60,6 +69,14 @@ class StopAfterBoundaryTests(unittest.TestCase):
             patch("speechcraft_dataset.run.normalize_transcripts", return_value=_stage_summary("normalization")),
             patch("speechcraft_dataset.run.run_mfa_alignment", return_value=_stage_summary("mfa")),
             patch("speechcraft_dataset.run.run_alignment_qc", return_value=_stage_summary("alignment_qc")),
+            patch(
+                "speechcraft_dataset.run.run_transcript_qc_stage",
+                side_effect=transcript_qc_side_effect or (lambda root, config: _stage_summary("transcript_qc")),
+            ),
+            patch(
+                "speechcraft_dataset.run.run_speaker_purity_stage",
+                side_effect=speaker_purity_side_effect or (lambda root, config: _stage_summary("speaker_purity")),
+            ),
             safecut as safecut_mock,
             assembly as assembly_mock,
             native_export as export_mock,
@@ -193,3 +210,33 @@ class StopAfterBoundaryTests(unittest.TestCase):
         status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
         self.assertEqual(status["stage"], "native_export")
         self.assertEqual(status["summary"]["stage"], "native_export")
+
+    def test_stop_after_speaker_purity_skips_native_export(self) -> None:
+        def _write_safecut(root, config):
+            artifacts = root / "artifacts"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (artifacts / "safe_cutpoints.jsonl").write_text("", encoding="utf-8")
+            (artifacts / "safe_cutpoint_summary.json").write_text("{}", encoding="utf-8")
+            return _stage_summary("safe_cutpoints")
+
+        def _write_clips(root, config):
+            artifacts = root / "artifacts"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (artifacts / "candidate_review_manifest.json").write_text("[]", encoding="utf-8")
+            (artifacts / "candidate_review_summary.json").write_text("{}", encoding="utf-8")
+            (artifacts / "candidate_review_rejected.json").write_text("[]", encoding="utf-8")
+            return _stage_summary("candidate_review_clips")
+
+        run_root, exit_code, safecut, assembly, export = self._run_with_stop_after(
+            "speaker_purity",
+            safecut_side_effect=_write_safecut,
+            assembly_side_effect=_write_clips,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertFalse((run_root / "artifacts" / "export_manifest.json").exists())
+        safecut.assert_called_once()
+        assembly.assert_called_once()
+        export.assert_not_called()
+        status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["stage"], "speaker_purity")
+        self.assertEqual(status["summary"]["stage"], "speaker_purity")

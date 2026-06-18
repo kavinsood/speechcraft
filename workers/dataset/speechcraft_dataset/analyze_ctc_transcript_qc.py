@@ -12,13 +12,16 @@ from typing import Any
 import numpy as np
 
 from .buffers import read_analysis_audio
-from .io import read_json_value, resolve_under_root, write_json
+from .io import read_json_value, resolve_under_root, sha256_file, write_json
 
 DEFAULT_MODEL = "facebook/wav2vec2-base-960h"
 TARGET_SAMPLE_RATE = 16000
 WEAK_CHAR_THRESHOLD = 0.25
 WEAK_WINDOW_THRESHOLD = 0.50
 WEAK_WINDOW_FRAMES = 5
+TRANSCRIPT_QC_SCHEMA_VERSION = 1
+TRANSCRIPT_SCORE_METHOD = "min_meaningful_ctc_span"
+WORKER_TRANSCRIPT_THRESHOLD_HINT = 85
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,12 @@ def _round(value: float | None, digits: int = 6) -> float | None:
     if value is None:
         return None
     return round(float(value), digits)
+
+
+def _round_score_0_100(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(max(0.0, min(100.0, float(value) * 100.0)), 2)
 
 
 def resolve_device(device_arg: str) -> str:
@@ -209,6 +218,144 @@ def score_bucket(transcript_match_score: float | None) -> str:
     return "rejected"
 
 
+def score_bucket_hint(transcript_match_score: float | None) -> str:
+    if transcript_match_score is None:
+        return "unscored"
+    if transcript_match_score >= WORKER_TRANSCRIPT_THRESHOLD_HINT:
+        return "pass"
+    if transcript_match_score >= 70:
+        return "review"
+    return "fail"
+
+
+def _meaningful_word_spans(
+    verifier_text: str,
+    char_probs: np.ndarray,
+    timings: Any,
+    index_duration: float,
+) -> list[dict[str, Any]]:
+    timing_values = np.asarray(timings, dtype=np.float64).reshape(-1)
+    if char_probs.size == 0 or timing_values.size == 0:
+        return []
+
+    length = min(len(verifier_text), char_probs.size, timing_values.size)
+    words: list[dict[str, Any]] = []
+    current_chars: list[str] = []
+    current_probs: list[float] = []
+    current_times: list[float] = []
+
+    def flush() -> None:
+        if not current_chars:
+            return
+        text = "".join(current_chars)
+        if len([char for char in text if char.isalnum()]) < 2:
+            current_chars.clear()
+            current_probs.clear()
+            current_times.clear()
+            return
+        start_sec = float(min(current_times))
+        end_sec = float(max(current_times) + max(index_duration, 0.0))
+        words.append(
+            {
+                "text": text,
+                "score": float(np.mean(np.asarray(current_probs, dtype=np.float64))),
+                "start_sec": round(start_sec, 6),
+                "end_sec": round(end_sec, 6),
+                "char_count": len(current_probs),
+            }
+        )
+        current_chars.clear()
+        current_probs.clear()
+        current_times.clear()
+
+    for index in range(length):
+        char = verifier_text[index]
+        if char in {"|", " "}:
+            flush()
+            continue
+        current_chars.append(char)
+        current_probs.append(float(char_probs[index]))
+        current_times.append(float(timing_values[index]))
+    flush()
+    return words
+
+
+def _meaningful_span_metrics(
+    verifier_text: str,
+    char_probs: np.ndarray,
+    timings: Any,
+    index_duration: float,
+) -> tuple[float | None, list[dict[str, Any]]]:
+    words = _meaningful_word_spans(verifier_text, char_probs, timings, index_duration)
+    if not words:
+        return None, []
+
+    span_candidates: list[dict[str, Any]] = []
+    max_words_per_span = 3
+    for start in range(len(words)):
+        total_chars = 0
+        total_score = 0.0
+        for end in range(start, min(len(words), start + max_words_per_span)):
+            word = words[end]
+            total_chars += int(word["char_count"])
+            total_score += float(word["score"]) * int(word["char_count"])
+            if total_chars < 2:
+                continue
+            span_candidates.append(
+                {
+                    "text": " ".join(str(words[index]["text"]) for index in range(start, end + 1)),
+                    "score": total_score / total_chars,
+                    "start_sec": float(words[start]["start_sec"]),
+                    "end_sec": float(words[end]["end_sec"]),
+                    "word_count": end - start + 1,
+                }
+            )
+
+    if not span_candidates:
+        return None, []
+
+    span_candidates.sort(
+        key=lambda span: (
+            float(span["score"]),
+            -int(span["word_count"]),
+            float(span["start_sec"]),
+        )
+    )
+    min_span_score = float(span_candidates[0]["score"])
+    weak_cutoff = min(min_span_score + 0.08, 0.92)
+    weak_spans: list[dict[str, Any]] = []
+    for span in span_candidates:
+        if float(span["score"]) > weak_cutoff:
+            break
+        weak_spans.append(
+            {
+                "start_sec": round(float(span["start_sec"]), 6),
+                "end_sec": round(float(span["end_sec"]), 6),
+                "text": str(span["text"]),
+                "score": _round(float(span["score"])),
+            }
+        )
+        if len(weak_spans) >= 3:
+            break
+    return _round(min_span_score), weak_spans
+
+
+def select_transcript_gate_score(
+    *,
+    ctc_min_span_score: float | None,
+    ctc_min_aligned_token_score: float | None,
+    ctc_min_window_score: float | None,
+    ctc_mean_score: float | None,
+) -> float | None:
+    if ctc_min_span_score is not None:
+        return ctc_min_span_score
+    if ctc_min_aligned_token_score is not None:
+        return ctc_min_aligned_token_score
+    if ctc_min_window_score is not None:
+        return ctc_min_window_score
+    return ctc_mean_score
+
+
 def score_clip(
     audio: np.ndarray,
     sample_rate: int,
@@ -252,37 +399,56 @@ def score_clip(
     ctc_min_token_score = float(np.min(char_prob_array)) if char_prob_array.size else None
     ctc_min_aligned_token_score = float(np.min(positive)) if positive.size else None
     ctc_min_window_score = _min_window_score(char_prob_array, WEAK_WINDOW_FRAMES)
-    unaligned_token_count = int(np.sum(char_prob_array < WEAK_CHAR_THRESHOLD))
-    weak_span_count = 0
-    if char_prob_array.size >= WEAK_WINDOW_FRAMES:
-        for start in range(0, char_prob_array.size - WEAK_WINDOW_FRAMES + 1):
-            if float(np.mean(char_prob_array[start : start + WEAK_WINDOW_FRAMES])) < WEAK_WINDOW_THRESHOLD:
-                weak_span_count += 1
+    ctc_min_span_score, weak_spans = _meaningful_span_metrics(
+        verifier_text,
+        char_prob_array,
+        timings,
+        float(config.index_duration),
+    )
+    meaningful_mask = np.asarray([char not in {"|", " "} for char in verifier_text[: char_prob_array.size]], dtype=bool)
+    meaningful_probs = char_prob_array[: meaningful_mask.size][meaningful_mask]
+    unaligned_token_count = int(np.sum(meaningful_probs < WEAK_CHAR_THRESHOLD))
+    weak_span_count = len(weak_spans)
 
     segment_conf = None
     if segments:
         segment_conf = float(segments[0][2])
-    raw_score = ctc_mean_score
-    if segment_conf is not None and segment_conf > 0:
-        raw_score = (ctc_mean_score + segment_conf) / 2.0
-    transcript_match_score = round(max(0.0, min(1.0, raw_score)) * 100.0, 3)
+    raw_score = select_transcript_gate_score(
+        ctc_min_span_score=ctc_min_span_score,
+        ctc_min_aligned_token_score=ctc_min_aligned_token_score,
+        ctc_min_window_score=ctc_min_window_score,
+        ctc_mean_score=ctc_mean_score,
+    )
+    transcript_match_score = _round_score_0_100(raw_score)
     coverage = audio_coverage_metrics(
         audio_duration_sec=float(audio.shape[0]) / float(sample_rate),
         segments=segments,
         timings=timings,
         index_duration=float(config.index_duration),
     )
+    reason_codes: list[str] = []
+    if transcript_match_score is not None and transcript_match_score < WORKER_TRANSCRIPT_THRESHOLD_HINT:
+        reason_codes.append("low_transcript_match")
+    if weak_spans and transcript_match_score is not None and transcript_match_score < WORKER_TRANSCRIPT_THRESHOLD_HINT:
+        reason_codes.append("weak_transcript_span")
+    bucket = score_bucket(transcript_match_score)
+    bucket_hint = score_bucket_hint(transcript_match_score)
 
     return {
+        "transcript_score_method": TRANSCRIPT_SCORE_METHOD,
         "ctc_mean_score": _round(ctc_mean_score),
+        "ctc_min_span_score": _round(ctc_min_span_score),
         "ctc_min_window_score": _round(ctc_min_window_score),
         "ctc_min_token_score": _round(ctc_min_token_score),
         "ctc_min_aligned_token_score": _round(ctc_min_aligned_token_score),
         "unaligned_token_count": unaligned_token_count,
         "weak_span_count": weak_span_count,
+        "weak_spans": weak_spans,
         "segment_confidence": _round(segment_conf),
         "transcript_match_score": transcript_match_score,
-        "bucket": score_bucket(transcript_match_score),
+        "bucket": bucket,
+        "bucket_hint": bucket_hint,
+        "reason_codes": reason_codes,
         **coverage,
     }
 
@@ -303,13 +469,17 @@ def build_clip_row(
         "review_reason_codes": candidate.get("review_reason_codes") or [],
         "verifier_text": None,
         "verifier_text_source": None,
+        "transcript_score_method": TRANSCRIPT_SCORE_METHOD,
         "ctc_mean_score": None,
+        "ctc_min_span_score": None,
         "ctc_min_window_score": None,
         "ctc_min_token_score": None,
         "unaligned_token_count": None,
         "weak_span_count": None,
+        "weak_spans": [],
         "segment_confidence": None,
         "transcript_match_score": None,
+        "bucket_hint": "unscored",
         "audio_duration_sec": candidate.get("duration_sec"),
         "aligned_speech_sec": None,
         "unexplained_speech_sec": None,
@@ -488,6 +658,7 @@ def analyze_ctc_transcript_qc(
                 "clip_id": row.get("clip_id"),
                 "score": row.get("transcript_match_score"),
                 "bucket": row.get("bucket"),
+                "bucket_hint": row.get("bucket_hint"),
                 "duration_sec": row.get("duration_sec"),
                 "verifier_text": row.get("verifier_text"),
                 "audio_path": row.get("audio_path"),
@@ -525,6 +696,7 @@ def analyze_ctc_transcript_qc(
                 "clip_id",
                 "score",
                 "bucket",
+                "bucket_hint",
                 "duration_sec",
                 "verifier_text",
                 "audio_path",
@@ -537,6 +709,80 @@ def analyze_ctc_transcript_qc(
 
     log(f"scored {len(scored_rows)}/{len(rows)} clips -> {out_dir}")
     log(f"buckets: {bucket_counts}")
+    return summary
+
+
+def run_transcript_qc(
+    run_root: Path,
+    config: dict[str, Any],
+    *,
+    model_name: str | None = None,
+    device: str = "auto",
+) -> dict[str, Any]:
+    model = str(model_name or config.get("transcript_qc_model") or DEFAULT_MODEL)
+    bundle = load_ctc_model(model, device)
+    manifest_path = resolve_under_root(run_root, "artifacts/candidate_review_manifest.json")
+    candidates = read_json_value(manifest_path)
+    if not isinstance(candidates, list):
+        raise ValueError("candidate_review_manifest.json must contain a list")
+
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        rows.append(build_clip_row(candidate, run_root, bundle))
+
+    scored_rows = [row for row in rows if row.get("transcript_match_score") is not None]
+    scores = [
+        float(row["transcript_match_score"])
+        for row in scored_rows
+        if isinstance(row.get("transcript_match_score"), (int, float))
+    ]
+    reason_counts: dict[str, int] = {}
+    for row in rows:
+        for reason in row.get("reason_codes") or []:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    bucket_hint_counts = {
+        "pass": sum(row.get("bucket_hint") == "pass" for row in rows),
+        "review": sum(row.get("bucket_hint") == "review" for row in rows),
+        "fail": sum(row.get("bucket_hint") == "fail" for row in rows),
+        "unscored": sum(row.get("bucket_hint") == "unscored" for row in rows),
+    }
+
+    artifact_payload = {
+        "schema_version": TRANSCRIPT_QC_SCHEMA_VERSION,
+        "stage": "transcript_qc",
+        "model": model,
+        "score_method": TRANSCRIPT_SCORE_METHOD,
+        "clips": rows,
+    }
+    artifact_path = resolve_under_root(run_root, "artifacts/transcript_qc.json")
+    write_json(artifact_path, artifact_payload)
+    summary = {
+        "schema_version": TRANSCRIPT_QC_SCHEMA_VERSION,
+        "stage": "transcript_qc",
+        "model": model,
+        "score_method": TRANSCRIPT_SCORE_METHOD,
+        "clip_count": len(rows),
+        "scored_count": len(scored_rows),
+        "failed_count": len(rows) - len(scored_rows),
+        "score_p50": _percentile(scores, 50),
+        "score_p10": _percentile(scores, 10),
+        "score_p90": _percentile(scores, 90),
+        "bucket_hint_counts": bucket_hint_counts,
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "input_artifact_hashes": {
+            "candidate_review_manifest_json": sha256_file(manifest_path),
+        },
+    }
+    summary_path = resolve_under_root(run_root, "artifacts/transcript_qc_summary.json")
+    write_json(summary_path, summary)
+    summary["output_hashes"] = {
+        "transcript_qc_json": sha256_file(artifact_path),
+        "transcript_qc_summary_json": sha256_file(summary_path),
+    }
+    write_json(summary_path, summary)
+    log(f"wrote transcript QC artifacts for {len(rows)} clips")
     return summary
 
 

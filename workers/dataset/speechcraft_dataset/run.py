@@ -20,6 +20,7 @@ from .export import export_native_candidate_clips
 from .io import read_json, resolve_under_root, write_json
 from .mfa import run_mfa_alignment
 from .normalization import normalize_transcripts
+from .qc_score_stages import run_speaker_purity_stage, run_transcript_qc_stage
 from .safecut import generate_safe_cutpoint_diagnostics
 from .vad import run_silero_vad
 
@@ -173,6 +174,8 @@ def should_stop(current_stage: str, stop_after: str) -> bool:
         "alignment_qc",
         "safe_cutpoints",
         "candidate_review_clips",
+        "transcript_qc",
+        "speaker_purity",
         "native_export",
     ]
     return order.index(current_stage) >= order.index(stop_after)
@@ -216,6 +219,10 @@ def failure_reason_codes(stage: str, exc: Exception) -> list[str]:
         return ["safe_cutpoint_generation_failed"]
     if stage == "candidate_review_clips":
         return ["candidate_review_clip_assembly_failed"]
+    if stage == "transcript_qc":
+        return ["transcript_qc_failed"]
+    if stage == "speaker_purity":
+        return ["speaker_purity_failed"]
     if stage == "native_export":
         return ["native_export_failed"]
     return ["dataset_worker_failed"]
@@ -454,7 +461,41 @@ def run_dataset_worker(args: argparse.Namespace) -> int:
             log_line(run_root, "dataset worker completed candidate review clips")
             return 0
 
-        status.update({"stage": "native_export", "summary": candidate_review_summary})
+        status.update({"stage": "transcript_qc", "summary": candidate_review_summary})
+        write_status(run_root, status)
+        transcript_qc_summary = run_transcript_qc_stage(run_root, config)
+        log_line(run_root, f"transcript_qc completed summary={transcript_qc_summary}")
+        if should_stop("transcript_qc", args.stop_after):
+            status.update(
+                {
+                    "ok": True,
+                    "stage": "transcript_qc",
+                    "summary": transcript_qc_summary,
+                    "completed_at": utc_now_iso(),
+                }
+            )
+            write_status(run_root, status)
+            log_line(run_root, "dataset worker completed transcript QC")
+            return 0
+
+        status.update({"stage": "speaker_purity", "summary": transcript_qc_summary})
+        write_status(run_root, status)
+        speaker_purity_summary = run_speaker_purity_stage(run_root, config)
+        log_line(run_root, f"speaker_purity completed summary={speaker_purity_summary}")
+        if should_stop("speaker_purity", args.stop_after):
+            status.update(
+                {
+                    "ok": True,
+                    "stage": "speaker_purity",
+                    "summary": speaker_purity_summary,
+                    "completed_at": utc_now_iso(),
+                }
+            )
+            write_status(run_root, status)
+            log_line(run_root, "dataset worker completed speaker purity")
+            return 0
+
+        status.update({"stage": "native_export", "summary": speaker_purity_summary})
         write_status(run_root, status)
         native_export_summary = export_native_candidate_clips(run_root, config)
         log_line(run_root, f"native_export completed summary={native_export_summary}")
@@ -506,6 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
             "alignment_qc",
             "safe_cutpoints",
             "candidate_review_clips",
+            "transcript_qc",
+            "speaker_purity",
             "native_export",
         ],
         default="alignment_qc",

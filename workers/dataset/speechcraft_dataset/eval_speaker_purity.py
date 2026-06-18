@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,10 +12,13 @@ from typing import Any
 import numpy as np
 
 from .buffers import read_analysis_audio, sec_to_sample, write_pcm16_mono
-from .io import read_json, read_json_value, read_jsonl, resolve_under_root, write_json
+from .io import read_json, read_json_value, read_jsonl, resolve_under_root, sha256_file, write_json
 
 DEFAULT_MODEL = "nvidia/speakerverification_en_titanet_large"
 TARGET_SAMPLE_RATE = 16000
+SPEAKER_PURITY_SCHEMA_VERSION = 1
+SPEAKER_SCORE_METHOD = "min_valid_window_similarity"
+SUSPICIOUS_SPAN_SIMILARITY_MAX = 0.85
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,39 @@ def _round(value: float | None, digits: int = 6) -> float | None:
     if value is None:
         return None
     return round(float(value), digits)
+
+
+def _percentile_score(values: list[float], quantile: float) -> float | None:
+    percentile = _percentile(values, quantile)
+    if percentile is None:
+        return None
+    return round(float(percentile), 6)
+
+
+def _percentile_score_0_100(values: list[float], quantile: float) -> float | None:
+    percentile = _percentile(values, quantile)
+    if percentile is None:
+        return None
+    return round(max(0.0, min(100.0, float(percentile))), 2)
+
+
+def _score_0_100(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    scaled = float(value)
+    if not math.isfinite(scaled):
+        return None
+    return round(max(0.0, min(100.0, scaled * 100.0)), 2)
+
+
+def _speaker_bucket_hint(score: float | None) -> str:
+    if score is None:
+        return "unscored"
+    if score >= 70:
+        return "pass"
+    if score >= 55:
+        return "review"
+    return "fail"
 
 
 def resolve_device(device_arg: str) -> str:
@@ -371,6 +408,7 @@ def score_candidate_clip(
         "purity_score": round(min_similarity, 6),
         "min_window_similarity": round(min_similarity, 6),
         "mean_window_similarity": round(float(np.mean(similarities)), 6),
+        "p10_window_similarity": _percentile_score(similarities, 10),
         "scored_window_count": len(scored),
         "skipped_window_count": skipped,
         "intruder_window_count": intruder_count,
@@ -612,6 +650,208 @@ def evaluate_speaker_purity(
     log(f"scored {len(scored_rows)}/{len(clip_rows)} clips -> {out_dir}")
     log(f"buckets: {bucket_counts}")
     return summary
+
+
+def _phase3_reason_codes(row: dict[str, Any]) -> list[str]:
+    score = row.get("speaker_check_score")
+    reason_codes = [str(code) for code in (row.get("reason_codes") or []) if isinstance(code, str)]
+    if score is None:
+        return sorted(set(reason_codes or ["missing_speaker_qc"]))
+    if isinstance(score, (int, float)) and score < 70:
+        reason_codes.append("low_speaker_similarity_window")
+    if isinstance(score, (int, float)) and score < 55:
+        reason_codes.append("possible_other_speaker_or_voice_shift")
+    return sorted(set(reason_codes))
+
+
+def _phase3_suspicious_spans(row: dict[str, Any]) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    for window in row.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        similarity = window.get("similarity")
+        start_sec = window.get("start_sec")
+        end_sec = window.get("end_sec")
+        if not isinstance(similarity, (int, float)) or not isinstance(start_sec, (int, float)) or not isinstance(end_sec, (int, float)):
+            continue
+        if float(similarity) >= SUSPICIOUS_SPAN_SIMILARITY_MAX:
+            continue
+        spans.append(
+            {
+                "start_sec": round(float(start_sec), 6),
+                "end_sec": round(float(end_sec), 6),
+                "similarity": round(float(similarity), 6),
+            }
+        )
+    return spans
+
+
+def _build_phase3_clip_row(candidate: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    score = metrics.get("min_window_similarity")
+    speaker_check_score = _score_0_100(score)
+    if speaker_check_score is not None and not 0.0 <= speaker_check_score <= 100.0:
+        raise ValueError("speaker_check_score must be between 0 and 100")
+    row = {
+        "clip_id": str(candidate.get("id") or candidate.get("clip_id") or ""),
+        "audio_path": str(candidate.get("audio_path") or ""),
+        "duration_sec": candidate.get("duration_sec"),
+        "speaker_check_score": speaker_check_score,
+        "speaker_score_method": SPEAKER_SCORE_METHOD,
+        "min_window_similarity": metrics.get("min_window_similarity"),
+        "mean_window_similarity": metrics.get("mean_window_similarity"),
+        "p10_window_similarity": metrics.get("p10_window_similarity"),
+        "scored_window_count": metrics.get("scored_window_count"),
+        "skipped_window_count": metrics.get("skipped_window_count"),
+        "intruder_window_count": metrics.get("intruder_window_count"),
+        "worst_window_start_sec": metrics.get("worst_window_start_sec"),
+        "bucket_hint": _speaker_bucket_hint(speaker_check_score),
+        "suspicious_spans": _phase3_suspicious_spans(metrics),
+    }
+    row["reason_codes"] = _phase3_reason_codes(row | {"reason_codes": metrics.get("reason_codes") or []})
+    return row
+
+
+def run_speaker_purity(
+    run_root: Path,
+    config: dict[str, Any],
+    *,
+    model_name: str | None = None,
+    device: str = "auto",
+) -> dict[str, Any]:
+    config_obj = SpeakerPurityConfig(
+        min_region_sec=float(config.get("speaker_purity_min_region_sec") or SpeakerPurityConfig.min_region_sec),
+        enroll_chunk_sec=float(config.get("speaker_purity_enroll_chunk_sec") or SpeakerPurityConfig.enroll_chunk_sec),
+        max_enroll_chunks=int(config.get("speaker_purity_max_enroll_chunks") or SpeakerPurityConfig.max_enroll_chunks),
+        outlier_percentile=float(config.get("speaker_purity_outlier_percentile") or SpeakerPurityConfig.outlier_percentile),
+        window_sec=float(config.get("speaker_purity_window_sec") or SpeakerPurityConfig.window_sec),
+        window_hop_sec=float(config.get("speaker_purity_window_hop_sec") or SpeakerPurityConfig.window_hop_sec),
+        purity_threshold=float(config.get("speaker_purity_threshold") or SpeakerPurityConfig.purity_threshold),
+        suspicious_threshold=float(config.get("speaker_purity_suspicious_threshold") or SpeakerPurityConfig.suspicious_threshold),
+        silence_frame_ms=float(config.get("speaker_purity_silence_frame_ms") or SpeakerPurityConfig.silence_frame_ms),
+        silence_rms_threshold=float(config.get("speaker_purity_silence_rms_threshold") or SpeakerPurityConfig.silence_rms_threshold),
+        max_silent_frame_fraction=float(config.get("speaker_purity_max_silent_frame_fraction") or SpeakerPurityConfig.max_silent_frame_fraction),
+    )
+    model = str(model_name or config.get("speaker_purity_model") or DEFAULT_MODEL)
+    run_root = run_root.expanduser().resolve()
+    artifacts_dir = resolve_under_root(run_root, "artifacts")
+    stage_dir = artifacts_dir / "_speaker_purity_stage"
+    summary = evaluate_speaker_purity(
+        run_root,
+        stage_dir,
+        target_speaker_id=str(config.get("target_speaker_id") or "") or None,
+        model_name=model,
+        config=config_obj,
+        max_clips=None,
+        export_worst=int(config.get("speaker_purity_export_worst") or 50),
+        export_best=int(config.get("speaker_purity_export_best") or 20),
+        device=str(config.get("speaker_purity_device") or device),
+    )
+
+    raw_rows = read_json_value(stage_dir / "speaker_purity_qc.json")
+    if not isinstance(raw_rows, list):
+        raise ValueError("speaker_purity_qc.json must contain a list")
+    manifest_path = resolve_under_root(run_root, "artifacts/candidate_review_manifest.json")
+    candidates = read_json_value(manifest_path)
+    if not isinstance(candidates, list):
+        raise ValueError("candidate_review_manifest.json must contain a list")
+
+    raw_by_clip_id = {
+        str(row.get("clip_id") or ""): row
+        for row in raw_rows
+        if isinstance(row, dict) and isinstance(row.get("clip_id"), str)
+    }
+    clips: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        clip_id = str(candidate.get("id") or candidate.get("clip_id") or "")
+        metrics = raw_by_clip_id.get(clip_id)
+        if metrics is None:
+            clips.append(
+                {
+                    "clip_id": clip_id,
+                    "audio_path": str(candidate.get("audio_path") or ""),
+                    "duration_sec": candidate.get("duration_sec"),
+                    "speaker_check_score": None,
+                    "speaker_score_method": SPEAKER_SCORE_METHOD,
+                    "min_window_similarity": None,
+                    "mean_window_similarity": None,
+                    "p10_window_similarity": None,
+                    "scored_window_count": 0,
+                    "skipped_window_count": 0,
+                    "intruder_window_count": 0,
+                    "worst_window_start_sec": None,
+                    "bucket_hint": "unscored",
+                    "suspicious_spans": [],
+                    "reason_codes": ["missing_speaker_qc"],
+                }
+            )
+            continue
+        clips.append(_build_phase3_clip_row(candidate, metrics))
+
+    scored_rows = [row for row in clips if isinstance(row.get("speaker_check_score"), (int, float))]
+    scores = [float(row["speaker_check_score"]) for row in scored_rows]
+    reason_counts: dict[str, int] = {}
+    for row in clips:
+        for reason in row.get("reason_codes") or []:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    bucket_hint_counts = {
+        "pass": sum(row.get("bucket_hint") == "pass" for row in clips),
+        "review": sum(row.get("bucket_hint") == "review" for row in clips),
+        "fail": sum(row.get("bucket_hint") == "fail" for row in clips),
+        "unscored": sum(row.get("bucket_hint") == "unscored" for row in clips),
+    }
+
+    artifact_payload = {
+        "schema_version": SPEAKER_PURITY_SCHEMA_VERSION,
+        "stage": "speaker_purity",
+        "model": model,
+        "score_method": SPEAKER_SCORE_METHOD,
+        "clips": clips,
+    }
+    artifact_path = resolve_under_root(run_root, "artifacts/speaker_purity.json")
+    write_json(artifact_path, artifact_payload)
+
+    voiceprint_stage_path = stage_dir / "enrollment" / "target_voiceprint.json"
+    if voiceprint_stage_path.exists():
+        write_json(resolve_under_root(run_root, "artifacts/target_voiceprint.json"), read_json_value(voiceprint_stage_path))
+
+    summary_payload = {
+        "schema_version": SPEAKER_PURITY_SCHEMA_VERSION,
+        "stage": "speaker_purity",
+        "model": model,
+        "score_method": SPEAKER_SCORE_METHOD,
+        "target_speaker_id": summary.get("target_speaker_id"),
+        "clip_count": len(clips),
+        "scored_count": len(scored_rows),
+        "failed_count": len(clips) - len(scored_rows),
+        "score_p50": _percentile_score_0_100(scores, 50),
+        "score_p10": _percentile_score_0_100(scores, 10),
+        "score_p90": _percentile_score_0_100(scores, 90),
+        "bucket_hint_counts": bucket_hint_counts,
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "input_artifact_hashes": {
+            "candidate_review_manifest_json": sha256_file(manifest_path),
+            "speaker_selection_json": sha256_file(resolve_under_root(run_root, "artifacts/speaker_selection.json")),
+            "speaker_regions_jsonl": sha256_file(resolve_under_root(run_root, "artifacts/speaker_regions.jsonl")),
+            "audio_variants_manifest_json": sha256_file(resolve_under_root(run_root, "artifacts/audio_variants_manifest.json")),
+        },
+    }
+    for field_name in ("score_p50", "score_p10", "score_p90"):
+        value = summary_payload[field_name]
+        if value is not None and not 0.0 <= float(value) <= 100.0:
+            raise ValueError(f"{field_name} must be between 0 and 100")
+    summary_path = resolve_under_root(run_root, "artifacts/speaker_purity_summary.json")
+    write_json(summary_path, summary_payload)
+    summary_payload["output_hashes"] = {
+        "speaker_purity_json": sha256_file(artifact_path),
+        "speaker_purity_summary_json": sha256_file(summary_path),
+    }
+    if (artifacts_dir / "target_voiceprint.json").exists():
+        summary_payload["output_hashes"]["target_voiceprint_json"] = sha256_file(artifacts_dir / "target_voiceprint.json")
+    write_json(summary_path, summary_payload)
+    log(f"wrote speaker purity artifacts for {len(clips)} clips")
+    return summary_payload
 
 
 def build_parser() -> argparse.ArgumentParser:
