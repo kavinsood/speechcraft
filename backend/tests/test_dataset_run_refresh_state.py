@@ -208,6 +208,22 @@ class DatasetRunRefreshStateTests(unittest.TestCase):
         self.assertEqual(refreshed.status, ProcessingRunStatus.COMPLETED)
         self.assertEqual(refreshed.stage, RfcStage.EXPORT)
 
+    def test_transcript_qc_success_maps_to_transcript_qc_stage(self) -> None:
+        run = self._create_run()
+        self._mark_running(run)
+        self._write_status(
+            run,
+            {
+                "stage": "transcript_qc",
+                "ok": True,
+                "summary": {"clip_count": 2},
+                "completed_at": "2026-06-05T11:30:52+00:00",
+            },
+        )
+        refreshed = refresh_dataset_run(self.repository, run.id)
+        self.assertEqual(refreshed.status, ProcessingRunStatus.COMPLETED)
+        self.assertEqual(refreshed.stage, RfcStage.TRANSCRIPT_QC)
+
     def test_unknown_worker_stage_adds_diagnostic_reason(self) -> None:
         run = self._create_run()
         self._mark_running(run)

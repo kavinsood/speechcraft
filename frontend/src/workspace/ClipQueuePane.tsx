@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { ClipLabItemRef, QcBucket, ReviewStatus, SliceSummary, SourceRecordingQueue } from "../types";
+import type { ClipLabItemRef, ReviewStatus, SliceSummary, SourceRecordingQueue } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   clipMatchesFilters,
@@ -19,13 +19,6 @@ type ClipQueuePaneProps = {
   workspaceEmptyMessage: string | null;
   recordings: SourceRecordingQueue[];
   clips: SliceSummary[];
-  qcResultMap?: Map<string, {
-    bucket: QcBucket;
-    visibleBucket: QcBucket;
-    score: number;
-    reasonCodes: string[];
-    reviewSnapshot?: ReviewStatus | null;
-  }> | null;
   activeClipItem: ClipLabItemRef | null;
   onSelectClipItem: (clipItem: ClipLabItemRef) => void;
   onRetryLoad: () => void;
@@ -38,7 +31,6 @@ export default function ClipQueuePane({
   workspaceEmptyMessage,
   recordings,
   clips,
-  qcResultMap,
   activeClipItem,
   onSelectClipItem,
   onRetryLoad,
@@ -86,11 +78,10 @@ export default function ClipQueuePane({
   }, [clips]);
 
   const queueClips = useMemo(() => {
-    const sortedClips = qcResultMap ? clips : sortClipsForQueue(clips);
-    return sortedClips.filter((clip) =>
+    return sortClipsForQueue(clips).filter((clip) =>
       clipMatchesFilters(clip, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved),
     );
-  }, [clips, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved, qcResultMap]);
+  }, [clips, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved]);
 
   useEffect(() => {
     onVisibleClipIdsChange(queueClips.map((clip) => clip.id));
@@ -247,7 +238,6 @@ export default function ClipQueuePane({
         {workspacePhase === "ready" ? (
           <>
             {queueClips.map((clip, index) => {
-              const qcMeta = qcResultMap?.get(clip.id) ?? null;
               return (
                 <button
                   key={clip.id}
@@ -264,14 +254,6 @@ export default function ClipQueuePane({
                     </span>
                   </div>
                   <p>{getSliceTranscriptText(clip)}</p>
-                  {qcMeta ? (
-                    <div className="qc-queue-meta">
-                      <span className={`qc-bucket-label qc-bucket-${qcMeta.visibleBucket}`}>
-                        QC {qcMeta.visibleBucket.replace(/_/g, " ")}
-                      </span>
-                      <span>{qcMeta.score.toFixed(3)}</span>
-                    </div>
-                  ) : null}
                   <div className="clip-list-meta">
                     <span>{formatSeconds(getSliceDuration(clip))}</span>
                     <span>{clip.active_variant_generator_model ?? "source"}</span>

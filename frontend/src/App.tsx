@@ -5,16 +5,15 @@ import {
   PipelineProvider,
   initialPipelineSelection,
   pipelineSelectionReducer,
-  type LabHandoffContext,
   type PipelineSelectionState,
   type PipelineStage,
 } from "./pipeline/PipelineContext";
 import ExportPage from "./pages/ExportPage";
 import IngestPage from "./pages/IngestPage";
-import LegacyLabPage from "./legacy/LegacyLabPage";
-import LegacyQcPage from "./legacy/LegacyQcPage";
+import LabelPage from "./pages/LabelPage";
 import OverviewPage from "./pages/OverviewPage";
 import ProcessingPage from "./pages/ProcessingPage";
+import QcPage from "./pages/QcPage";
 import ReferencePage from "./pages/ReferencePage";
 import SpeakersPage from "./pages/SpeakersPage";
 import SlicerPage from "./pages/SlicerPage";
@@ -48,9 +47,6 @@ type PageHeaderContent = {
   description: string;
 };
 
-const qcBucketFilters = ["auto-kept", "needs-review", "auto-rejected", "all"] as const;
-const qcSortModes = ["source-order", "qc-score-ascending", "qc-score-descending"] as const;
-
 const stepDefinitions: StepDefinition[] = [
   { id: "ingest", label: "Ingest", shortLabel: "In", glyph: "I", tone: "Sources first" },
   { id: "overview", label: "Overview", shortLabel: "Ov", glyph: "O", tone: "Raw recordings and prep" },
@@ -78,23 +74,6 @@ function isAppStep(value: string | null): value is AppStep {
   return value === "reference" || stepDefinitions.some((step) => step.id === value);
 }
 
-function isQcBucketFilter(value: string | null): value is LabHandoffContext["bucketFilter"] {
-  return qcBucketFilters.some((bucket) => bucket === value);
-}
-
-function isQcSortMode(value: string | null): value is LabHandoffContext["sort"] {
-  return qcSortModes.some((sort) => sort === value);
-}
-
-function parseNullableThreshold(value: string | null): number | null {
-  if (!value) {
-    return null;
-  }
-
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 function readPipelineSelectionFromSearch(
   searchParams: URLSearchParams,
   step: AppStep,
@@ -102,27 +81,11 @@ function readPipelineSelectionFromSearch(
   const processingRunId = searchParams.get("processingRun")?.trim() || null;
   const speakersRunId = searchParams.get("speakersRun")?.trim() || null;
   const runId = searchParams.get("run")?.trim() || null;
-  const qcRunId = searchParams.get("qc")?.trim() || null;
-  const bucket = searchParams.get("bucket");
-  const sort = searchParams.get("sort");
-  const keepThreshold = parseNullableThreshold(searchParams.get("keep") ?? searchParams.get("threshold"));
-  const rejectThreshold = parseNullableThreshold(searchParams.get("reject"));
-  const preset = searchParams.get("preset")?.trim() || null;
 
   const selectedSpeakersRunId = step === "speakers" ? speakersRunId : null;
   const selectedSlicerDatasetRunId = step === "slicer" ? runId : null;
   const selectedQcDatasetRunId = step === "qc" ? runId : null;
   const selectedLabDatasetRunId = step === "lab" ? runId : null;
-  const selectedQcRun =
-    runId && qcRunId && (step === "qc" || step === "lab") ? { datasetRunId: runId, qcRunId } : null;
-
-  const hasHandoffParams =
-    step === "lab" ||
-    isQcBucketFilter(bucket) ||
-    isQcSortMode(sort) ||
-    keepThreshold !== null ||
-    rejectThreshold !== null ||
-    preset !== null;
 
   return {
     selectedSpeakersRunId,
@@ -130,20 +93,6 @@ function readPipelineSelectionFromSearch(
     selectedSlicerDatasetRunId,
     selectedQcDatasetRunId,
     selectedLabDatasetRunId,
-    selectedQcRun,
-    labHandoff:
-      hasHandoffParams && runId
-        ? {
-            source: "qc",
-            datasetRunId: runId,
-            qcRunId,
-            bucketFilter: isQcBucketFilter(bucket) ? bucket : "all",
-            sort: isQcSortMode(sort) ? sort : "source-order",
-            keepThreshold,
-            rejectThreshold,
-            preset,
-          }
-        : null,
   };
 }
 
@@ -178,7 +127,7 @@ function writeRouteToLocation(
   pipelineSelection: PipelineSelectionState,
   replace = false,
 ) {
-  const url = new URL(window.location.href);
+  const url = new URL(window.location.origin);
   url.pathname = route.step === "ingest" ? "/" : `/${route.step}`;
   if (route.projectId) {
     url.searchParams.set("project", route.projectId);
@@ -190,9 +139,6 @@ function writeRouteToLocation(
   } else {
     url.searchParams.delete("clip_id");
   }
-
-  const routeUsesQcSelection = route.step === "qc" || route.step === "lab";
-  const routeUsesLabHandoff = route.step === "lab";
 
   if (route.step === "speakers" && pipelineSelection.selectedSpeakersRunId) {
     url.searchParams.set("speakersRun", pipelineSelection.selectedSpeakersRunId);
@@ -214,40 +160,6 @@ function writeRouteToLocation(
     url.searchParams.set("run", pipelineSelection.selectedLabDatasetRunId);
   } else {
     url.searchParams.delete("run");
-  }
-
-  if (routeUsesQcSelection && pipelineSelection.selectedQcRun) {
-    url.searchParams.set("qc", pipelineSelection.selectedQcRun.qcRunId);
-  } else {
-    url.searchParams.delete("qc");
-  }
-
-  if (routeUsesLabHandoff && pipelineSelection.labHandoff) {
-    url.searchParams.set("bucket", pipelineSelection.labHandoff.bucketFilter);
-    url.searchParams.set("sort", pipelineSelection.labHandoff.sort);
-    if (pipelineSelection.labHandoff.keepThreshold !== null) {
-      url.searchParams.set("keep", String(pipelineSelection.labHandoff.keepThreshold));
-    } else {
-      url.searchParams.delete("keep");
-    }
-    if (pipelineSelection.labHandoff.rejectThreshold !== null) {
-      url.searchParams.set("reject", String(pipelineSelection.labHandoff.rejectThreshold));
-    } else {
-      url.searchParams.delete("reject");
-    }
-    if (pipelineSelection.labHandoff.preset) {
-      url.searchParams.set("preset", pipelineSelection.labHandoff.preset);
-    } else {
-      url.searchParams.delete("preset");
-    }
-    url.searchParams.delete("threshold");
-  } else {
-    url.searchParams.delete("bucket");
-    url.searchParams.delete("sort");
-    url.searchParams.delete("keep");
-    url.searchParams.delete("reject");
-    url.searchParams.delete("preset");
-    url.searchParams.delete("threshold");
   }
 
   if (replace) {
@@ -470,8 +382,6 @@ export default function App() {
     const nextPipelineSelection: PipelineSelectionState = {
       ...pipelineSelection,
       selectedQcDatasetRunId: runId,
-      selectedQcRun: null,
-      labHandoff: null,
     };
     dispatchPipelineSelection({ type: "select-qc-dataset-run", runId });
     writeRouteToLocation(route, nextPipelineSelection, true);
@@ -481,7 +391,6 @@ export default function App() {
     const nextPipelineSelection: PipelineSelectionState = {
       ...pipelineSelection,
       selectedLabDatasetRunId: runId,
-      labHandoff: null,
     };
     dispatchPipelineSelection({ type: "select-lab-dataset-run", runId });
     writeRouteToLocation(route, nextPipelineSelection, true);
@@ -507,46 +416,6 @@ export default function App() {
     const nextRoute = { step: "processing" as const, projectId: route.projectId, clipItem: route.clipItem };
     setRoute(nextRoute);
     writeRouteToLocation(nextRoute, nextPipelineSelection);
-  }
-
-  function selectQcRun(qcRunId: string | null) {
-    const nextPipelineSelection: PipelineSelectionState =
-      pipelineSelection.selectedQcDatasetRunId && qcRunId
-        ? {
-            ...pipelineSelection,
-            selectedQcRun: {
-              datasetRunId: pipelineSelection.selectedQcDatasetRunId,
-              qcRunId,
-            },
-            labHandoff: null,
-          }
-        : {
-            ...pipelineSelection,
-            selectedQcRun: null,
-            labHandoff: null,
-          };
-    dispatchPipelineSelection({ type: "select-qc-run", qcRunId });
-    writeRouteToLocation(route, nextPipelineSelection, true);
-  }
-
-  function setPipelineLabHandoff(handoff: LabHandoffContext | null) {
-    const handoffMatchesSelection =
-      !handoff ||
-      (handoff.datasetRunId === pipelineSelection.selectedLabDatasetRunId &&
-        (!handoff.qcRunId ||
-          (pipelineSelection.selectedQcRun?.datasetRunId === handoff.datasetRunId &&
-            pipelineSelection.selectedQcRun.qcRunId === handoff.qcRunId)));
-
-    if (!handoffMatchesSelection) {
-      return;
-    }
-
-    const nextPipelineSelection = {
-      ...pipelineSelection,
-      labHandoff: handoff,
-    };
-    dispatchPipelineSelection({ type: "set-lab-handoff", handoff });
-    writeRouteToLocation(route, nextPipelineSelection, true);
   }
 
   function handleImportComplete(projectId: string) {
@@ -590,23 +459,13 @@ export default function App() {
     pageContent = <SlicerPage {...pageProps} onOpenQc={() => navigate("qc")} />;
   } else if (route.step === "qc") {
     pageContent = (
-      <LegacyQcPage
+      <QcPage
         {...pageProps}
-        onOpenLab={(handoff) => {
-          const nextPipelineSelection = {
-            ...pipelineSelection,
-            labHandoff: handoff,
-          };
-          const nextRoute = { step: "lab" as const, projectId: route.projectId, clipItem: route.clipItem };
-          dispatchPipelineSelection({ type: "set-lab-handoff", handoff });
-          setRoute(nextRoute);
-          writeRouteToLocation(nextRoute, nextPipelineSelection);
-        }}
       />
     );
   } else if (route.step === "lab") {
     pageContent = (
-      <LegacyLabPage
+      <LabelPage
         {...pageProps}
         activeClipItem={route.clipItem}
         onActiveClipItemChange={(clipItem) => {
@@ -677,16 +536,11 @@ export default function App() {
           selectedSlicerDatasetRunId={pipelineSelection.selectedSlicerDatasetRunId}
           selectedQcDatasetRunId={pipelineSelection.selectedQcDatasetRunId}
           selectedLabDatasetRunId={pipelineSelection.selectedLabDatasetRunId}
-          selectedQcRun={pipelineSelection.selectedQcRun}
-          selectedQcRunId={pipelineSelection.selectedQcRun?.qcRunId ?? null}
-          labHandoff={pipelineSelection.labHandoff}
           selectSpeakersRun={selectSpeakersRun}
           selectProcessingRun={selectProcessingRun}
           selectSlicerDatasetRun={selectSlicerDatasetRun}
           selectQcDatasetRun={selectQcDatasetRun}
           selectLabDatasetRun={selectLabDatasetRun}
-          selectQcRun={selectQcRun}
-          setLabHandoff={setPipelineLabHandoff}
           resetPipelineSelection={() => {
             dispatchPipelineSelection({ type: "reset" });
             writeRouteToLocation(route, initialPipelineSelection, true);
