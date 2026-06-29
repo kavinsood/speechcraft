@@ -11,6 +11,9 @@ import numpy as np
 from speechcraft_dataset.analyze_ctc_transcript_qc import (
     TRANSCRIPT_SCORE_METHOD,
     _meaningful_span_metrics,
+    composite_transcript_match_score,
+    detect_greedy_insertions,
+    find_sequence_insertion_blocks,
     normalize_verifier_text,
     run_transcript_qc,
     select_transcript_gate_score,
@@ -78,6 +81,46 @@ class AnalyzeCtcTranscriptQcTests(unittest.TestCase):
         min_span_score, weak_spans = _meaningful_span_metrics(verifier_text, char_probs, timings, 0.1)
         self.assertIsNone(min_span_score)
         self.assertEqual(weak_spans, [])
+
+    def test_detect_greedy_insertions_flags_missing_transcript_words(self) -> None:
+        count, words = detect_greedy_insertions(
+            "I|VE|BEEN|THINKING",
+            "LIKE|I|VE|BEEN|THINKING",
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(words, ["LIKE"])
+
+    def test_find_sequence_insertion_blocks_uses_ordered_diff(self) -> None:
+        blocks = find_sequence_insertion_blocks(
+            "I|KNOW|I|KNOW",
+            "I|KNOW|THAT|I|KNOW",
+        )
+        self.assertEqual(blocks, [(2, 3, ["THAT"])])
+
+    def test_composite_transcript_match_score_is_min_of_alignment_and_integrity(self) -> None:
+        _integrity, final = composite_transcript_match_score(
+            96.0,
+            confirmed_insertions=[{"text": "LIKE"}],
+        )
+        self.assertEqual(final, 0.0)
+        _integrity, final = composite_transcript_match_score(94.0, confirmed_insertions=[])
+        self.assertEqual(final, 94.0)
+
+    def test_detect_greedy_insertions_ignores_short_words(self) -> None:
+        count, words = detect_greedy_insertions(
+            "I|VE|BEEN|THINKING",
+            "I|AM|VE|BEEN|THINKING",
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(words, [])
+
+    def test_detect_greedy_insertions_no_false_positive_when_texts_match(self) -> None:
+        count, words = detect_greedy_insertions(
+            "HELLO|WORLD",
+            "HELLO|WORLD",
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(words, [])
 
     def test_select_transcript_gate_score_fallback_order(self) -> None:
         self.assertEqual(

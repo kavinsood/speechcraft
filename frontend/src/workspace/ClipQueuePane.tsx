@@ -2,7 +2,9 @@ import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { ClipLabItemRef, ReviewStatus, SliceSummary, SourceRecordingQueue } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
+  clipQueueSortOptions,
   clipMatchesFilters,
+  type ClipQueueSortMode,
   formatSeconds,
   getSliceDuration,
   getSliceTranscriptText,
@@ -20,6 +22,8 @@ type ClipQueuePaneProps = {
   recordings: SourceRecordingQueue[];
   clips: SliceSummary[];
   activeClipItem: ClipLabItemRef | null;
+  sortMode: ClipQueueSortMode;
+  onSortModeChange: (mode: ClipQueueSortMode) => void;
   onSelectClipItem: (clipItem: ClipLabItemRef) => void;
   onRetryLoad: () => void;
   onVisibleClipIdsChange: (clipIds: string[]) => void;
@@ -32,6 +36,8 @@ export default function ClipQueuePane({
   recordings,
   clips,
   activeClipItem,
+  sortMode,
+  onSortModeChange,
   onSelectClipItem,
   onRetryLoad,
   onVisibleClipIdsChange,
@@ -78,10 +84,10 @@ export default function ClipQueuePane({
   }, [clips]);
 
   const queueClips = useMemo(() => {
-    return sortClipsForQueue(clips).filter((clip) =>
+    return sortClipsForQueue(clips, sortMode).filter((clip) =>
       clipMatchesFilters(clip, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved),
     );
-  }, [clips, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved]);
+  }, [clips, deferredSearch, selectedFilterTags, selectedFilterStatuses, hideResolved, sortMode]);
 
   useEffect(() => {
     onVisibleClipIdsChange(queueClips.map((clip) => clip.id));
@@ -195,6 +201,21 @@ export default function ClipQueuePane({
         </div>
       </div>
 
+      <div className="clip-queue-sort-row">
+        <select
+          aria-label="Sort clips"
+          className="clip-sort-select"
+          value={sortMode}
+          onChange={(event) => onSortModeChange(event.target.value as ClipQueueSortMode)}
+        >
+          {clipQueueSortOptions.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
       <div className="clip-list">
         {workspacePhase === "loading" ? <div className="empty-state">Loading clips...</div> : null}
         {workspacePhase === "error" ? (
@@ -242,6 +263,7 @@ export default function ClipQueuePane({
                 <button
                   key={clip.id}
                   className={`clip-list-item ${clip.id === activeClipItem?.id ? "active" : ""}`}
+                  data-clip-id={clip.id}
                   type="button"
                   onClick={() => onSelectClipItem({ id: clip.id })}
                 >

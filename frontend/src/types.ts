@@ -98,10 +98,12 @@ export type DatasetRun = {
 
 export type DatasetRunCreateRequest = {
   source_recording_ids: string[];
-  config: Record<string, unknown>;
+  config?: Record<string, unknown>;
   single_speaker: boolean;
   target_speaker_label: string;
   stop_after: string;
+  language?: string;
+  whisper_model_size?: "large-v3" | "base";
 };
 
 export type DatasetSpeakerSample = {
@@ -378,6 +380,17 @@ export type ClipLabCommit = {
   active_variant_id?: string | null;
   message?: string | null;
   is_milestone: boolean;
+  created_at: string;
+};
+
+export type ReferenceClipCandidate = {
+  project_id: string;
+  dataset_run_id: string;
+  clip_id: string;
+  transcript_text: string;
+  filename: string;
+  relative_path: string;
+  source_audio_path: string;
   created_at: string;
 };
 

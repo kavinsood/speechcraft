@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +21,16 @@ WEAK_CHAR_THRESHOLD = 0.25
 WEAK_WINDOW_THRESHOLD = 0.50
 WEAK_WINDOW_FRAMES = 5
 TRANSCRIPT_QC_SCHEMA_VERSION = 1
-TRANSCRIPT_SCORE_METHOD = "min_meaningful_ctc_span"
+TRANSCRIPT_SCORE_METHOD = "min_alignment_and_confirmed_greedy_insertion_v1"
 WORKER_TRANSCRIPT_THRESHOLD_HINT = 85
+GREEDY_INTEGRITY_PASS_SCORE = 100.0
+GREEDY_INTEGRITY_FAIL_SCORE = 0.0
+GREEDY_INSERTION_MIN_WORD_LEN = 3
+INSERTION_INTERIOR_CONFIDENCE_THRESHOLD = 0.70
+INSERTION_EDGE_CONFIDENCE_THRESHOLD = 0.85
+AUDIO_EDGE_FRACTION = 0.10
+UNTRANSCRIBED_SPEECH_REASON = "untranscribed_speech_detected"
+CONFIRMED_GREEDY_INSERTION_REASON = "confirmed_greedy_insertion"
 
 
 @dataclass(frozen=True)
@@ -340,6 +349,183 @@ def _meaningful_span_metrics(
     return _round(min_span_score), weak_spans
 
 
+def split_verifier_words(text: str) -> list[str]:
+    if "|" in text:
+        return [word for word in text.split("|") if word]
+    return [word for word in text.split() if word]
+
+
+def word_char_spans(text: str) -> list[tuple[int, int]]:
+    words = split_verifier_words(text)
+    if not words:
+        return []
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    for word in words:
+        start = text.find(word, search_from)
+        if start < 0:
+            raise ValueError(f"word {word!r} not found in verifier text")
+        end = start + len(word)
+        spans.append((start, end))
+        search_from = end
+    return spans
+
+
+def find_sequence_insertion_blocks(expected_text: str, greedy_text: str) -> list[tuple[int, int, list[str]]]:
+    expected_words = split_verifier_words(expected_text)
+    greedy_words = split_verifier_words(greedy_text)
+    if not greedy_words:
+        return []
+    matcher = SequenceMatcher(a=expected_words, b=greedy_words)
+    blocks: list[tuple[int, int, list[str]]] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag != "insert" or j2 <= j1:
+            continue
+        block_words = greedy_words[j1:j2]
+        if any(len(word) >= GREEDY_INSERTION_MIN_WORD_LEN for word in block_words):
+            blocks.append((j1, j2, block_words))
+    return blocks
+
+
+def _insertion_location(
+    *,
+    start_sec: float,
+    end_sec: float,
+    audio_duration_sec: float,
+) -> str:
+    edge_sec = max(0.0, float(audio_duration_sec) * AUDIO_EDGE_FRACTION)
+    if start_sec <= edge_sec or end_sec >= max(0.0, float(audio_duration_sec) - edge_sec):
+        return "edge"
+    return "interior"
+
+
+def _align_text_char_probs(
+    text: str,
+    probs: np.ndarray,
+    bundle: CtcModelBundle,
+    config: Any,
+) -> tuple[Any, np.ndarray]:
+    import ctc_segmentation
+
+    ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(
+        config,
+        [text],
+        char_list=bundle.char_list,
+    )
+    if ground_truth_mat.size == 0:
+        raise ValueError("ctc_alignment_failed: empty ground truth matrix")
+    timings, char_probs, _state_list = ctc_segmentation.ctc_segmentation(config, probs, ground_truth_mat)
+    _segments = ctc_segmentation.determine_utterance_segments(
+        config,
+        utt_begin_indices,
+        char_probs,
+        timings,
+        [text],
+    )
+    return timings, np.asarray(char_probs, dtype=np.float64)
+
+
+def confirm_greedy_insertions(
+    expected_text: str,
+    greedy_text: str,
+    *,
+    probs: np.ndarray,
+    bundle: CtcModelBundle,
+    config: Any,
+    index_duration: float,
+    audio_duration_sec: float,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not greedy_text.strip():
+        return [], []
+
+    insertion_blocks = find_sequence_insertion_blocks(expected_text, greedy_text)
+    if not insertion_blocks:
+        return [], []
+
+    try:
+        timings, char_probs = _align_text_char_probs(greedy_text, probs, bundle, config)
+    except ValueError:
+        return [], []
+
+    spans = word_char_spans(greedy_text)
+    confirmed: list[dict[str, Any]] = []
+    confirmed_words: list[str] = []
+    for word_start, word_end, block_words in insertion_blocks:
+        if word_end > len(spans):
+            continue
+        char_start = spans[word_start][0]
+        char_end = spans[word_end - 1][1]
+        if char_end > char_probs.size:
+            continue
+        block_probs = char_probs[char_start:char_end]
+        if block_probs.size == 0:
+            continue
+        confidence = float(np.min(block_probs))
+        timing_slice = np.asarray(timings[char_start:char_end], dtype=np.float64)
+        if timing_slice.size == 0:
+            continue
+        start_sec = round(float(np.min(timing_slice)) * float(index_duration), 3)
+        end_sec = round(float(np.max(timing_slice)) * float(index_duration), 3)
+        location = _insertion_location(
+            start_sec=start_sec,
+            end_sec=end_sec,
+            audio_duration_sec=audio_duration_sec,
+        )
+        required_confidence = (
+            INSERTION_EDGE_CONFIDENCE_THRESHOLD
+            if location == "edge"
+            else INSERTION_INTERIOR_CONFIDENCE_THRESHOLD
+        )
+        if confidence < required_confidence:
+            continue
+        text = "|".join(block_words)
+        confirmed.append(
+            {
+                "text": text,
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "confidence": round(confidence, 4),
+                "location": location,
+            }
+        )
+        confirmed_words.append(text)
+
+    return confirmed, confirmed_words
+
+
+def composite_transcript_match_score(
+    forced_alignment_score: float | None,
+    *,
+    confirmed_insertions: list[dict[str, Any]],
+) -> tuple[float, float | None]:
+    greedy_integrity_score = (
+        GREEDY_INTEGRITY_FAIL_SCORE if confirmed_insertions else GREEDY_INTEGRITY_PASS_SCORE
+    )
+    if forced_alignment_score is None:
+        return greedy_integrity_score, None
+    return greedy_integrity_score, min(float(forced_alignment_score), greedy_integrity_score)
+
+
+def greedy_decode_text_from_logits(logits: Any, bundle: CtcModelBundle) -> str:
+    import torch
+
+    predicted_ids = torch.argmax(logits, dim=-1)
+    if predicted_ids.dim() == 1:
+        predicted_ids = predicted_ids.unsqueeze(0)
+    decoded = bundle.processor.batch_decode(predicted_ids)
+    if not decoded:
+        return ""
+    return str(decoded[0]).strip()
+
+
+def detect_greedy_insertions(expected_text: str, greedy_text: str) -> tuple[int, list[str]]:
+    """Text-only helper for unit tests; production uses confirm_greedy_insertions()."""
+
+    blocks = find_sequence_insertion_blocks(expected_text, greedy_text)
+    insertion_words = ["|".join(block_words) for _j1, _j2, block_words in blocks]
+    return (1 if insertion_words else 0), insertion_words
+
+
 def select_transcript_gate_score(
     *,
     ctc_min_span_score: float | None,
@@ -377,6 +563,22 @@ def score_clip(
 
     config = ctc_segmentation.CtcSegmentationParameters(char_list=bundle.char_list)
     config.index_duration = audio.shape[0] / probs.shape[0] / sample_rate
+    audio_duration_sec = float(audio.shape[0]) / float(sample_rate)
+
+    greedy_raw = greedy_decode_text_from_logits(logits, bundle)
+    greedy_normalized, _ = normalize_verifier_text(greedy_raw, set(bundle.char_list))
+    confirmed_insertions, confirmed_insertion_words = confirm_greedy_insertions(
+        verifier_text,
+        greedy_normalized,
+        probs=probs,
+        bundle=bundle,
+        config=config,
+        index_duration=float(config.index_duration),
+        audio_duration_sec=audio_duration_sec,
+    )
+    ctc_greedy_insertions = 1 if confirmed_insertions else 0
+    untranscribed_speech_detected = ctc_greedy_insertions > 0
+
     ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(
         config,
         [verifier_text],
@@ -419,9 +621,13 @@ def score_clip(
         ctc_min_window_score=ctc_min_window_score,
         ctc_mean_score=ctc_mean_score,
     )
-    transcript_match_score = _round_score_0_100(raw_score)
+    forced_alignment_score = _round_score_0_100(raw_score)
+    greedy_integrity_score, transcript_match_score = composite_transcript_match_score(
+        forced_alignment_score,
+        confirmed_insertions=confirmed_insertions,
+    )
     coverage = audio_coverage_metrics(
-        audio_duration_sec=float(audio.shape[0]) / float(sample_rate),
+        audio_duration_sec=audio_duration_sec,
         segments=segments,
         timings=timings,
         index_duration=float(config.index_duration),
@@ -431,11 +637,21 @@ def score_clip(
         reason_codes.append("low_transcript_match")
     if weak_spans and transcript_match_score is not None and transcript_match_score < WORKER_TRANSCRIPT_THRESHOLD_HINT:
         reason_codes.append("weak_transcript_span")
+    if untranscribed_speech_detected:
+        reason_codes.append(UNTRANSCRIBED_SPEECH_REASON)
+        reason_codes.append(CONFIRMED_GREEDY_INSERTION_REASON)
     bucket = score_bucket(transcript_match_score)
     bucket_hint = score_bucket_hint(transcript_match_score)
 
     return {
         "transcript_score_method": TRANSCRIPT_SCORE_METHOD,
+        "forced_alignment_score": forced_alignment_score,
+        "greedy_integrity_score": greedy_integrity_score,
+        "confirmed_insertions": confirmed_insertions,
+        "untranscribed_speech_detected": untranscribed_speech_detected,
+        "ctc_greedy_insertions": ctc_greedy_insertions,
+        "ctc_greedy_insertion_words": confirmed_insertion_words,
+        "ctc_greedy_decode_text": greedy_normalized or None,
         "ctc_mean_score": _round(ctc_mean_score),
         "ctc_min_span_score": _round(ctc_min_span_score),
         "ctc_min_window_score": _round(ctc_min_window_score),
@@ -478,7 +694,14 @@ def build_clip_row(
         "weak_span_count": None,
         "weak_spans": [],
         "segment_confidence": None,
+        "forced_alignment_score": None,
+        "greedy_integrity_score": None,
+        "confirmed_insertions": [],
+        "untranscribed_speech_detected": False,
         "transcript_match_score": None,
+        "ctc_greedy_insertions": None,
+        "ctc_greedy_insertion_words": [],
+        "ctc_greedy_decode_text": None,
         "bucket_hint": "unscored",
         "audio_duration_sec": candidate.get("duration_sec"),
         "aligned_speech_sec": None,

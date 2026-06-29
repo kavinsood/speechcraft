@@ -1,4 +1,4 @@
-import type { ClipLabItem, ClipLabVariant, ReviewStatus, Slice, SliceSummary } from "../types";
+import type { ClipLabItem, ClipLabVariant, DatasetQcPayload, ReviewStatus, Slice, SliceSummary } from "../types";
 
 type ClipLikeSummary = SliceSummary | ClipLabItem;
 
@@ -16,8 +16,50 @@ export const statusLabels: Record<ReviewStatus, string> = {
   rejected: "Rejected",
 };
 
+export type ClipQueueSortMode =
+  | "source_timeline"
+  | "best_reference_candidate"
+  | "transcript_confidence"
+  | "speaker_purity"
+  | "longest_first";
+
+export type DatasetQcScores = {
+  transcriptMatch: number | null;
+  speakerCheck: number | null;
+};
+
+export function buildDatasetQcScoreIndex(
+  payload: DatasetQcPayload | null | undefined,
+): Map<string, DatasetQcScores> {
+  const index = new Map<string, DatasetQcScores>();
+  for (const clip of payload?.clips ?? []) {
+    index.set(clip.clip_id, {
+      transcriptMatch: clip.transcript_match,
+      speakerCheck: clip.speaker_check,
+    });
+  }
+  return index;
+}
+
+export function formatQcScore(score: number | null): string {
+  return score === null ? "—" : score.toFixed(2);
+}
+
+export const clipQueueSortOptions: Array<{ value: ClipQueueSortMode; label: string }> = [
+  { value: "source_timeline", label: "Source Order" },
+  { value: "best_reference_candidate", label: "Reference Clip Candidates" },
+  { value: "transcript_confidence", label: "Transcript Confidence" },
+  { value: "speaker_purity", label: "Speaker Purity" },
+  { value: "longest_first", label: "Longest First" },
+];
+
 export function formatSeconds(value: number): string {
   return `${value.toFixed(2)}s`;
+}
+
+function finiteNumberOr(value: unknown, fallback: number): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 export function formatClipTimestamp(value: number): string {
@@ -47,10 +89,50 @@ export function getSliceMetadata<T>(
   key: string,
   fallback: T,
 ): T {
-  const itemMetadata =
-    "model_metadata" in slice ? slice.model_metadata : (slice as ClipLabItem).item_metadata;
-  const value = itemMetadata?.[key];
-  return (value as T | undefined) ?? fallback;
+  for (const source of metadataSources(slice)) {
+    if (key in source) {
+      const value = source[key];
+      return (value as T | undefined) ?? fallback;
+    }
+  }
+  return fallback;
+}
+
+function metadataSources(slice: ClipLikeSummary): Record<string, unknown>[] {
+  const sources: Record<string, unknown>[] = [];
+
+  if ("model_metadata" in slice && slice.model_metadata && typeof slice.model_metadata === "object") {
+    sources.push(slice.model_metadata);
+  }
+
+  if ("item_metadata" in slice && (slice as ClipLabItem).item_metadata && typeof (slice as ClipLabItem).item_metadata === "object") {
+    sources.push((slice as ClipLabItem).item_metadata as Record<string, unknown>);
+  }
+
+  return sources;
+}
+
+function getNestedMetadataValue(source: Record<string, unknown>, path: string[]): unknown {
+  let current: unknown = source;
+  for (const key of path) {
+    if (!current || typeof current !== "object" || !(key in current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
+function getNumericMetadataValue(slice: ClipLikeSummary, paths: string[][]): number | null {
+  for (const source of metadataSources(slice)) {
+    for (const path of paths) {
+      const raw = getNestedMetadataValue(source, path);
+      if (typeof raw === "number" && Number.isFinite(raw)) {
+        return raw;
+      }
+    }
+  }
+  return null;
 }
 
 export function getSliceTranscriptText(slice: ClipLikeSummary): string {
@@ -58,25 +140,117 @@ export function getSliceTranscriptText(slice: ClipLikeSummary): string {
 }
 
 export function getSliceDuration(slice: ClipLikeSummary): number {
-  return Number((slice.duration_seconds ?? 0).toFixed(2));
+  return Number(finiteNumberOr(slice.duration_seconds, 0).toFixed(2));
 }
 
 export function getSliceOrderIndex(slice: ClipLikeSummary): number {
-  return Number(getSliceMetadata(slice, "order_index", 0));
+  return finiteNumberOr(getSliceMetadata(slice, "order_index", 0), 0);
 }
 
 export function getSliceOriginalStart(slice: ClipLikeSummary): number {
   if ("start_seconds" in slice) {
-    return Number(slice.start_seconds);
+    return finiteNumberOr(slice.start_seconds, 0);
   }
-  return Number(getSliceMetadata(slice, "original_start_time", 0));
+
+  const startTime = getSliceMetadata<number | null>(slice, "original_start_time", null);
+  if (typeof startTime === "number" && Number.isFinite(startTime)) {
+    return startTime;
+  }
+
+  const startSample = getSliceMetadata<number | null>(slice, "source_start_sample", null);
+  const sampleRate = getSliceMetadata<number | null>(slice, "sample_rate", null);
+  if (
+    typeof startSample === "number"
+    && Number.isFinite(startSample)
+    && typeof sampleRate === "number"
+    && Number.isFinite(sampleRate)
+    && sampleRate > 0
+  ) {
+    return startSample / sampleRate;
+  }
+
+  return 0;
 }
 
 export function getSliceOriginalEnd(slice: ClipLikeSummary): number {
   if ("end_seconds" in slice) {
-    return Number(slice.end_seconds);
+    return finiteNumberOr(slice.end_seconds, getSliceDuration(slice));
   }
-  return Number(getSliceMetadata(slice, "original_end_time", getSliceDuration(slice)));
+
+  const endTime = getSliceMetadata<number | null>(slice, "original_end_time", null);
+  if (typeof endTime === "number" && Number.isFinite(endTime)) {
+    return endTime;
+  }
+
+  const endSample = getSliceMetadata<number | null>(slice, "source_end_sample", null);
+  const sampleRate = getSliceMetadata<number | null>(slice, "sample_rate", null);
+  if (
+    typeof endSample === "number"
+    && Number.isFinite(endSample)
+    && typeof sampleRate === "number"
+    && Number.isFinite(sampleRate)
+    && sampleRate > 0
+  ) {
+    return endSample / sampleRate;
+  }
+
+  return finiteNumberOr(
+    getSliceMetadata(slice, "original_end_time", getSliceDuration(slice)),
+    getSliceDuration(slice),
+  );
+}
+
+function compareSourceTimeline(left: ClipLikeSummary, right: ClipLikeSummary): number {
+  const leftRecording = String(left.source_recording_id ?? "");
+  const rightRecording = String(right.source_recording_id ?? "");
+  if (leftRecording !== rightRecording) {
+    return leftRecording.localeCompare(rightRecording);
+  }
+
+  const leftStart = getSliceOriginalStart(left);
+  const rightStart = getSliceOriginalStart(right);
+  if (leftStart !== rightStart) {
+    return leftStart - rightStart;
+  }
+
+  const leftEnd = getSliceOriginalEnd(left);
+  const rightEnd = getSliceOriginalEnd(right);
+  if (leftEnd !== rightEnd) {
+    return leftEnd - rightEnd;
+  }
+
+  const leftOrder = getSliceOrderIndex(left);
+  const rightOrder = getSliceOrderIndex(right);
+  if (leftOrder !== rightOrder) {
+    return leftOrder - rightOrder;
+  }
+
+  return String(left.created_at ?? "").localeCompare(String(right.created_at ?? ""));
+}
+
+function compareNumericMetric(
+  left: ClipLikeSummary,
+  right: ClipLikeSummary,
+  metric: (slice: ClipLikeSummary) => number | null,
+  direction: "asc" | "desc",
+): number {
+  const leftValue = metric(left);
+  const rightValue = metric(right);
+  const leftMissing = leftValue === null;
+  const rightMissing = rightValue === null;
+
+  if (leftMissing || rightMissing) {
+    if (leftMissing && rightMissing) {
+      return compareSourceTimeline(left, right);
+    }
+    return leftMissing ? 1 : -1;
+  }
+
+  if (leftValue !== rightValue) {
+    return direction === "asc" ? leftValue - rightValue : rightValue - leftValue;
+  }
+
+  return compareSourceTimeline(left, right);
 }
 
 export function getSliceSpeakerName(slice: ClipLikeSummary): string {
@@ -91,6 +265,81 @@ export function getSliceLanguage(slice: ClipLikeSummary): string {
     return slice.language;
   }
   return String(getSliceMetadata(slice, "language", "en"));
+}
+
+function harmonicMean(left: number, right: number): number {
+  if (left <= 0 || right <= 0) {
+    return 0;
+  }
+  return (2 * left * right) / (left + right);
+}
+
+function referenceDurationMultiplier(durationSec: number): number | null {
+  if (!Number.isFinite(durationSec) || durationSec < 2.5 || durationSec > 15) {
+    return null;
+  }
+
+  if (durationSec < 4) {
+    return 0.6 + 0.4 * ((durationSec - 2.5) / 1.5);
+  }
+
+  if (durationSec <= 8) {
+    return 1.0;
+  }
+
+  if (durationSec <= 12) {
+    return 1.0 - 0.05 * ((durationSec - 8) / 4);
+  }
+
+  return 0.95 - 0.35 * ((durationSec - 12) / 3);
+}
+
+export function getSliceTranscriptConfidence(slice: ClipLikeSummary): number | null {
+  return getNumericMetadataValue(slice, [
+    ["transcript_match"],
+    ["transcript_match_score"],
+    ["transcript_score"],
+  ]);
+}
+
+export function getSliceSpeakerPurityScore(slice: ClipLikeSummary): number | null {
+  return getNumericMetadataValue(slice, [
+    ["speaker_check"],
+    ["speaker_check_score"],
+    ["speaker_score"],
+  ]);
+}
+
+export function getReferenceCandidateScore(
+  transcriptMatch: number | null,
+  speakerCheck: number | null,
+  durationSec: number,
+): number | null {
+  if (
+    transcriptMatch === null
+    || speakerCheck === null
+    || !Number.isFinite(transcriptMatch)
+    || !Number.isFinite(speakerCheck)
+  ) {
+    return null;
+  }
+
+  const durationMultiplier = referenceDurationMultiplier(durationSec);
+  if (durationMultiplier === null) {
+    return null;
+  }
+
+  const transcript = Math.max(0, Math.min(100, transcriptMatch));
+  const speaker = Math.max(0, Math.min(100, speakerCheck));
+  return harmonicMean(transcript, speaker) * durationMultiplier;
+}
+
+export function getSliceReferenceCandidateScore(slice: ClipLikeSummary): number | null {
+  return getReferenceCandidateScore(
+    getSliceTranscriptConfidence(slice),
+    getSliceSpeakerPurityScore(slice),
+    getSliceDuration(slice),
+  );
 }
 
 export function isSliceSuperseded(slice: ClipLikeSummary): boolean {
@@ -145,23 +394,38 @@ export function sortVariantsForHistory(variants: ClipLabVariant[]): ClipLabVaria
   });
 }
 
-export function sortClipsForQueue<T extends SliceSummary>(clips: T[]): T[] {
-  return [...clips]
-    .filter((slice) => !isSliceSuperseded(slice))
-    .sort((left, right) => {
-      const leftPriority = queuePriorityOrder.indexOf(left.status);
-      const rightPriority = queuePriorityOrder.indexOf(right.status);
+export function sortClipsForQueue<T extends SliceSummary>(
+  clips: T[],
+  mode: ClipQueueSortMode = "source_timeline",
+): T[] {
+  const visible = clips.filter((slice) => !isSliceSuperseded(slice));
+  if (mode === "source_timeline") {
+    return visible;
+  }
 
-      if (leftPriority !== rightPriority) {
-        return leftPriority - rightPriority;
+  return [...visible].sort((left, right) => {
+    if (mode === "best_reference_candidate") {
+      return compareNumericMetric(left, right, getSliceReferenceCandidateScore, "desc");
+    }
+
+    if (mode === "transcript_confidence") {
+      return compareNumericMetric(left, right, getSliceTranscriptConfidence, "asc");
+    }
+
+    if (mode === "speaker_purity") {
+      return compareNumericMetric(left, right, getSliceSpeakerPurityScore, "asc");
+    }
+
+    if (mode === "longest_first") {
+      const durationDelta = getSliceDuration(right) - getSliceDuration(left);
+      if (durationDelta !== 0) {
+        return durationDelta;
       }
+      return compareSourceTimeline(left, right);
+    }
 
-      if (getSliceOrderIndex(left) !== getSliceOrderIndex(right)) {
-        return getSliceOrderIndex(left) - getSliceOrderIndex(right);
-      }
-
-      return left.created_at.localeCompare(right.created_at);
-    });
+    return compareSourceTimeline(left, right);
+  });
 }
 
 export function buildTagColor(name: string): string {

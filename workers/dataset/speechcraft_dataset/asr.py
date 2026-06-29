@@ -98,7 +98,11 @@ def run_asr(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     beam_size = int(config.get("faster_whisper_beam_size", 5))
     model_load_timeout = int(config.get("asr_model_load_timeout_sec") or 180)
     transcribe_timeout = int(config.get("asr_transcribe_timeout_sec") or 600)
-    language = str(config.get("asr_language") or "en")
+    language_setting = config.get("asr_language")
+    if language_setting in {None, "", "auto"}:
+        language = None
+    else:
+        language = str(language_setting)
     task = str(config.get("asr_task") or "transcribe")
     vad_filter = bool(config.get("asr_vad_filter", False))
     word_timestamps = bool(config.get("asr_word_timestamps", False))

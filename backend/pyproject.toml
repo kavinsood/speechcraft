@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "FastAPI backend for the Speechcraft speech dataset workstation"
 requires-python = ">=3.11"
 dependencies = [
+  "filelock>=3.28.0,<4.0.0",
   "fastapi>=0.115.0,<1.0.0",
   "faster-whisper>=1.1.0,<2.0.0",
   "librosa>=0.11.0,<0.12",

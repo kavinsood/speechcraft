@@ -93,6 +93,55 @@ class CtcTranscriptTortureTestTests(unittest.TestCase):
         self.assertEqual(summary["localized"]["coverage"]["mean_unaligned_speech_ratio_delta"], 0.14)
         self.assertTrue(trial["omission_signal"])
 
+    def test_build_trial_record_flags_greedy_insertions_on_omit(self) -> None:
+        baseline = {
+            "transcript_match_score": 95.0,
+            "ctc_mean_pct": 95.0,
+            "ctc_min_token_pct": 80.0,
+            "ctc_min_aligned_token_pct": 80.0,
+            "ctc_min_window_pct": 75.0,
+            "unaligned_token_count": 0,
+            "weak_span_count": 0,
+            "segment_confidence_pct": 95.0,
+            "unaligned_speech_ratio": 0.08,
+            "unexplained_speech_sec": 0.4,
+            "aligned_speech_ratio": 0.92,
+            "ctc_greedy_insertions": 0,
+            "ctc_greedy_insertion_words": [],
+            "untranscribed_speech_detected": False,
+            "bucket": "accepted",
+        }
+        perturbed = {
+            **baseline,
+            "transcript_match_score": 0.0,
+            "forced_alignment_score": 94.0,
+            "greedy_integrity_score": 0.0,
+            "ctc_greedy_insertions": 1,
+            "ctc_greedy_insertion_words": ["LIKE"],
+            "untranscribed_speech_detected": True,
+            "bucket": "rejected",
+        }
+        trial = build_trial_record(
+            perturbation="omit",
+            try_index=0,
+            word_index=0,
+            detail={"removed_word": "LIKE"},
+            perturbed_text="I|VE|BEEN|THINKING",
+            baseline=baseline,
+            perturbed=perturbed,
+        )
+        self.assertTrue(trial["caught_by_greedy_decode"])
+        self.assertTrue(trial["poisoned_by_greedy_insertions"])
+        self.assertTrue(trial["poisoned_detected"])
+        self.assertEqual(trial["perturbed_ctc_greedy_insertions"], 1)
+        self.assertEqual(trial["perturbed_greedy_insertion_words"], ["LIKE"])
+        self.assertEqual(trial["greedy_insertion_delta"], 1)
+
+        summary = summarize_trials([{"clip_id": "clip-1", "trials": [trial]}])
+        self.assertEqual(summary["localized"]["pct_poisoned_by_greedy_insertions"], 100.0)
+        self.assertEqual(summary["localized"]["coverage"]["pct_caught_by_greedy_decode"], 100.0)
+        self.assertEqual(len(summary["top_greedy_insertion_cases"]), 1)
+
     def test_localized_metrics_converts_to_percent(self) -> None:
         metrics = localized_metrics(
             {
@@ -104,12 +153,13 @@ class CtcTranscriptTortureTestTests(unittest.TestCase):
                 "unaligned_token_count": 1,
                 "weak_span_count": 2,
                 "segment_confidence": 0.9,
-                "bucket": "accepted",
+                "ctc_greedy_insertions": 1,
+                "ctc_greedy_insertion_words": ["LIKE|WELL"],
+                "bucket": "rejected",
             }
         )
-        self.assertEqual(metrics["ctc_min_token_pct"], 0.0)
-        self.assertEqual(metrics["ctc_min_aligned_token_pct"], 5.0)
-        self.assertEqual(metrics["ctc_min_window_pct"], 12.0)
+        self.assertEqual(metrics["ctc_greedy_insertions"], 1)
+        self.assertEqual(metrics["ctc_greedy_insertion_words"], ["LIKE|WELL"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlmodel import Session, delete, select
 
 from .dataset_worker_client import dataset_worker_python, dataset_worker_root, run_dataset_worker_preflight
+from .defaults import build_dataset_worker_config, build_slicer_config_overrides, DATASET_SLICER_HARDCODED, SLICER_UI_CONFIG_KEYS
 from .models import (
     DatasetExportResultsView,
     DatasetExportRerunRequest,
@@ -46,21 +47,7 @@ RESERVED_WORKER_CONFIG_KEYS = {
     "source_wavs",
     "target_speaker_label",
 }
-SLICER_CONFIG_KEYS = {
-    "cutpoint_left_word_edge_guard_ms",
-    "cutpoint_min_gap_ms",
-    "cutpoint_right_word_edge_guard_ms",
-    "cutpoint_noise_margin_db",
-    "cutpoint_frame_ms",
-    "cutpoint_hop_ms",
-    "oov_cut_guard_sec",
-    "symbol_cut_guard_sec",
-    "numeric_cut_guard_sec",
-    "provisional_split_guard_sec",
-    "candidate_min_clip_sec",
-    "candidate_target_clip_sec",
-    "candidate_max_clip_sec",
-}
+SLICER_CONFIG_KEYS = set(SLICER_UI_CONFIG_KEYS) | set(DATASET_SLICER_HARDCODED)
 WORKER_STAGE_MAP = {
     "source_audio": RfcStage.INGEST,
     "audio_variants": RfcStage.AUDIO_VARIANTS,
@@ -267,15 +254,29 @@ def _assert_asr_model_available(repository: Any, run: ProcessingRun) -> None:
         asr_device=str(config.get("faster_whisper_device") or "cpu"),
         asr_compute_type=str(config.get("faster_whisper_compute_type") or "int8"),
     )
-    if preflight.get("ok") is True:
-        return
     asr_model = preflight.get("asr_model")
+    if isinstance(asr_model, dict) and asr_model.get("ok") is True:
+        return
     message = None
     if isinstance(asr_model, dict):
         message = asr_model.get("error")
     if not message:
         message = preflight.get("error")
     raise ValueError(str(message or "ASR model preflight failed"))
+
+
+def _prepare_run_config_for_launch(repository: Any, run: ProcessingRun, *, stop_after: str) -> None:
+    config_path = _run_root(repository, run) / "config.json"
+    config = _read_json_object(config_path)
+    target_speaker_label = str(run.input_summary.get("target_speaker_label") or DEFAULT_SINGLE_SPEAKER_ID)
+    config["target_speaker_label"] = target_speaker_label
+    if bool(run.input_summary.get("single_speaker", True)):
+        config["mode"] = "single_speaker"
+    elif stop_after == "diarization":
+        config["mode"] = "diarization"
+    else:
+        config["mode"] = "selected_speaker"
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _view(session: Session, run: ProcessingRun) -> DatasetRunView:
@@ -308,7 +309,12 @@ def create_dataset_run(repository: Any, project_id: str, request: DatasetRunCrea
         run_root = dataset_storage_root(repository) / artifact_root
         run_root.mkdir(parents=True, exist_ok=False)
         config_path = run_root / "config.json"
-        config_path.write_text(json.dumps(request.config, indent=2, sort_keys=True), encoding="utf-8")
+        worker_config = build_dataset_worker_config(
+            language=request.language,
+            whisper_model_size=request.whisper_model_size,
+            overrides=request.config,
+        )
+        config_path.write_text(json.dumps(worker_config, indent=2, sort_keys=True), encoding="utf-8")
         run = ProcessingRun(
             id=run_id,
             project_id=project_id,
@@ -345,6 +351,7 @@ def start_dataset_run(repository: Any, run_id: str) -> DatasetRunView:
                 stop_after = "diarization"
         if _stop_after_requires_asr(stop_after):
             _assert_asr_model_available(repository, run)
+        _prepare_run_config_for_launch(repository, run, stop_after=stop_after)
         _launch_worker(repository, run, stop_after=stop_after)
         session.add(run)
         session.commit()
@@ -476,6 +483,7 @@ def resume_dataset_run_processing(
         run.input_summary = {**run.input_summary, "requested_stop_after": requested_stop_after}
         if _stop_after_requires_asr(requested_stop_after):
             _assert_asr_model_available(repository, run)
+        _prepare_run_config_for_launch(repository, run, stop_after=requested_stop_after)
         _launch_worker(repository, run, stop_after=requested_stop_after)
         session.add(run)
         session.commit()
@@ -483,7 +491,7 @@ def resume_dataset_run_processing(
 
 
 def rerun_dataset_slicer(repository: Any, run_id: str, request: DatasetSlicerRerunRequest) -> DatasetRunView:
-    unknown = sorted(set(request.config) - SLICER_CONFIG_KEYS)
+    unknown = sorted(set(request.config) - SLICER_UI_CONFIG_KEYS)
     if unknown:
         raise ValueError(f"Unsupported slicer config keys: {', '.join(unknown)}")
     with Session(repository.engine, expire_on_commit=False) as session:
@@ -502,7 +510,7 @@ def rerun_dataset_slicer(repository: Any, run_id: str, request: DatasetSlicerRer
             raise ValueError(f"Dataset worker python not found: {worker_python}")
         config_path = run_root / "config.json"
         config = _read_json_object(config_path)
-        config.update(request.config)
+        config.update(build_slicer_config_overrides(request.config))
         config_path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
         status_path = run_root / "status.json"
         status_path.write_text(

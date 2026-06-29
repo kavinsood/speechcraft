@@ -25,37 +25,62 @@ type Props = {
   onOpenQc: () => void;
 };
 
-const defaults: Record<string, number> = {
-  cutpoint_left_word_edge_guard_ms: 30,
-  cutpoint_min_gap_ms: 80,
-  cutpoint_right_word_edge_guard_ms: 30,
-  cutpoint_noise_margin_db: 6,
-  cutpoint_frame_ms: 20,
-  cutpoint_hop_ms: 10,
-  oov_cut_guard_sec: 0.5,
-  symbol_cut_guard_sec: 0.5,
-  numeric_cut_guard_sec: 0.5,
-  provisional_split_guard_sec: 0.5,
+const SLICER_DEFAULTS = {
   candidate_min_clip_sec: 3,
   candidate_target_clip_sec: 8,
   candidate_max_clip_sec: 15,
-};
+  cutpoint_min_gap_ms: 80,
+  cutpoint_left_word_edge_guard_ms: 30,
+  cutpoint_right_word_edge_guard_ms: 30,
+} as const;
 
-const controls = [
-  ["Left word-edge guard", "cutpoint_left_word_edge_guard_ms", "ms", 0, 500, 5],
-  ["Minimum usable gap", "cutpoint_min_gap_ms", "ms", 0, 1000, 5],
-  ["Right word-edge guard", "cutpoint_right_word_edge_guard_ms", "ms", 0, 500, 5],
-  ["Noise-floor margin", "cutpoint_noise_margin_db", "dB", 0, 30, 0.5],
-  ["RMS frame", "cutpoint_frame_ms", "ms", 5, 200, 5],
-  ["RMS hop", "cutpoint_hop_ms", "ms", 1, 100, 1],
-  ["OOV cut guard", "oov_cut_guard_sec", "sec", 0, 5, 0.05],
-  ["Symbol cut guard", "symbol_cut_guard_sec", "sec", 0, 5, 0.05],
-  ["Numeric cut guard", "numeric_cut_guard_sec", "sec", 0, 5, 0.05],
-  ["Provisional seam guard", "provisional_split_guard_sec", "sec", 0, 5, 0.05],
-  ["Minimum clip", "candidate_min_clip_sec", "sec", 1, 15, 0.5],
-  ["Target clip", "candidate_target_clip_sec", "sec", 1, 20, 0.5],
-  ["Maximum clip", "candidate_max_clip_sec", "sec", 1, 30, 0.5],
+type SlicerSettings = typeof SLICER_DEFAULTS;
+
+const MAIN_CONTROLS = [
+  { label: "Target clip", key: "candidate_target_clip_sec", unit: "sec", min: 1, max: 20, step: 0.5, title: "Preferred clip duration for TTS training." },
+  { label: "Minimum clip", key: "candidate_min_clip_sec", unit: "sec", min: 1, max: 15, step: 0.5, title: "Clips shorter than this are rejected." },
+  { label: "Maximum clip", key: "candidate_max_clip_sec", unit: "sec", min: 1, max: 30, step: 0.5, title: "Clips longer than this are split or rejected." },
+  { label: "Smallest cuttable gap", key: "cutpoint_min_gap_ms", unit: "ms", min: 0, max: 1000, step: 5, title: "Minimum silence gap required before a cut is allowed." },
 ] as const;
+
+const ADVANCED_CONTROLS = [
+  { label: "Left word-edge guard", key: "cutpoint_left_word_edge_guard_ms", unit: "ms", min: 0, max: 500, step: 5, title: "Keep cuts away from the start edge of aligned words." },
+  { label: "Right word-edge guard", key: "cutpoint_right_word_edge_guard_ms", unit: "ms", min: 0, max: 500, step: 5, title: "Keep cuts away from the end edge of aligned words." },
+] as const;
+
+function buildSlicerConfig(settings: SlicerSettings): Record<string, number> {
+  return { ...settings };
+}
+
+function NumericSetting({
+  label,
+  value,
+  unit,
+  min,
+  max,
+  step,
+  title,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  unit: string;
+  min: number;
+  max: number;
+  step: number;
+  title: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="processing-setting" title={title}>
+      <span>{label}</span>
+      <span className="processing-input-row">
+        <input aria-label={label} type="number" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+        <small>{unit}</small>
+      </span>
+    </label>
+  );
+}
 
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof ApiError || error instanceof Error ? error.message || fallback : fallback;
@@ -91,7 +116,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
   const [results, setResults] = useState<DatasetSlicerResults | null>(null);
   const [exportResults, setExportResults] = useState<DatasetExportResults | null>(null);
   const [log, setLog] = useState<DatasetRunLog | null>(null);
-  const [settings, setSettings] = useState(defaults);
+  const [settings, setSettings] = useState<SlicerSettings>(SLICER_DEFAULTS);
   const [error, setError] = useState<string | null>(null);
   const [pollWarning, setPollWarning] = useState<string | null>(null);
   const [pollFailureCount, setPollFailureCount] = useState(0);
@@ -103,7 +128,14 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
 
   async function loadRuns(projectId: string) {
     try {
-      setRuns(await fetchProjectDatasetRuns(projectId));
+      const nextRuns = await fetchProjectDatasetRuns(projectId);
+      setRuns(nextRuns);
+      if (selectedSlicerDatasetRunId && !nextRuns.some((run) => run.id === selectedSlicerDatasetRunId)) {
+        selectSlicerDatasetRun(null);
+        setResults(null);
+        setExportResults(null);
+        setLog(null);
+      }
     } catch (loadError) {
       setError(errorMessage(loadError, "Dataset runs could not be loaded."));
     }
@@ -142,13 +174,14 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
   }, [activeProject?.id]);
 
   useEffect(() => {
-    if (selectedSlicerDatasetRunId) void loadSelected(selectedSlicerDatasetRunId);
-    else {
+    if (selectedSlicerDatasetRunId && runs.some((run) => run.id === selectedSlicerDatasetRunId)) {
+      void loadSelected(selectedSlicerDatasetRunId);
+    } else {
       setResults(null);
       setExportResults(null);
       setLog(null);
     }
-  }, [selectedSlicerDatasetRunId]);
+  }, [selectedSlicerDatasetRunId, runs]);
 
   useEffect(() => {
     if (!selectedRun || selectedRun.status !== "running") return;
@@ -162,7 +195,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
     setBusy(true);
     setError(null);
     try {
-      const run = await rerunDatasetSlicer(selectedRun.id, settings);
+      const run = await rerunDatasetSlicer(selectedRun.id, buildSlicerConfig(settings));
       setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
       await loadSelected(run.id, true);
     } catch (rerunError) {
@@ -222,7 +255,7 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
 
         <main className="processing-main">
           <section className="panel processing-controls">
-            <div className="panel-header"><div><p className="eyebrow">SafeCutPoint authority</p><h3>Acoustic cut and assembly controls</h3></div><span className="status-pill">{slicerReady ? "Alignment ready" : "Needs alignment"}</span></div>
+            <div className="panel-header"><div><p className="eyebrow">SafeCutPoint authority</p><h3>Clip assembly controls</h3></div><span className="status-pill">{slicerReady ? "Alignment ready" : "Needs alignment"}</span></div>
             {!selectedRun ? (
               <p>Select a dataset run from the sidebar or use Open Slicer on a completed Processing run.</p>
             ) : slicerReady && !hasCandidates ? (
@@ -232,9 +265,42 @@ export default function SlicerPage({ activeProject, projectLoadStatus, projectLo
             ) : (
               <p>Complete Processing through alignment QC before generating candidate clips.</p>
             )}
-            <div className="processing-settings-grid">
-              {controls.map(([label, key, unit, min, max, step]) => <label className="processing-setting" key={key}><span>{label}</span><span className="processing-input-row"><input type="number" value={settings[key]} min={min} max={max} step={step} onChange={(event) => setSettings((current) => ({ ...current, [key]: Number(event.target.value) }))} /><small>{unit}</small></span></label>)}
+            <div className="processing-settings-grid slicer-primary-settings">
+              {MAIN_CONTROLS.map((control) => (
+                <NumericSetting
+                  key={control.key}
+                  label={control.label}
+                  value={settings[control.key]}
+                  unit={control.unit}
+                  min={control.min}
+                  max={control.max}
+                  step={control.step}
+                  title={control.title}
+                  onChange={(value) => setSettings((current) => ({ ...current, [control.key]: value }))}
+                />
+              ))}
             </div>
+            <details className="processing-settings-section slicer-advanced-settings">
+              <summary><span>Advanced slicing parameters</span><small>Word-edge guards for fast or breathy speakers</small></summary>
+              <div className="processing-settings-grid">
+                {ADVANCED_CONTROLS.map((control) => (
+                  <NumericSetting
+                    key={control.key}
+                    label={control.label}
+                    value={settings[control.key]}
+                    unit={control.unit}
+                    min={control.min}
+                    max={control.max}
+                    step={control.step}
+                    title={control.title}
+                    onChange={(value) => setSettings((current) => ({ ...current, [control.key]: value }))}
+                  />
+                ))}
+              </div>
+            </details>
+            <p className="muted-copy processing-operator-note">
+              RMS frame/hop, noise-floor margin, and hazard guards are locked server-side.
+            </p>
             <div className="processing-actions">
               <button className="primary-button" type="button" disabled={generateDisabled} onClick={() => void generateOrRegenerate()}>{generateLabel}</button>
               <button className="action-button" type="button" disabled={exportDisabled} onClick={() => void exportNative()}>Export native-rate clips</button>

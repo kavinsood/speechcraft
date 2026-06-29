@@ -157,6 +157,8 @@ describe("ProcessingPage", () => {
       source_recording_ids: ["recording-1"],
       single_speaker: true,
       stop_after: "alignment_qc",
+      language: "auto",
+      whisper_model_size: "large-v3",
     });
     await waitFor(() => expect(startDatasetRun).toHaveBeenCalledWith("dataset-run-1"));
   });
@@ -206,7 +208,7 @@ describe("ProcessingPage", () => {
     renderPage();
 
     expect(await screen.findByText("No dataset runs yet.")).not.toBeNull();
-    expect(screen.getByText("Checking ASR model small.en")).not.toBeNull();
+    expect(await screen.findByText("Checking dataset worker")).not.toBeNull();
     expect((screen.getByRole("button", { name: "Create and start single-speaker run" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText("Waiting for dataset worker preflight.")).not.toBeNull();
     finishPreflight({ ok: true });
@@ -224,38 +226,32 @@ describe("ProcessingPage", () => {
     expect(screen.getByRole("button", { name: "Create and start single-speaker run" })).not.toBeNull();
   });
 
-  it("requests preflight for the selected ASR model and updates when the model changes", async () => {
+  it("requests preflight for the selected whisper model size", async () => {
     renderPage();
 
     await screen.findByRole("button", { name: "Create and start single-speaker run" });
     expect(fetchDatasetPreflight).toHaveBeenCalledWith({
-      asrModel: "small.en",
-      asrDevice: "cuda",
-      asrComputeType: "float16",
+      asrModel: "large-v3",
     });
 
-    fireEvent.change(screen.getByLabelText("Whisper model"), { target: { value: "medium.en" } });
+    fireEvent.change(screen.getByLabelText("Whisper model size"), { target: { value: "base" } });
 
     await waitFor(() =>
       expect(fetchDatasetPreflight).toHaveBeenLastCalledWith({
-        asrModel: "medium.en",
-        asrDevice: "cuda",
-        asrComputeType: "float16",
+        asrModel: "base",
       }),
     );
   });
 
-  it("keeps processing parameter controls available while hiding VAD controls", async () => {
-    const { container } = renderPage();
+  it("does not expose hidden pipeline parameter controls", async () => {
+    renderPage();
 
     await screen.findByRole("button", { name: "Create and start single-speaker run" });
-    const details = Array.from(container.querySelectorAll("details")).find((node) => node.textContent?.includes("Pipeline parameters"));
-    expect(details?.open).toBe(false);
-
-    fireEvent.click(screen.getByText("Pipeline parameters"));
-    expect(details?.open).toBe(true);
-    expect(screen.queryByLabelText("VAD threshold")).toBeNull();
-    expect(screen.getByLabelText("Processing buffer maximum")).not.toBeNull();
+    expect(screen.queryByLabelText("Processing buffer maximum")).toBeNull();
+    expect(screen.queryByLabelText("ASR device")).toBeNull();
+    expect(screen.queryByText("Pipeline parameters")).toBeNull();
+    expect(screen.getByLabelText("Audio language")).not.toBeNull();
+    expect(screen.getByLabelText("Execution target")).not.toBeNull();
   });
 
   it("shows selected run terminal output", async () => {

@@ -132,6 +132,12 @@ def localized_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "aligned_speech_ratio": metrics.get("aligned_speech_ratio"),
         "unaligned_speech_ratio": metrics.get("unaligned_speech_ratio"),
         "char_timings_span_sec": metrics.get("char_timings_span_sec"),
+        "ctc_greedy_insertions": metrics.get("ctc_greedy_insertions"),
+        "ctc_greedy_insertion_words": metrics.get("ctc_greedy_insertion_words") or [],
+        "forced_alignment_score": metrics.get("forced_alignment_score"),
+        "greedy_integrity_score": metrics.get("greedy_integrity_score"),
+        "confirmed_insertions": metrics.get("confirmed_insertions") or [],
+        "untranscribed_speech_detected": metrics.get("untranscribed_speech_detected"),
         "bucket": metrics.get("bucket"),
     }
 
@@ -205,6 +211,11 @@ def build_trial_record(
         and unaligned_speech_ratio_delta is not None
         and unaligned_speech_ratio_delta > 0.01
     )
+    perturbed_greedy_insertions = int(perturbed.get("ctc_greedy_insertions") or 0)
+    baseline_greedy_insertions = int(baseline.get("ctc_greedy_insertions") or 0)
+    greedy_insertion_delta = perturbed_greedy_insertions - baseline_greedy_insertions
+    caught_by_greedy_decode = perturbation == "omit" and bool(perturbed.get("untranscribed_speech_detected"))
+    poisoned_by_greedy_insertions = bool(perturbed.get("untranscribed_speech_detected"))
 
     return {
         "perturbation": perturbation,
@@ -247,15 +258,22 @@ def build_trial_record(
         "perturbed_aligned_speech_ratio": perturbed.get("aligned_speech_ratio"),
         "aligned_speech_ratio_delta": aligned_speech_ratio_delta,
         "omission_signal": omission_signal,
+        "baseline_ctc_greedy_insertions": baseline_greedy_insertions,
+        "perturbed_ctc_greedy_insertions": perturbed_greedy_insertions,
+        "greedy_insertion_delta": greedy_insertion_delta,
+        "perturbed_greedy_insertion_words": perturbed.get("ctc_greedy_insertion_words") or [],
+        "caught_by_greedy_decode": caught_by_greedy_decode,
         "poisoned_by_min_window": poisoned_by_min_window,
         "poisoned_by_min_aligned_token": poisoned_by_min_aligned,
         "poisoned_by_weak_spans": poisoned_by_weak_spans,
         "poisoned_by_unaligned_speech": poisoned_by_unaligned_speech,
+        "poisoned_by_greedy_insertions": poisoned_by_greedy_insertions,
         "poisoned_detected": (
             poisoned_by_min_window
             or poisoned_by_min_aligned
             or poisoned_by_weak_spans
             or poisoned_by_unaligned_speech
+            or poisoned_by_greedy_insertions
         ),
         "bucket": perturbed["bucket"],
     }
@@ -434,8 +452,16 @@ def summarize_trials(all_trials: list[dict[str, Any]]) -> dict[str, Any]:
             "pct_unaligned_ratio_increased": round(100.0 * sum(value > 0 for value in ratio_deltas) / len(ratio_deltas), 1) if ratio_deltas else None,
             "pct_unaligned_ratio_ge_0_05": round(100.0 * sum(value >= 0.05 for value in ratio_deltas) / len(ratio_deltas), 1) if ratio_deltas else None,
             "pct_omission_signal": round(100.0 * sum(trial.get("omission_signal") for trial in trials) / len(trials), 1),
+            "pct_caught_by_greedy_decode": round(
+                100.0 * sum(trial.get("caught_by_greedy_decode") for trial in trials) / len(trials),
+                1,
+            ),
             "pct_poisoned_by_unaligned_speech": round(
                 100.0 * sum(trial.get("poisoned_by_unaligned_speech") for trial in trials) / len(trials),
+                1,
+            ),
+            "pct_poisoned_by_greedy_insertions": round(
+                100.0 * sum(trial.get("poisoned_by_greedy_insertions") for trial in trials) / len(trials),
                 1,
             ),
             "max_perturbed_unaligned_speech_ratio": round(max(perturbed_ratios), 6) if perturbed_ratios else None,
@@ -458,6 +484,10 @@ def summarize_trials(all_trials: list[dict[str, Any]]) -> dict[str, Any]:
             "pct_poisoned_by_min_window": round(100.0 * sum(trial.get("poisoned_by_min_window") for trial in trials) / len(trials), 1),
             "pct_poisoned_by_min_aligned_token": round(100.0 * sum(trial.get("poisoned_by_min_aligned_token") for trial in trials) / len(trials), 1),
             "pct_poisoned_by_weak_spans": round(100.0 * sum(trial.get("poisoned_by_weak_spans") for trial in trials) / len(trials), 1),
+            "pct_poisoned_by_greedy_insertions": round(
+                100.0 * sum(trial.get("poisoned_by_greedy_insertions") for trial in trials) / len(trials),
+                1,
+            ),
             "pct_poisoned_detected": round(100.0 * sum(trial.get("poisoned_detected") for trial in trials) / len(trials), 1),
             "coverage": coverage_stats(trials),
             "notes": {
@@ -485,6 +515,15 @@ def summarize_trials(all_trials: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         return sorted(cases, key=lambda row: -float(row["unaligned_speech_ratio_delta"]))[:10]
 
+    def greedy_insertion_cases(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cases = [
+            trial
+            for trial in trials
+            if trial.get("perturbation") == "omit"
+            and int(trial.get("perturbed_ctc_greedy_insertions") or 0) > 0
+        ]
+        return sorted(cases, key=lambda row: -int(row.get("perturbed_ctc_greedy_insertions") or 0))[:10]
+
     overall_localized = localized_stats(flat)
     sharpest_guillotine = sorted(
         flat,
@@ -509,6 +548,7 @@ def summarize_trials(all_trials: list[dict[str, Any]]) -> dict[str, Any]:
         "sharpest_guillotine": sharpest_guillotine,
         "hidden_needle_cases": hidden_needle_cases(flat),
         "top_omission_coverage_cases": omission_coverage_cases(flat),
+        "top_greedy_insertion_cases": greedy_insertion_cases(flat),
         "worst_mean_score_responses": sorted(flat, key=lambda row: float(row["score_delta"]))[:10],
         "best_mean_score_responses": sorted(flat, key=lambda row: -float(row["score_delta"]))[:10],
     }

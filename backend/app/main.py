@@ -8,7 +8,9 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from .reference_clip_candidates import mark_dataset_clip_as_reference_candidate
 from .dataset_worker_client import run_dataset_worker_preflight
+from .defaults import resolve_asr_device_and_compute_type, resolve_whisper_model
 from .dataset_runs import (
     create_dataset_run,
     get_candidate_review_media_path,
@@ -29,7 +31,20 @@ from .dataset_runs import (
     start_dataset_run,
 )
 from .dataset_qc import finalize_dataset_qc, get_dataset_qc
+from .clip_lab_state import (
+    ClipLabStateError,
+    ClipLabValidationError,
+    ClipNotFoundError,
+    StaleClipError,
+    StaleManifestError,
+    get_dataset_clip_lab,
+    patch_dataset_clip_lab_clip,
+)
+from .native_cliplab import NativeClipLabStore
 from .models import (
+    DatasetClipLabClipView,
+    DatasetClipLabPatchRequest,
+    DatasetClipLabView,
     DatasetExportResultsView,
     DatasetExportRerunRequest,
     DatasetQcFinalizeRequest,
@@ -48,6 +63,7 @@ from .models import (
     ExportPreview,
     ExportRun,
     ImportBatchCreate,
+    MarkReferenceClipCandidateRequest,
     ProcessingJobView,
     ProjectPreparationRequest,
     ProjectPreparationRun,
@@ -60,6 +76,7 @@ from .models import (
     ReferenceEmbeddingEvaluationRequest,
     ReferenceEmbeddingEvaluationResponse,
     ReferenceCandidateSummary,
+    ReferenceClipCandidateView,
     ReferenceRunCreate,
     ReferenceRunRerankRequest,
     ReferenceRunRerankResponse,
@@ -125,6 +142,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+native_cliplab_store = NativeClipLabStore(repository.db_path, repository.media_root)
+
 
 @app.get("/healthz")
 def healthcheck() -> dict[str, str]:
@@ -140,13 +159,14 @@ def system_preflight(
     asr_device: str | None = None,
     asr_compute_type: str | None = None,
 ) -> dict[str, object]:
+    resolved_device, resolved_compute_type = resolve_asr_device_and_compute_type()
     return run_dataset_worker_preflight(
         artifact_root=artifact_root,
-        asr_model=asr_model,
+        asr_model=asr_model or resolve_whisper_model("large-v3"),
         asr_model_path=asr_model_path,
         asr_cache_dir=asr_cache_dir,
-        asr_device=asr_device,
-        asr_compute_type=asr_compute_type,
+        asr_device=asr_device or resolved_device,
+        asr_compute_type=asr_compute_type or resolved_compute_type,
     )
 
 
@@ -303,6 +323,41 @@ def finalize_dataset_qc_route(run_id: str, payload: DatasetQcFinalizeRequest) ->
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/dataset-runs/{run_id}/clip-lab", response_model=DatasetClipLabView)
+def read_dataset_clip_lab(run_id: str) -> DatasetClipLabView:
+    try:
+        return get_dataset_clip_lab(repository, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.patch(
+    "/api/dataset-runs/{run_id}/clips/{clip_id}/clip-lab",
+    response_model=DatasetClipLabClipView,
+)
+def patch_dataset_clip_lab_route(
+    run_id: str,
+    clip_id: str,
+    payload: DatasetClipLabPatchRequest,
+) -> DatasetClipLabClipView:
+    try:
+        return patch_dataset_clip_lab_clip(repository, run_id, clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (StaleManifestError, StaleClipError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.get("/media/dataset-runs/{run_id}/candidate-review/{clip_id}.wav")
 def get_dataset_candidate_review_media(run_id: str, clip_id: str) -> FileResponse:
     try:
@@ -310,6 +365,30 @@ def get_dataset_candidate_review_media(run_id: str, clip_id: str) -> FileRespons
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(path=path, media_type="audio/wav")
+
+
+@app.post(
+    "/api/projects/{project_id}/dataset-runs/{run_id}/reference-clip-candidates",
+    response_model=ReferenceClipCandidateView,
+)
+def mark_reference_clip_candidate(
+    project_id: str,
+    run_id: str,
+    payload: MarkReferenceClipCandidateRequest,
+) -> ReferenceClipCandidateView:
+    try:
+        result = mark_dataset_clip_as_reference_candidate(
+            repository,
+            project_id=project_id,
+            dataset_run_id=run_id,
+            clip_id=payload.clip_id,
+            transcript_text=payload.transcript_text,
+        )
+        return ReferenceClipCandidateView(**result)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/media/dataset-runs/{run_id}/native-export/{clip_id}.wav")
@@ -339,6 +418,14 @@ def list_projects() -> list[ProjectSummary]:
 def get_project(project_id: str) -> ProjectSummary:
     try:
         return repository.get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.get("/api/projects/{project_id}/slices")
+def list_project_slices(project_id: str) -> list[dict[str, object]]:
+    try:
+        return native_cliplab_store.list_project_slices(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
@@ -487,6 +574,115 @@ def list_export_runs(project_id: str) -> list[ExportRun]:
         return repository.list_export_runs(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+
+
+@app.post("/api/projects/{project_id}/media-cleanup")
+def cleanup_project_media(project_id: str) -> dict[str, object]:
+    try:
+        repository.get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
+    return {
+        "project_id": project_id,
+        "deleted_slice_count": 0,
+        "deleted_variant_count": 0,
+        "deleted_file_count": 0,
+        "skipped_reference_count": 0,
+        "deleted_slice_ids": [],
+        "deleted_variant_ids": [],
+    }
+
+
+@app.get("/api/slices/{slice_id}/clip-lab")
+def get_slice_clip_lab_item(slice_id: str) -> dict[str, object]:
+    try:
+        return native_cliplab_store.get_clip_lab_item(slice_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.get("/api/slices/{slice_id}/waveform-peaks")
+def get_slice_waveform_peaks(slice_id: str, bins: int = 120) -> dict[str, object]:
+    try:
+        return native_cliplab_store.get_waveform_peaks(slice_id, bins)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/media/variants/{variant_id}.wav")
+def get_variant_media(variant_id: str) -> FileResponse:
+    try:
+        path = native_cliplab_store.get_variant_media_path(variant_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Audio variant not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Audio file missing: {exc}") from exc
+    return FileResponse(path=path, media_type="audio/wav")
+
+
+@app.post("/api/clips/{clip_id}/save")
+def save_slice_state(clip_id: str, payload: dict[str, object]) -> dict[str, object]:
+    try:
+        return native_cliplab_store.save_slice_state(clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/clips/{clip_id}/status")
+def update_slice_status(clip_id: str, payload: dict[str, object]) -> dict[str, object]:
+    status = payload.get("status")
+    if not isinstance(status, str) or not status:
+        raise HTTPException(status_code=400, detail="status is required")
+    try:
+        return native_cliplab_store.update_slice_status(clip_id, status)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.patch("/api/clips/{clip_id}/transcript")
+def update_slice_transcript(clip_id: str, payload: dict[str, object]) -> dict[str, object]:
+    modified_text = payload.get("modified_text")
+    if not isinstance(modified_text, str):
+        raise HTTPException(status_code=400, detail="modified_text is required")
+    try:
+        return native_cliplab_store.update_slice_transcript(clip_id, modified_text)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.patch("/api/clips/{clip_id}/tags")
+def update_slice_tags(clip_id: str, payload: dict[str, object]) -> dict[str, object]:
+    tags = payload.get("tags")
+    if not isinstance(tags, list):
+        raise HTTPException(status_code=400, detail="tags is required")
+    try:
+        return native_cliplab_store.update_slice_tags(clip_id, [tag for tag in tags if isinstance(tag, dict)])
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+
+
+@app.post("/api/clips/{clip_id}/undo")
+def undo_slice(clip_id: str) -> dict[str, object]:
+    try:
+        return native_cliplab_store.undo_slice(clip_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/clips/{clip_id}/redo")
+def redo_slice(clip_id: str) -> dict[str, object]:
+    try:
+        return native_cliplab_store.redo_slice(clip_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Slice not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/projects/{project_id}/export", response_model=ExportRun)

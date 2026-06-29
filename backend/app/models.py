@@ -650,6 +650,8 @@ class DatasetRunCreateRequest(SQLModel):
     config: dict[str, Any] = Field(default_factory=dict)
     single_speaker: bool = True
     target_speaker_label: str = "speaker_0"
+    language: str = "auto"
+    whisper_model_size: Literal["large-v3", "base"] = "large-v3"
     stop_after: Literal[
         "source_audio",
         "audio_variants",
@@ -848,6 +850,49 @@ class DatasetQcFinalizeResponse(SQLModel):
     run_id: str
     dataset_qc_path: str
     summary: DatasetQcFinalizeSummaryView
+
+
+class DatasetClipLabPipelineFindingView(SQLModel):
+    code: str
+    label: str
+
+
+class DatasetClipLabClipView(SQLModel):
+    clip_id: str
+    clip_version: int
+    review_status: Literal["unresolved", "accepted", "rejected", "quarantined"]
+    transcript: str
+    original_transcript: str
+    transcript_override: str | None = None
+    reviewer_tags: list[str] = Field(default_factory=list)
+    pipeline_findings: list[DatasetClipLabPipelineFindingView] = Field(default_factory=list)
+    content_hash: str
+    accepted_content_hash: str | None = None
+    accepted_at: str | None = None
+    acceptance_stale: bool = False
+    transcript_match: float | None = None
+    speaker_check: float | None = None
+
+
+class DatasetClipLabView(SQLModel):
+    run_id: str
+    candidate_manifest_sha256: str
+    stale_state: bool = False
+    stale_reason: str | None = None
+    invalid_state: bool = False
+    invalid_state_reason: str | None = None
+    saved_state_clip_count: int = 0
+    qc_available: bool = False
+    qc_error: str | None = None
+    clips: list[DatasetClipLabClipView] = Field(default_factory=list)
+
+
+class DatasetClipLabPatchRequest(SQLModel):
+    expected_manifest_sha256: str
+    expected_clip_version: int
+    review_status: Literal["unresolved", "accepted", "rejected", "quarantined"] | None = None
+    transcript_override: str | None = None
+    reviewer_tags: list[str] | None = None
 
 
 class ProjectPreparationRequest(SQLModel):
@@ -1093,6 +1138,22 @@ class ReferenceAssetCreateFromCandidate(SQLModel):
     source_end_seconds: float | None = None
     name: str | None = None
     mood_label: str | None = None
+
+
+class MarkReferenceClipCandidateRequest(SQLModel):
+    clip_id: str
+    transcript_text: str
+
+
+class ReferenceClipCandidateView(SQLModel):
+    project_id: str
+    dataset_run_id: str
+    clip_id: str
+    transcript_text: str
+    filename: str
+    relative_path: str
+    source_audio_path: str
+    created_at: str
 
 
 class ReferenceRunRerankRequest(SQLModel):

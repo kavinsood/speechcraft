@@ -23,6 +23,7 @@ import type {
   ProcessingJob,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
+  ReferenceClipCandidate,
   ReferenceCandidate,
   ReferenceRunRerankResponse,
   ReferenceRun,
@@ -645,6 +646,22 @@ export async function fetchClipLabWaveformPeaks(
 ): Promise<WaveformPeaks> {
   const response = await fetch(`${API_BASE}/api/slices/${sliceId}/waveform-peaks?bins=${bins}`);
   return await parseJson<WaveformPeaks>(response);
+}
+
+export async function markDatasetClipAsReferenceCandidate(
+  projectId: string,
+  datasetRunId: string,
+  payload: { clip_id: string; transcript_text: string },
+): Promise<ReferenceClipCandidate> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${projectId}/dataset-runs/${datasetRunId}/reference-clip-candidates`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  return await parseJson<ReferenceClipCandidate>(response);
 }
 
 export async function saveCurrentSliceAsReference(payload: {

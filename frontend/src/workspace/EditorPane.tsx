@@ -6,9 +6,12 @@ import type { ClipLabItem, ClipLabItemRef, ReviewStatus, WaveformPeaks } from ".
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatClipTimestamp,
+  formatQcScore,
   formatSeconds,
   getAlignmentSource,
   getSliceDuration,
+  getSliceSpeakerPurityScore,
+  getSliceTranscriptConfidence,
   getSliceTranscriptText,
   parseTagDraft,
 } from "./workspace-helpers";
@@ -51,6 +54,7 @@ type EditorPaneProps = {
   onSplitClip: (clipItem: ClipLabItemRef, splitAtSeconds: number) => Promise<number>;
   onMergeClip: (clipItem: ClipLabItemRef) => Promise<number>;
   onRunClipLabModel: (clipItem: ClipLabItemRef, generatorModel: string) => Promise<ClipLabItem>;
+  onMarkReferenceClipCandidate?: (clipItem: ClipLabItemRef, transcriptText: string) => Promise<void>;
 };
 
 export default function EditorPane({
@@ -73,6 +77,7 @@ export default function EditorPane({
   onSplitClip,
   onMergeClip,
   onRunClipLabModel,
+  onMarkReferenceClipCandidate,
 }: EditorPaneProps) {
   const transcriptEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const waveSurferRef = useRef<WaveSurfer | null>(null);
@@ -94,6 +99,7 @@ export default function EditorPane({
   const [isSavingSlice, setIsSavingSlice] = useState(false);
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [isRunningModel, setIsRunningModel] = useState(false);
+  const [isMarkingReferenceCandidate, setIsMarkingReferenceCandidate] = useState(false);
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [waveformPeaks, setWaveformPeaks] = useState<WaveformPeaks | null>(null);
   const [waveformError, setWaveformError] = useState<string | null>(null);
@@ -285,6 +291,42 @@ export default function EditorPane({
       return null;
     } finally {
       setIsSavingSlice(false);
+    }
+  }
+
+  async function handleMarkReferenceClipCandidate() {
+    if (!activeClip || !onMarkReferenceClipCandidate) {
+      return;
+    }
+
+    const transcriptText = draftTranscript.trim();
+    if (!transcriptText) {
+      setEditorNotice("Add transcript text before marking this clip as a reference candidate.");
+      return;
+    }
+
+    setIsMarkingReferenceCandidate(true);
+    pausePlayback();
+
+    try {
+      if (capabilities?.can_save) {
+        const currentTagDraft = activeClip.tags.map((tag) => tag.name).join(", ");
+        const workingClip = await onSaveClipLabItem({ id: activeClip.id }, {
+          modified_text:
+            draftTranscript !== getSliceTranscriptText(activeClip) ? draftTranscript : undefined,
+          tags: draftTags.trim() !== currentTagDraft.trim() ? parseTagDraft(draftTags) : undefined,
+          message: "Saved before reference clip candidate export",
+          is_milestone: true,
+        });
+        setDraftTranscript(getSliceTranscriptText(workingClip));
+        setDraftTags(workingClip.tags.map((tag) => tag.name).join(", "));
+      }
+      await onMarkReferenceClipCandidate({ id: activeClip.id }, transcriptText);
+      setEditorNotice("Marked as reference clip candidate.");
+    } catch (error) {
+      setEditorNotice(error instanceof Error ? error.message : "Reference clip candidate export failed.");
+    } finally {
+      setIsMarkingReferenceCandidate(false);
     }
   }
 
@@ -622,15 +664,24 @@ export default function EditorPane({
                   className="primary-button"
                   type="button"
                   onClick={() => void handleSaveClip()}
-                  disabled={!activeClip || !capabilities?.can_save || isSavingSlice}
+                  disabled={!activeClip || !capabilities?.can_save || isSavingSlice || isMarkingReferenceCandidate}
                 >
                   Save
                 </button>
+                {onMarkReferenceClipCandidate ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleMarkReferenceClipCandidate()}
+                    disabled={!activeClip || isSavingSlice || isMarkingReferenceCandidate || !draftTranscript.trim()}
+                  >
+                    {isMarkingReferenceCandidate ? "Marking..." : "Mark as reference clip candidate"}
+                  </button>
+                ) : null}
                 <button
                   className="primary-button"
                   type="button"
                   onClick={() => void handleAcceptNextAndPlay()}
-                  disabled={!activeClip || !capabilities?.can_set_status || isSavingSlice}
+                  disabled={!activeClip || !capabilities?.can_set_status || isSavingSlice || isMarkingReferenceCandidate}
                 >
                   Accept & Next
                 </button>
@@ -808,19 +859,20 @@ export default function EditorPane({
 
         <div className="transcript-meta-grid">
           {activeClip ? (
-            <div className="selection-panel asr-panel">
+            <div className="selection-panel qc-scores-panel">
               <div className="selection-header">
-                <strong>ASR</strong>
-                <button type="button" disabled={!activeClip.can_run_asr}>
-                  {activeClip.can_run_asr ? "Run ASR" : "Run ASR (Soon)"}
-                </button>
+                <strong>QC Scores</strong>
               </div>
-              <p className="muted-copy">
-                Source: {activeClip.transcript_source ?? "unknown"}
-              </p>
-              <p className="muted-copy">
-                {activeClip.asr_placeholder_message ?? "ASR controls will land here."}
-              </p>
+              <div className="clip-qc-score-grid">
+                <div className="clip-qc-score-card">
+                  <span className="eyebrow">Transcript Confidence</span>
+                  <strong>{formatQcScore(getSliceTranscriptConfidence(activeClip))}</strong>
+                </div>
+                <div className="clip-qc-score-card">
+                  <span className="eyebrow">Speaker Purity</span>
+                  <strong>{formatQcScore(getSliceSpeakerPurityScore(activeClip))}</strong>
+                </div>
+              </div>
             </div>
           ) : null}
 

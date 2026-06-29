@@ -841,6 +841,41 @@ button:disabled.is-busy {
   margin-bottom: 0.55rem;
 }
 
+.clip-queue-sort-row {
+  margin-bottom: 0.65rem;
+}
+
+.lab-run-select-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.45rem;
+}
+
+.lab-run-select {
+  width: 100%;
+  border: 1px solid rgba(87, 94, 96, 0.18);
+  background: var(--control-surface);
+  color: var(--control-text);
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.75rem;
+  font-size: 0.82rem;
+}
+
+.lab-run-block .muted-copy {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.clip-sort-select {
+  width: 100%;
+  border: 1px solid rgba(87, 94, 96, 0.18);
+  background: var(--control-surface);
+  color: var(--control-text);
+  padding: 0.7rem 0.9rem;
+  border-radius: 0.9rem;
+}
+
 .clip-queue-tools .search-input {
   flex: 1;
   max-width: none;
@@ -1188,8 +1223,27 @@ button:disabled.is-busy {
   overflow-y: auto;
 }
 
-.asr-panel {
+.asr-panel,
+.qc-scores-panel {
   min-height: 100%;
+}
+
+.clip-qc-score-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.35rem;
+}
+
+.clip-qc-score-card {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.clip-qc-score-card strong {
+  font-size: 1.35rem;
+  line-height: 1.1;
+  color: #223036;
 }
 
 .tag-filter-bar {
@@ -2540,6 +2594,22 @@ button:disabled.is-busy {
 .processing-stage-strip .disabled {
   background: rgba(94, 101, 95, 0.1);
   color: #6a726d;
+}
+
+.slicer-primary-settings {
+  margin-bottom: 0.75rem;
+}
+
+.slicer-advanced-settings {
+  margin-bottom: 0.75rem;
+}
+
+.processing-operator-form {
+  grid-template-columns: 1fr;
+}
+
+.processing-operator-note {
+  margin: 0 0 1rem;
 }
 
 .processing-quick-settings,

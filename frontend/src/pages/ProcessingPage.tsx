@@ -34,67 +34,30 @@ type ProcessingPageProps = {
   onOpenSlicerWithRun: (runId: string) => void;
 };
 
-type NumericSettingProps = {
-  label: string;
-  name: string;
-  value: number;
-  unit: string;
-  min: number;
-  max: number;
-  step: number;
-  title: string;
-  onChange: (name: string, value: number) => void;
-};
+const LANGUAGE_OPTIONS = [
+  { value: "auto", label: "Auto-detect (Whisper)" },
+  { value: "en", label: "English" },
+  { value: "es", label: "Spanish" },
+  { value: "fr", label: "French" },
+  { value: "de", label: "German" },
+  { value: "it", label: "Italian" },
+  { value: "pt", label: "Portuguese" },
+] as const;
 
-const defaults = {
-  max_processing_buffer_sec: 29.5,
-  processing_buffer_pad_sec: 0.5,
-  target_processing_chunk_sec: 24,
-  min_split_gap_sec: 0.12,
-  min_asr_mfa_buffer_sec: 5,
-  faster_whisper_beam_size: 5,
-  asr_model_load_timeout_sec: 180,
-  asr_transcribe_timeout_sec: 600,
-  mfa_timeout_sec: 3600,
-  alignment_tiny_word_sec: 0.02,
-  alignment_long_word_sec: 2,
-  alignment_trusted_edge_warn_sec: 0.08,
-};
+const WHISPER_MODEL_OPTIONS = [
+  { value: "large-v3", label: "Large-v3 (slow, best accuracy)" },
+  { value: "base", label: "Base (fast, good accuracy)" },
+] as const;
 
-const numericControls: Array<Omit<NumericSettingProps, "value" | "onChange">> = [
-  { label: "Processing buffer maximum", name: "max_processing_buffer_sec", unit: "sec", min: 5, max: 29.9, step: 0.1, title: "Hard padded-buffer duration ceiling." },
-  { label: "Processing buffer padding", name: "processing_buffer_pad_sec", unit: "sec", min: 0, max: 3, step: 0.05, title: "Pre/post context added around trusted chunks." },
-  { label: "Target processing chunk", name: "target_processing_chunk_sec", unit: "sec", min: 5, max: 28, step: 0.5, title: "Preferred trusted chunk duration before padding." },
-  { label: "Minimum split gap", name: "min_split_gap_sec", unit: "sec", min: 0, max: 2, step: 0.01, title: "Minimum VAD silence accepted for a processing seam." },
-  { label: "Minimum ASR/MFA buffer", name: "min_asr_mfa_buffer_sec", unit: "sec", min: 0, max: 15, step: 0.5, title: "Buffers shorter than this are held out." },
-  { label: "Whisper beam size", name: "faster_whisper_beam_size", unit: "beams", min: 1, max: 20, step: 1, title: "Beam search width used by faster-whisper." },
-  { label: "ASR model load timeout", name: "asr_model_load_timeout_sec", unit: "sec", min: 10, max: 1800, step: 10, title: "Maximum model initialization time." },
-  { label: "ASR transcribe timeout", name: "asr_transcribe_timeout_sec", unit: "sec", min: 30, max: 7200, step: 30, title: "Maximum transcription time per worker operation." },
-  { label: "MFA timeout", name: "mfa_timeout_sec", unit: "sec", min: 60, max: 14400, step: 60, title: "Maximum MFA subprocess runtime." },
-  { label: "Tiny aligned word", name: "alignment_tiny_word_sec", unit: "sec", min: 0, max: 0.5, step: 0.005, title: "Words shorter than this are alignment warnings." },
-  { label: "Long aligned word", name: "alignment_long_word_sec", unit: "sec", min: 0.5, max: 10, step: 0.1, title: "Words longer than this are alignment warnings." },
-  { label: "Trusted-edge warning", name: "alignment_trusted_edge_warn_sec", unit: "sec", min: 0, max: 2, step: 0.01, title: "Warn when words sit this close to trusted edges." },
-];
+const EXECUTION_TARGET_OPTIONS = [
+  { value: "alignment_qc", label: "Full run (through alignment QC)" },
+  { value: "mfa", label: "Stop after MFA alignment" },
+  { value: "normalization", label: "Stop after transcription (ASR)" },
+] as const;
 
-const controlGroups = [
-  {
-    title: "Buffers",
-    description: "Speaker-aware processing-buffer chunking for ASR and MFA.",
-    names: ["max_processing_buffer_sec", "processing_buffer_pad_sec", "target_processing_chunk_sec", "min_split_gap_sec", "min_asr_mfa_buffer_sec"],
-  },
-  {
-    title: "ASR",
-    description: "faster-whisper runtime controls.",
-    names: ["faster_whisper_beam_size", "asr_model_load_timeout_sec", "asr_transcribe_timeout_sec"],
-  },
-  {
-    title: "MFA and alignment QC",
-    description: "Forced-alignment runtime and sanity thresholds.",
-    names: ["mfa_timeout_sec", "alignment_tiny_word_sec", "alignment_long_word_sec", "alignment_trusted_edge_warn_sec"],
-  },
-];
-
-const controlsByName = new Map(numericControls.map((control) => [control.name, control]));
+function whisperModelForPreflight(modelSize: string): string {
+  return modelSize === "base" ? "base" : "large-v3";
+}
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError || error instanceof Error) return error.message || fallback;
@@ -117,18 +80,6 @@ function sourceDisplayName(recording: SourceRecording, index: number): string {
   const displayName = recording.display_name?.trim();
   if (displayName && !/^source-[a-f0-9]+\.wav$/i.test(displayName)) return displayName;
   return `Source audio ${index + 1}`;
-}
-
-function NumericSetting({ label, name, value, unit, min, max, step, title, onChange }: NumericSettingProps) {
-  return (
-    <label className="processing-setting" title={title}>
-      <span>{label}</span>
-      <span className="processing-input-row">
-        <input aria-label={label} type="number" min={min} max={max} step={step} value={value} onChange={(event) => onChange(name, Number(event.target.value))} />
-        <small>{unit}</small>
-      </span>
-    </label>
-  );
 }
 
 function launchBlockReason(input: {
@@ -184,14 +135,9 @@ export default function ProcessingPage({
   const [speakerResults, setSpeakerResults] = useState<DatasetSpeakerResults | null>(null);
   const [preflight, setPreflight] = useState<DatasetPreflight | null>(null);
   const [preflightLoading, setPreflightLoading] = useState(false);
-  const [settings, setSettings] = useState<Record<string, number>>(defaults);
-  const [model, setModel] = useState("small.en");
-  const [asrDevice, setAsrDevice] = useState("cuda");
-  const [asrComputeType, setAsrComputeType] = useState("float16");
-  const [asrLanguage, setAsrLanguage] = useState("en");
-  const [mfaDictionary, setMfaDictionary] = useState("english_us_mfa");
-  const [mfaAcousticModel, setMfaAcousticModel] = useState("english_mfa");
-  const [stopAfter, setStopAfter] = useState("alignment_qc");
+  const [audioLanguage, setAudioLanguage] = useState("auto");
+  const [whisperModelSize, setWhisperModelSize] = useState("large-v3");
+  const [executionTarget, setExecutionTarget] = useState("alignment_qc");
   const [error, setError] = useState<string | null>(null);
   const [runRefreshWarning, setRunRefreshWarning] = useState<string | null>(null);
   const [pollFailureCount, setPollFailureCount] = useState(0);
@@ -229,14 +175,14 @@ export default function ProcessingPage({
         if (stillValid.length > 0) return stillValid;
         return nextRecordings.map((recording) => recording.id);
       });
-      const stillSelected =
+      const nextSelectedRunId =
         selectedProcessingRunId && nextRuns.some((run) => run.id === selectedProcessingRunId)
           ? selectedProcessingRunId
           : selectedSpeakersRunId && nextRuns.some((run) => run.id === selectedSpeakersRunId)
             ? selectedSpeakersRunId
-          : nextRuns[0]?.id ?? null;
-      if (stillSelected !== selectedProcessingRunId) {
-        selectProcessingRun(stillSelected);
+            : nextRuns[0]?.id ?? null;
+      if (nextSelectedRunId !== selectedProcessingRunId) {
+        selectProcessingRun(nextSelectedRunId);
       }
     } catch (loadError) {
       setError(getErrorMessage(loadError, "Processing state could not be loaded."));
@@ -247,9 +193,7 @@ export default function ProcessingPage({
     setPreflightLoading(true);
     try {
       const nextPreflight = await fetchDatasetPreflight({
-        asrModel: model,
-        asrDevice,
-        asrComputeType,
+        asrModel: whisperModelForPreflight(whisperModelSize),
       });
       setPreflight(nextPreflight);
     } catch (preflightError) {
@@ -303,7 +247,7 @@ export default function ProcessingPage({
     if (activeProject) {
       void loadPreflight();
     }
-  }, [activeProject?.id, model, asrDevice, asrComputeType]);
+  }, [activeProject?.id, whisperModelSize]);
 
   useEffect(() => {
     if (activityRun) void refreshRun(activityRun.id, { updateLog: true });
@@ -363,7 +307,7 @@ export default function ProcessingPage({
     try {
       const started = await resumeDatasetRunProcessing(
         run.id,
-        stopAfter as "buffers" | "normalization" | "mfa" | "alignment_qc",
+        executionTarget as "buffers" | "normalization" | "mfa" | "alignment_qc",
       );
       setRuns((current) => [started, ...current.filter((entry) => entry.id !== started.id)]);
       selectProcessingRun(started.id);
@@ -384,21 +328,9 @@ export default function ProcessingPage({
         source_recording_ids: selectedRecordingIds,
         single_speaker: true,
         target_speaker_label: "speaker_0",
-        stop_after: stopAfter,
-        config: {
-          ...settings,
-          faster_whisper_model: model,
-          faster_whisper_device: asrDevice,
-          faster_whisper_compute_type: asrComputeType,
-          asr_language: asrLanguage,
-          asr_task: "transcribe",
-          asr_vad_filter: false,
-          asr_condition_on_previous_text: false,
-          asr_word_timestamps: false,
-          mfa_dictionary: mfaDictionary,
-          mfa_acoustic_model: mfaAcousticModel,
-          mfa_single_speaker: true,
-        },
+        stop_after: executionTarget,
+        language: audioLanguage,
+        whisper_model_size: whisperModelSize as "large-v3" | "base",
       });
       setRuns((current) => [created, ...current.filter((entry) => entry.id !== created.id)]);
       selectProcessingRun(created.id);
@@ -439,12 +371,12 @@ export default function ProcessingPage({
       <div className="processing-topline">
         <div>
           <p className="eyebrow">Environment</p>
-          <strong>{preflightLoading ? `Checking ASR model ${model}` : preflight?.ok ? "Dataset worker ready" : "ASR model unavailable"}</strong>
+          <strong>{preflightLoading ? "Checking dataset worker" : preflight?.ok ? "Dataset worker ready" : "ASR model unavailable"}</strong>
           <span>
             {preflightLoading
-              ? `Verifying the selected ASR model (${model}) can load before launch.`
+              ? `Verifying ${whisperModelForPreflight(whisperModelSize)} can load before launch.`
               : preflight?.ok
-                ? `Selected ASR model ${model} and configured tools passed preflight.`
+                ? `Whisper ${whisperModelForPreflight(whisperModelSize)} and worker tools passed preflight.`
                 : preflight?.error ?? "Run preflight to inspect the worker environment."}
           </span>
           <small>API: {API_BASE}</small>
@@ -472,41 +404,45 @@ export default function ProcessingPage({
 
         <main className="processing-main">
           <section className="panel processing-controls">
-            <div className="panel-header"><div><p className="eyebrow">Run setup</p><h3>Selected-speaker alignment pipeline</h3></div><span className="status-pill">{selectedRunIsMultiSpeaker ? "Multi-speaker handoff" : "Single speaker"}</span></div>
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Run setup</p>
+                <h3>Dataset Processing Engine</h3>
+              </div>
+              <span className="status-pill">{selectedRunIsMultiSpeaker ? "Multi-speaker handoff" : "Single speaker"}</span>
+            </div>
             <div className="processing-stage-strip">
               <span>Buffers</span><span>ASR</span><span>MFA</span><span>Alignment QC</span>
             </div>
-            <div className="processing-quick-settings">
-              <label className="processing-setting" title="Local or cached faster-whisper model name."><span>Whisper model</span><select value={model} onChange={(event) => setModel(event.target.value)}><option>tiny.en</option><option>base.en</option><option>small.en</option><option>medium.en</option></select></label>
-              <label className="processing-setting" title="Execution device for faster-whisper."><span>ASR device</span><select value={asrDevice} onChange={(event) => setAsrDevice(event.target.value)}><option>cuda</option><option>cpu</option></select></label>
-              <label className="processing-setting" title="Stop after this stage for diagnostic reruns. Slicer owns SafeCutPoints and candidate clips."><span>Stop after</span><select value={stopAfter} onChange={(event) => setStopAfter(event.target.value)}><option value="buffers">Buffers</option><option value="normalization">ASR + normalization</option><option value="mfa">MFA</option><option value="alignment_qc">Alignment QC</option></select></label>
+            <div className="processing-quick-settings processing-operator-form">
+              <label className="processing-setting" title="Tell the pipeline what language the speakers use. MFA models are chosen automatically.">
+                <span>Audio language</span>
+                <select aria-label="Audio language" value={audioLanguage} onChange={(event) => setAudioLanguage(event.target.value)}>
+                  {LANGUAGE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="processing-setting" title="Hardware tradeoff between speed and transcription accuracy.">
+                <span>Whisper model size</span>
+                <select aria-label="Whisper model size" value={whisperModelSize} onChange={(event) => setWhisperModelSize(event.target.value)}>
+                  {WHISPER_MODEL_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="processing-setting" title="Run the full alignment pipeline or stop after an intermediate stage.">
+                <span>Execution target</span>
+                <select aria-label="Execution target" value={executionTarget} onChange={(event) => setExecutionTarget(event.target.value)}>
+                  {EXECUTION_TARGET_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
             </div>
-            <details className="processing-settings-section">
-              <summary><span>Pipeline parameters</span><small>Buffers, ASR, MFA, and alignment QC knobs</small></summary>
-              {controlGroups.map((group) => (
-                <div className="processing-settings-group" key={group.title}>
-                  <div><strong>{group.title}</strong><small>{group.description}</small></div>
-                  <div className="processing-settings-grid">
-                    {group.names.map((name) => {
-                      const control = controlsByName.get(name);
-                      if (!control) return null;
-                      return <NumericSetting key={name} {...control} value={settings[name]} onChange={(settingName, value) => setSettings((current) => ({ ...current, [settingName]: value }))} />;
-                    })}
-                  </div>
-                </div>
-              ))}
-              <div className="processing-settings-group">
-                <div><strong>ASR and MFA models</strong><small>These are passed to the dataset worker config.</small></div>
-                <div className="processing-settings-grid">
-                  <label className="processing-setting" title="CTranslate2 compute precision."><span>ASR compute type</span><select value={asrComputeType} onChange={(event) => setAsrComputeType(event.target.value)}><option>float16</option><option>int8_float16</option><option>int8</option><option>float32</option></select></label>
-                  <label className="processing-setting" title="Language code passed explicitly to faster-whisper."><span>ASR language</span><input value={asrLanguage} onChange={(event) => setAsrLanguage(event.target.value)} /></label>
-                  <label className="processing-setting" title="MFA pronunciation dictionary model."><span>MFA dictionary</span><input value={mfaDictionary} onChange={(event) => setMfaDictionary(event.target.value)} /></label>
-                  <label className="processing-setting" title="MFA acoustic model."><span>MFA acoustic model</span><input value={mfaAcousticModel} onChange={(event) => setMfaAcousticModel(event.target.value)} /></label>
-                  <label className="processing-setting processing-fixed-rule" title="Required pipeline rule."><span>ASR timestamp authority</span><input value="Disabled · MFA is cut authority" disabled /></label>
-                  <label className="processing-setting processing-fixed-rule" title="Required pipeline rule."><span>Previous-text conditioning</span><input value="Disabled" disabled /></label>
-                </div>
-              </div>
-            </details>
+            <p className="muted-copy processing-operator-note">
+              Buffer limits, beam size, timeouts, MFA dictionary paths, and compute device are locked server-side.
+            </p>
             {selectedRunIsMultiSpeaker ? (
               <div className="processing-actions processing-handoff">
                 {selectedRunSpeakerChosen ? (

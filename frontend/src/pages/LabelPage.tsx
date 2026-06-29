@@ -1,20 +1,20 @@
-import { startTransition, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ApiError,
   appendClipEdlOperation,
   buildCandidateReviewAudioUrl,
-  cleanupProjectMedia,
-  fetchProjectReferenceAssets,
   fetchClipLabItem,
+  fetchDatasetQc,
   fetchDatasetSlicerResults,
+  fetchProjectDatasetRuns,
   fetchProjectExports,
   fetchProjectRecordings,
-  fetchProjectSlices,
+  fetchProjectReferenceAssets,
+  markDatasetClipAsReferenceCandidate,
   mergeWithNextClip,
   redoClip,
   resolveApiUrl,
   runClipLabModel,
-  runProjectExport,
   saveCurrentSliceAsReference,
   saveClipState,
   setActiveVariant,
@@ -27,9 +27,15 @@ import EditorPane from "../workspace/EditorPane";
 import InspectorPane from "../workspace/InspectorPane";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
 import { usePipelineContext } from "../pipeline/PipelineContext";
+import { isEligibleLabDatasetRun, resolveLabDatasetRunId } from "../pipeline/datasetRunHelpers";
 import {
+  buildDatasetQcScoreIndex,
+  type ClipQueueSortMode,
   getSliceDuration,
+  getSliceSpeakerPurityScore,
+  getSliceTranscriptConfidence,
   sortClipsForQueue,
+  type DatasetQcScores,
 } from "../workspace/workspace-helpers";
 import type {
   ClipLabItem,
@@ -38,6 +44,8 @@ import type {
   ClipLabCommit,
   ClipLabTranscript,
   ClipLabVariant,
+  DatasetQcPayload,
+  DatasetRun,
   DatasetSlicerResults,
   ExportRun,
   Project,
@@ -50,8 +58,6 @@ import type {
 } from "../types";
 
 type WorkspaceStatus = "loading" | "error" | "ready";
-
-const ACTIVE_RECORDING_PROCESSING_STATES = new Set(["transcribing", "aligning", "slicing"]);
 
 type LabelPageProps = {
   activeProject: Project | null;
@@ -185,13 +191,50 @@ function datasetTranscriptSummary(row: DatasetCandidateClip, modifiedText: strin
   };
 }
 
+function candidateReviewManifestIndex(clipId: string): number | null {
+  const match = /^candidate_review_clip_(\d+)$/.exec(clipId);
+  if (!match) {
+    return null;
+  }
+  const index = Number(match[1]);
+  return Number.isFinite(index) ? index : null;
+}
+
 function datasetSliceSummary(
   row: DatasetCandidateClip,
   sourceRecordingId: string,
   localState?: DatasetClipLocalState,
+  qcScores?: DatasetQcScores | null,
+  manifestIndex?: number,
 ): SliceSummary {
   const tags = candidateReviewTags(row, localState?.tags ?? null);
   const transcript = datasetTranscriptSummary(row, localState?.modifiedText ?? null);
+  const sampleRate = Number(row.sample_rate ?? 16000);
+  const sourceStartSample = Number(row.source_start_sample ?? 0);
+  const sourceEndSample = Number(row.source_end_sample ?? 0);
+  const originalStartTime =
+    Number.isFinite(sampleRate) && sampleRate > 0 && Number.isFinite(sourceStartSample)
+      ? sourceStartSample / sampleRate
+      : 0;
+  const originalEndTime =
+    Number.isFinite(sampleRate) && sampleRate > 0 && Number.isFinite(sourceEndSample)
+      ? sourceEndSample / sampleRate
+      : originalStartTime + Number(row.duration_sec ?? 0);
+  const orderIndex = manifestIndex ?? candidateReviewManifestIndex(String(row.id)) ?? 0;
+  const transcriptMatch =
+    qcScores?.transcriptMatch ??
+    (typeof row.transcript_match === "number"
+      ? row.transcript_match
+      : typeof row.transcript_match_score === "number"
+        ? row.transcript_match_score
+        : null);
+  const speakerCheck =
+    qcScores?.speakerCheck ??
+    (typeof row.speaker_check === "number"
+      ? row.speaker_check
+      : typeof row.speaker_check_score === "number"
+        ? row.speaker_check_score
+        : null);
   return {
     id: String(row.id),
     source_recording_id: sourceRecordingId,
@@ -206,6 +249,14 @@ function datasetSliceSummary(
       start_cutpoint_ref: row.start_cutpoint_ref ?? null,
       end_cutpoint_ref: row.end_cutpoint_ref ?? null,
       needs_review: Boolean(row.needs_review),
+      transcript_match: transcriptMatch,
+      speaker_check: speakerCheck,
+      original_start_time: originalStartTime,
+      original_end_time: originalEndTime,
+      source_start_sample: sourceStartSample,
+      source_end_sample: sourceEndSample,
+      sample_rate: sampleRate,
+      order_index: orderIndex,
     },
     created_at: new Date(0).toISOString(),
     transcript: transcript,
@@ -221,6 +272,7 @@ function datasetClipLabItem(
   sourceRecording: SourceRecordingQueue,
   runId: string,
   localState?: DatasetClipLocalState,
+  qcScores?: DatasetQcScores | null,
 ): ClipLabItem {
   const tags = candidateReviewTags(row, localState?.tags ?? null);
   const transcriptText = localState?.modifiedText ?? String(row.training_text ?? "");
@@ -228,6 +280,20 @@ function datasetClipLabItem(
   const variant = datasetVariant(row);
   const transcript = datasetTranscript(row, localState?.modifiedText ?? null);
   const commit = datasetCommit(row, transcriptText, status, tags, localState?.message ?? "Dataset candidate clip");
+  const transcriptMatch =
+    qcScores?.transcriptMatch ??
+    (typeof row.transcript_match === "number"
+      ? row.transcript_match
+      : typeof row.transcript_match_score === "number"
+        ? row.transcript_match_score
+        : null);
+  const speakerCheck =
+    qcScores?.speakerCheck ??
+    (typeof row.speaker_check === "number"
+      ? row.speaker_check
+      : typeof row.speaker_check_score === "number"
+        ? row.speaker_check_score
+        : null);
   return {
     id: String(row.id),
     kind: "slice",
@@ -250,10 +316,10 @@ function datasetClipLabItem(
       buffer_warning_reason_codes: Array.isArray(row.buffer_warning_reason_codes) ? row.buffer_warning_reason_codes : [],
       source_start_sample: row.source_start_sample ?? null,
       source_end_sample: row.source_end_sample ?? null,
+      transcript_match: transcriptMatch,
+      speaker_check: speakerCheck,
     },
-    transcript_source: "dataset_candidate",
     can_run_asr: false,
-    asr_placeholder_message: "Candidate review clips are already aligned and sliced.",
     active_variant_generator_model: null,
     can_undo: false,
     can_redo: false,
@@ -274,56 +340,38 @@ export default function LabelPage({
   onRetryProjects,
   onHeaderActionsChange,
 }: LabelPageProps) {
-  const { selectedLabDatasetRunId, selectedSlicerDatasetRunId } = usePipelineContext();
-  const datasetRunId = selectedLabDatasetRunId ?? selectedSlicerDatasetRunId;
-  const datasetMode = Boolean(datasetRunId);
+  const { selectedLabDatasetRunId, selectedSlicerDatasetRunId, selectedQcDatasetRunId, selectLabDatasetRun } =
+    usePipelineContext();
   const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus>("loading");
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceEmptyMessage, setWorkspaceEmptyMessage] = useState<string | null>(null);
   const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
   const [slices, setSlices] = useState<SliceSummary[]>([]);
+  const [queueSortMode, setQueueSortMode] = useState<ClipQueueSortMode>("source_timeline");
   const [recordings, setRecordings] = useState<SourceRecordingQueue[]>([]);
   const [activeClip, setActiveClip] = useState<ClipLabItem | null>(null);
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
   const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [referenceAssets, setReferenceAssets] = useState<ReferenceAssetSummary[]>([]);
   const [datasetSlicerResults, setDatasetSlicerResults] = useState<DatasetSlicerResults | null>(null);
+  const [datasetRuns, setDatasetRuns] = useState<DatasetRun[]>([]);
+  const datasetRunId = useMemo(
+    () =>
+      resolveLabDatasetRunId(datasetRuns, [
+        selectedLabDatasetRunId,
+        selectedSlicerDatasetRunId,
+        selectedQcDatasetRunId,
+      ]),
+    [datasetRuns, selectedLabDatasetRunId, selectedSlicerDatasetRunId, selectedQcDatasetRunId],
+  );
+  const datasetMode = Boolean(datasetRunId);
   const [datasetClipState, setDatasetClipState] = useState<Record<string, DatasetClipLocalState>>({});
-  const [isRunningExport, setIsRunningExport] = useState(false);
-  const [isCleaningMedia, setIsCleaningMedia] = useState(false);
   const [isSavingReference, setIsSavingReference] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
   const latestDetailRequestRef = useRef(0);
-  const showDangerousDevActions = import.meta.env.DEV;
 
-  function getWorkspaceEmptyMessage(nextSlices: SliceSummary[], nextRecordings: SourceRecordingQueue[]): string | null {
-    if (nextSlices.length > 0) {
-      return null;
-    }
-
-    const activeRecording = nextRecordings.find((recording) =>
-      ACTIVE_RECORDING_PROCESSING_STATES.has(recording.processing_state),
-    );
-    if (activeRecording) {
-      return activeRecording.processing_message ?? "Generating slices from source recordings...";
-    }
-
-    const staleRecording = nextRecordings.find((recording) => recording.processing_state === "alignment_stale");
-    if (staleRecording) {
-      return staleRecording.processing_message ?? "Source transcript changed. Re-run alignment before slicing.";
-    }
-
-    const failedRecording = nextRecordings.find((recording) => recording.processing_state === "failed");
-    if (failedRecording) {
-      return failedRecording.processing_message ?? "Recording processing failed. Check the backend logs.";
-    }
-
-    if (nextRecordings.length > 0) {
-      return "This project has recordings, but no slices yet.";
-    }
-
-    return "This project does not contain slices yet.";
-  }
+  const NO_DATASET_RUN_MESSAGE =
+    "No dataset run with candidate clips yet. Complete Processing and Slicer, then return to Clip Lab.";
 
   async function loadWorkspace(projectId: string | null | undefined, options?: { silent?: boolean }) {
     const requestId = latestWorkspaceRequestRef.current + 1;
@@ -348,71 +396,29 @@ export default function LabelPage({
     }
 
     try {
-      if (datasetMode && datasetRunId) {
-        const [results, nextRecordings, nextExports] = await Promise.all([
-          fetchDatasetSlicerResults(datasetRunId),
-          fetchProjectRecordings(projectId),
-          fetchProjectExports(projectId),
-        ]);
-        let nextReferenceAssets: ReferenceAssetSummary[] = [];
-        try {
-          nextReferenceAssets = await fetchProjectReferenceAssets(projectId);
-        } catch (error) {
-          if (latestWorkspaceRequestRef.current === requestId) {
-            setWorkspaceNotice(
-              getErrorMessage(error, "The reference library did not load, so duplicate-save protection is unavailable right now."),
-            );
-          }
-        }
+      if (!datasetRunId) {
         if (latestWorkspaceRequestRef.current !== requestId) {
           return;
         }
-        const primaryRecording = nextRecordings[0] ?? null;
-        const nextSlices = primaryRecording
-          ? results.candidate_review_manifest.map((row) =>
-              datasetSliceSummary(
-                row,
-                primaryRecording.id,
-                datasetClipState[String(row.id)],
-              ),
-            )
-          : [];
-        const sortedSlices = sortClipsForQueue(nextSlices);
-        setDatasetSlicerResults(results);
-        setSlices(nextSlices);
-        setRecordings(nextRecordings);
-        if (!options?.silent) {
-          setActiveClip(null);
-        }
-        setExportRuns(nextExports);
-        setReferenceAssets(nextReferenceAssets);
-        setVisibleQueueClipIds(sortedSlices.map((slice) => slice.id));
-        const nextActiveClip =
-          activeClipItem && sortedSlices.some((slice) => slice.id === activeClipItem.id)
-            ? activeClipItem
-            : sortedSlices[0]
-              ? { id: sortedSlices[0].id }
-              : null;
-        if (
-          nextActiveClip?.id !== activeClipItem?.id
-          || (nextActiveClip === null && activeClipItem !== null)
-        ) {
-          onActiveClipItemChange(nextActiveClip);
-        }
+        setDatasetSlicerResults(null);
+        setSlices([]);
+        setRecordings([]);
+        setExportRuns([]);
+        setReferenceAssets([]);
+        onActiveClipItemChange(null);
+        setVisibleQueueClipIds([]);
         setWorkspaceStatus("ready");
-        setWorkspaceEmptyMessage(
-          nextSlices.length > 0 ? null : "This dataset run does not contain any candidate review clips.",
-        );
+        setWorkspaceEmptyMessage(NO_DATASET_RUN_MESSAGE);
         return;
       }
 
-      const [nextSlices, nextRecordings, nextExports] = await Promise.all([
-        fetchProjectSlices(projectId),
+      const [results, nextRecordings, nextExports] = await Promise.all([
+        fetchDatasetSlicerResults(datasetRunId),
         fetchProjectRecordings(projectId),
         fetchProjectExports(projectId),
       ]);
       let nextReferenceAssets: ReferenceAssetSummary[] = [];
-
+      let datasetQcPayload: DatasetQcPayload | null = null;
       try {
         nextReferenceAssets = await fetchProjectReferenceAssets(projectId);
       } catch (error) {
@@ -422,12 +428,28 @@ export default function LabelPage({
           );
         }
       }
-
+      try {
+        datasetQcPayload = await fetchDatasetQc(datasetRunId);
+      } catch {
+        datasetQcPayload = null;
+      }
       if (latestWorkspaceRequestRef.current !== requestId) {
         return;
       }
-
-      const sortedSlices = sortClipsForQueue(nextSlices);
+      const primaryRecording = nextRecordings[0] ?? null;
+      const qcScoreIndex = buildDatasetQcScoreIndex(datasetQcPayload);
+      const nextSlices: SliceSummary[] = primaryRecording
+        ? results.candidate_review_manifest.map((row, index) =>
+            datasetSliceSummary(
+              row,
+              primaryRecording.id,
+              datasetClipState[String(row.id)],
+              qcScoreIndex.get(String(row.id)) ?? null,
+              index,
+            ),
+          )
+        : [];
+      setDatasetSlicerResults(results);
       setSlices(nextSlices);
       setRecordings(nextRecordings);
       if (!options?.silent) {
@@ -435,13 +457,13 @@ export default function LabelPage({
       }
       setExportRuns(nextExports);
       setReferenceAssets(nextReferenceAssets);
-      setVisibleQueueClipIds(sortedSlices.map((slice) => slice.id));
+      const sortedSlices = sortClipsForQueue(nextSlices, queueSortMode);
       const nextActiveClip =
         activeClipItem && sortedSlices.some((slice) => slice.id === activeClipItem.id)
-            ? activeClipItem
-            : sortedSlices[0]
-              ? { id: sortedSlices[0].id }
-              : null;
+          ? activeClipItem
+          : sortedSlices[0]
+            ? { id: sortedSlices[0].id }
+            : null;
       if (
         nextActiveClip?.id !== activeClipItem?.id
         || (nextActiveClip === null && activeClipItem !== null)
@@ -449,7 +471,9 @@ export default function LabelPage({
         onActiveClipItemChange(nextActiveClip);
       }
       setWorkspaceStatus("ready");
-      setWorkspaceEmptyMessage(getWorkspaceEmptyMessage(sortedSlices, nextRecordings));
+      setWorkspaceEmptyMessage(
+        nextSlices.length > 0 ? null : "This dataset run does not contain any candidate review clips.",
+      );
     } catch (error) {
       if (latestWorkspaceRequestRef.current !== requestId) {
         return;
@@ -475,6 +499,43 @@ export default function LabelPage({
   }
 
   useEffect(() => {
+    if (datasetRunId !== selectedLabDatasetRunId) {
+      selectLabDatasetRun(datasetRunId);
+    }
+  }, [datasetRunId, selectedLabDatasetRunId, selectLabDatasetRun]);
+
+  useEffect(() => {
+    if (!activeProject?.id) {
+      setDatasetRuns([]);
+      return;
+    }
+
+    let cancelled = false;
+    void fetchProjectDatasetRuns(activeProject.id)
+      .then((runs) => {
+        if (cancelled) {
+          return;
+        }
+        setDatasetRuns(runs.filter(isEligibleLabDatasetRun));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDatasetRuns([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject?.id]);
+
+  function handleLabDatasetRunChange(runId: string) {
+    selectLabDatasetRun(runId);
+    onActiveClipItemChange(null);
+    setActiveClip(null);
+  }
+
+  useEffect(() => {
     if (projectLoadStatus === "error") {
       setWorkspaceStatus("error");
       setWorkspaceError(projectLoadError ?? "The project list failed to load.");
@@ -489,26 +550,6 @@ export default function LabelPage({
     void loadWorkspace(activeProject?.id);
   }, [activeProject?.id, projectLoadStatus, projectLoadError, datasetRunId]);
 
-  useEffect(() => {
-    if (datasetMode) {
-      return;
-    }
-    if (!activeProject?.id || workspaceStatus !== "ready") {
-      return;
-    }
-    if (!recordings.some((recording) => ACTIVE_RECORDING_PROCESSING_STATES.has(recording.processing_state))) {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      void loadWorkspace(activeProject.id, { silent: true });
-    }, 3000);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [activeProject?.id, recordings, workspaceStatus, datasetMode]);
-
   const allClipTagNames = useMemo(() => {
     return Array.from(
       new Set(
@@ -518,7 +559,7 @@ export default function LabelPage({
           .sort(),
       ),
     );
-  }, [slices]);
+  }, [slices, queueSortMode]);
 
   const sliceMap = useMemo(() => new Map(slices.map((slice) => [slice.id, slice])), [slices]);
   const queueSlices = useMemo(() => slices, [slices]);
@@ -550,43 +591,37 @@ export default function LabelPage({
       onActiveClipItemChange(nextActiveTarget);
     }
 
-    if (datasetMode && datasetRunId) {
-      const primaryRecording = recordings[0] ?? null;
-      const candidateRow = datasetSlicerResults?.candidate_review_manifest.find(
-        (row) => String(row.id) === nextActiveTarget.id,
-      ) as DatasetCandidateClip | undefined;
-      if (!primaryRecording || !candidateRow) {
-        setActiveClip(null);
-        setWorkspaceNotice("Dataset candidate clip could not be loaded.");
-        return;
-      }
-      setActiveClip(
-        datasetClipLabItem(
-          candidateRow,
-          primaryRecording,
-          datasetRunId,
-          datasetClipState[nextActiveTarget.id],
-        ),
-      );
+    if (!datasetRunId) {
+      setActiveClip(null);
       return;
     }
 
-    void (async () => {
-      try {
-        const detail = await fetchClipLabItem(nextActiveTarget.id);
-        if (latestDetailRequestRef.current !== requestId) {
-          return;
+    const primaryRecording = recordings[0] ?? null;
+    const candidateRow = datasetSlicerResults?.candidate_review_manifest.find(
+      (row) => String(row.id) === nextActiveTarget.id,
+    ) as DatasetCandidateClip | undefined;
+    if (!primaryRecording || !candidateRow) {
+      setActiveClip(null);
+      setWorkspaceNotice("Dataset candidate clip could not be loaded.");
+      return;
+    }
+    const summary = sliceMap.get(nextActiveTarget.id);
+    const qcScores: DatasetQcScores | null = summary
+      ? {
+          transcriptMatch: getSliceTranscriptConfidence(summary),
+          speakerCheck: getSliceSpeakerPurityScore(summary),
         }
-        setActiveClip(detail);
-      } catch (error) {
-        if (latestDetailRequestRef.current !== requestId) {
-          return;
-        }
-        setActiveClip(null);
-        setWorkspaceNotice(getErrorMessage(error, "The active Clip Lab item failed to load."));
-      }
-    })();
-  }, [activeClipItem, activeSliceSummary?.id, datasetMode, datasetRunId, datasetSlicerResults, recordings, datasetClipState]);
+      : null;
+    setActiveClip(
+      datasetClipLabItem(
+        candidateRow,
+        primaryRecording,
+        datasetRunId,
+        datasetClipState[nextActiveTarget.id],
+        qcScores,
+      ),
+    );
+  }, [activeClipItem, activeSliceSummary?.id, datasetRunId, datasetSlicerResults, recordings, datasetClipState, sliceMap]);
 
   const activeClipAudioUrl = useMemo(() => {
     if (!activeClip) {
@@ -594,6 +629,10 @@ export default function LabelPage({
     }
     return resolveApiUrl(activeClip.audio_url);
   }, [activeClip]);
+
+  const handleQueueSortModeChange = useCallback((nextMode: ClipQueueSortMode) => {
+    setQueueSortMode(nextMode);
+  }, []);
 
   function handleClipSelect(nextClipItem: ClipLabItemRef) {
     setActiveClip(null);
@@ -633,59 +672,6 @@ export default function LabelPage({
     return detail;
   }
 
-  async function handleRunExport() {
-    if (!activeProject) {
-      return;
-    }
-
-    setIsRunningExport(true);
-    try {
-      const result = await runProjectExport(activeProject.id);
-      const [nextSlices, nextExports] = await Promise.all([
-        fetchProjectSlices(activeProject.id),
-        fetchProjectExports(activeProject.id),
-      ]);
-      setSlices(nextSlices);
-      setExportRuns(nextExports);
-      setWorkspaceNotice(`Export completed: ${result.accepted_clip_count} accepted slice(s) rendered.`);
-    } catch (error) {
-      setWorkspaceNotice(getErrorMessage(error, "Export failed. See backend logs for details."));
-    } finally {
-      setIsRunningExport(false);
-    }
-  }
-
-  async function handleCleanupMedia() {
-    if (!activeProject) {
-      return;
-    }
-    if (
-      !window.confirm(
-        "Cleanup removes superseded slices and unreferenced media files for this project. Continue?",
-      )
-    ) {
-      return;
-    }
-
-    setIsCleaningMedia(true);
-    try {
-      const result = await cleanupProjectMedia(activeProject.id);
-      const nextSlices = await fetchProjectSlices(activeProject.id);
-      const sorted = sortClipsForQueue(nextSlices);
-      setSlices(nextSlices);
-      setActiveClip(null);
-      setVisibleQueueClipIds(sorted.map((slice) => slice.id));
-      onActiveClipItemChange(sorted[0] ? { id: sorted[0].id } : null);
-      setWorkspaceNotice(
-        `Cleanup removed ${result.deleted_slice_count} superseded slice(s), ${result.deleted_variant_count} variant row(s), and ${result.deleted_file_count} file(s).`,
-      );
-    } catch (error) {
-      setWorkspaceNotice(getErrorMessage(error, "Project media cleanup failed."));
-    } finally {
-      setIsCleaningMedia(false);
-    }
-  }
-
   async function saveFullClipLabItem(
     clipItem: ClipLabItemRef,
     payload: {
@@ -719,7 +705,14 @@ export default function LabelPage({
         message: payload.message ?? datasetClipState[clipItem.id]?.message ?? null,
       };
       setDatasetClipState((current) => ({ ...current, [clipItem.id]: nextState }));
-      const updated = datasetClipLabItem(existingRow, primaryRecording, datasetRunId, nextState);
+      const summary = sliceMap.get(clipItem.id);
+      const qcScores: DatasetQcScores | null = summary
+        ? {
+            transcriptMatch: getSliceTranscriptConfidence(summary),
+            speakerCheck: getSliceSpeakerPurityScore(summary),
+          }
+        : null;
+      const updated = datasetClipLabItem(existingRow, primaryRecording, datasetRunId, nextState, qcScores);
       replaceSlice(updated as unknown as Slice);
       setActiveClip(updated);
       return updated;
@@ -771,8 +764,7 @@ export default function LabelPage({
     const nextSlices = await splitClip(clipItem.id, splitAtSeconds);
     setSlices(nextSlices);
     setActiveClip(null);
-    const sorted = sortClipsForQueue(nextSlices);
-    setVisibleQueueClipIds(sorted.map((slice) => slice.id));
+    const sorted = sortClipsForQueue(nextSlices, queueSortMode);
     const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
     onActiveClipItemChange(nextActiveClip ? { id: nextActiveClip.id } : null);
     return nextSlices.length;
@@ -786,8 +778,7 @@ export default function LabelPage({
     const nextSlices = await mergeWithNextClip(clipItem.id);
     setSlices(nextSlices);
     setActiveClip(null);
-    const sorted = sortClipsForQueue(nextSlices);
-    setVisibleQueueClipIds(sorted.map((slice) => slice.id));
+    const sorted = sortClipsForQueue(nextSlices, queueSortMode);
     const nextActiveClip = sorted.find((slice) => !existingIds.has(slice.id)) ?? sorted[0] ?? null;
     onActiveClipItemChange(nextActiveClip ? { id: nextActiveClip.id } : null);
     return nextSlices.length;
@@ -821,6 +812,18 @@ export default function LabelPage({
     } catch (error) {
       setWorkspaceNotice(getErrorMessage(error, "Variant switch failed."));
     }
+  }
+
+  async function handleMarkReferenceClipCandidate(clipItem: ClipLabItemRef, transcriptText: string) {
+    if (!activeProject?.id || !datasetRunId) {
+      throw new Error("Select a dataset run before marking reference clip candidates.");
+    }
+
+    const result = await markDatasetClipAsReferenceCandidate(activeProject.id, datasetRunId, {
+      clip_id: clipItem.id,
+      transcript_text: transcriptText,
+    });
+    setWorkspaceNotice(`Saved reference clip candidate: ${result.filename}`);
   }
 
   async function handleSaveAsReference(options?: {
@@ -883,7 +886,7 @@ export default function LabelPage({
       rejected: 0,
     };
 
-    for (const slice of sortClipsForQueue(slices)) {
+    for (const slice of sortClipsForQueue(slices, queueSortMode)) {
       counts[slice.status] += 1;
       durations[slice.status] += getSliceDuration(slice);
     }
@@ -895,8 +898,8 @@ export default function LabelPage({
   }, [slices]);
 
   const totalDurationSeconds = useMemo(
-    () => sortClipsForQueue(slices).reduce((sum, slice) => sum + getSliceDuration(slice), 0),
-    [slices],
+    () => sortClipsForQueue(slices, queueSortMode).reduce((sum, slice) => sum + getSliceDuration(slice), 0),
+    [slices, queueSortMode],
   );
   const acceptedRejectedRatio =
     datasetStatusCounts.durations.rejected > 0
@@ -927,27 +930,11 @@ export default function LabelPage({
   }, [activeClip, activeCommitId, referenceAssets]);
 
   useEffect(() => {
-    onHeaderActionsChange(
-      activeProject ? (
-        <>
-          {!datasetMode && showDangerousDevActions ? (
-            <button type="button" onClick={() => void handleCleanupMedia()} disabled={isCleaningMedia}>
-              {isCleaningMedia ? "Cleaning media..." : "Cleanup Media"}
-            </button>
-          ) : null}
-          {!datasetMode ? (
-            <button className="primary-button" type="button" onClick={() => void handleRunExport()} disabled={isRunningExport}>
-              {isRunningExport ? "Running export..." : "Run Export"}
-            </button>
-          ) : null}
-        </>
-      ) : null,
-    );
-
+    onHeaderActionsChange(null);
     return () => {
       onHeaderActionsChange(null);
     };
-  }, [activeProject, isCleaningMedia, isRunningExport, onHeaderActionsChange, showDangerousDevActions, datasetMode]);
+  }, [onHeaderActionsChange]);
 
   return (
     <ErrorBoundary
@@ -981,6 +968,8 @@ export default function LabelPage({
             recordings={recordings}
             clips={queueSlices}
             activeClipItem={activeClipItem}
+            sortMode={queueSortMode}
+            onSortModeChange={handleQueueSortModeChange}
             onSelectClipItem={handleClipSelect}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
             onVisibleClipIdsChange={setVisibleQueueClipIds}
@@ -1006,13 +995,17 @@ export default function LabelPage({
             onSplitClip={splitClipMutation}
             onMergeClip={mergeNextClipMutation}
             onRunClipLabModel={runClipLabModelMutation}
+            onMarkReferenceClipCandidate={datasetRunId ? handleMarkReferenceClipCandidate : undefined}
           />
 
           <InspectorPane
             workspacePhase={workspaceStatus}
             workspaceError={workspaceError}
             activeClip={activeClip}
-            totalClipCount={sortClipsForQueue(slices).length}
+            datasetRuns={datasetRuns}
+            selectedDatasetRunId={datasetRunId}
+            onDatasetRunChange={handleLabDatasetRunChange}
+            totalClipCount={sortClipsForQueue(slices, queueSortMode).length}
             totalDurationSeconds={totalDurationSeconds}
             datasetStatusCounts={datasetStatusCounts}
             acceptedRejectedRatio={acceptedRejectedRatio}

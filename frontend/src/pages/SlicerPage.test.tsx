@@ -17,6 +17,7 @@ vi.mock("../pipeline/PipelineContext", () => ({
 vi.mock("../api", () => ({
   ApiError: class ApiError extends Error {},
   buildCandidateReviewAudioUrl: vi.fn((runId: string, clipId: string) => `/media/dataset-runs/${runId}/candidate-review/${clipId}.wav`),
+  fetchDatasetExportResults: vi.fn(),
   fetchDatasetRunLog: vi.fn(),
   fetchDatasetSlicerResults: vi.fn(),
   fetchProjectDatasetRuns: vi.fn(),
@@ -24,7 +25,14 @@ vi.mock("../api", () => ({
   rerunDatasetSlicer: vi.fn(),
 }));
 
-import { buildCandidateReviewAudioUrl, fetchDatasetRunLog, fetchDatasetSlicerResults, fetchProjectDatasetRuns, rerunDatasetSlicer } from "../api";
+import {
+  buildCandidateReviewAudioUrl,
+  fetchDatasetExportResults,
+  fetchDatasetRunLog,
+  fetchDatasetSlicerResults,
+  fetchProjectDatasetRuns,
+  rerunDatasetSlicer,
+} from "../api";
 
 const alignmentArtifacts = [
   { id: "a1", kind: "aligned_words_jsonl", path: "artifacts/aligned_words.jsonl", summary: {}, reason_codes: [] },
@@ -74,6 +82,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchProjectDatasetRuns).mockResolvedValue([alignedRun]);
   vi.mocked(fetchDatasetRunLog).mockResolvedValue({ run_id: alignedRun.id, path: "logs/dataset_worker.log", text: "slicer done", truncated: false });
+  vi.mocked(fetchDatasetExportResults).mockResolvedValue({ run_id: alignedRun.id, export_summary: {}, export_manifest: [], export_audit: [] });
   vi.mocked(fetchDatasetSlicerResults).mockResolvedValue({
     run_id: alignedRun.id,
     safe_cutpoint_summary: {},
@@ -97,6 +106,27 @@ describe("SlicerPage", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Generate candidate clips" }));
     await waitFor(() => expect(rerunDatasetSlicer).toHaveBeenCalledTimes(1));
     expect(vi.mocked(rerunDatasetSlicer).mock.calls[0][1]).toMatchObject({ cutpoint_min_gap_ms: 80, candidate_target_clip_sec: 8 });
+  });
+
+  it("does not expose hidden slicer DSP controls", async () => {
+    renderPage();
+    await screen.findByRole("button", { name: "Generate candidate clips" });
+    expect(screen.queryByLabelText("RMS frame")).toBeNull();
+    expect(screen.queryByLabelText("Noise-floor margin")).toBeNull();
+    expect(screen.queryByLabelText("OOV cut guard")).toBeNull();
+    expect(screen.getByLabelText("Smallest cuttable gap")).not.toBeNull();
+    expect(screen.getByLabelText("Target clip")).not.toBeNull();
+  });
+
+  it("keeps word-edge guards in the advanced drawer", async () => {
+    const { container } = renderPage();
+    await screen.findByRole("button", { name: "Generate candidate clips" });
+    const details = container.querySelector(".slicer-advanced-settings");
+    expect(details?.hasAttribute("open")).toBe(false);
+    expect(screen.queryByLabelText("Left word-edge guard")).toBeNull();
+    fireEvent.click(screen.getByText("Advanced slicing parameters"));
+    expect(screen.getByLabelText("Left word-edge guard")).not.toBeNull();
+    expect(screen.getByLabelText("Right word-edge guard")).not.toBeNull();
   });
 
   it("shows existing candidate clips and Regenerate label when artifacts exist", async () => {
@@ -123,6 +153,16 @@ describe("SlicerPage", () => {
     renderPage();
     await screen.findByText("No dataset runs. Complete Processing first.");
     expect(fetchDatasetSlicerResults).not.toHaveBeenCalled();
+    expect(screen.getByText("Select a dataset run from the sidebar or use Open Slicer on a completed Processing run.")).not.toBeNull();
+  });
+
+  it("clears a stale selected run from another project instead of loading its results", async () => {
+    pipelineState.selectedSlicerDatasetRunId = "other-project-run";
+    renderPage();
+
+    await screen.findByText("No dataset runs. Complete Processing first.");
+    expect(fetchDatasetSlicerResults).not.toHaveBeenCalled();
+    expect(pipelineState.selectedSlicerDatasetRunId).toBeNull();
     expect(screen.getByText("Select a dataset run from the sidebar or use Open Slicer on a completed Processing run.")).not.toBeNull();
   });
 });
