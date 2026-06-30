@@ -271,6 +271,7 @@ class RfcArtifactSpineTests(TestCase):
             "candidate_review_manifest_json",
             "candidate_review_rejected_json",
             "candidate_review_summary_json",
+            "clip_lab_state_json",
             "export_manifest_json",
             "export_audit_json",
             "export_summary_json",

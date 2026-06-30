@@ -113,6 +113,7 @@ ARTIFACT_KINDS = {
     "artifacts/speaker_purity_summary.json": RunArtifactKind.SPEAKER_PURITY_SUMMARY_JSON,
     "artifacts/dataset_qc.json": RunArtifactKind.DATASET_QC_JSON,
     "artifacts/dataset_qc_summary.json": RunArtifactKind.DATASET_QC_SUMMARY_JSON,
+    "artifacts/clip_lab_state.json": RunArtifactKind.CLIP_LAB_STATE_JSON,
     "artifacts/export_manifest.json": RunArtifactKind.EXPORT_MANIFEST_JSON,
     "artifacts/export_audit.json": RunArtifactKind.EXPORT_AUDIT_JSON,
     "artifacts/export_summary.json": RunArtifactKind.EXPORT_SUMMARY_JSON,
@@ -505,6 +506,12 @@ def rerun_dataset_slicer(repository: Any, run_id: str, request: DatasetSlicerRer
         missing = [path for path in required if not (run_root / path).exists()]
         if missing:
             raise ValueError(f"Dataset run is not slicer-ready; missing: {', '.join(missing)}")
+        from .clip_lab_state import ClipLabStateBusyError, assert_clip_lab_run_available
+
+        try:
+            assert_clip_lab_run_available(run_root)
+        except ClipLabStateBusyError as exc:
+            raise ValueError(str(exc)) from exc
         worker_python = dataset_worker_python()
         if not worker_python.exists():
             raise ValueError(f"Dataset worker python not found: {worker_python}")
@@ -658,22 +665,29 @@ def generate_dataset_qc_scores(repository: Any, run_id: str, *, force: bool = Fa
         return _view(session, run)
 
 
+def _read_dataset_slicer_results_from_root(run_id: str, root: Path) -> DatasetSlicerResultsView:
+    return DatasetSlicerResultsView(
+        run_id=run_id,
+        safe_cutpoint_summary=_read_json_object(root / "artifacts/safe_cutpoint_summary.json"),
+        candidate_review_summary=_read_json_object(root / "artifacts/candidate_review_summary.json"),
+        candidate_review_manifest=_read_json_list(root / "artifacts/candidate_review_manifest.json"),
+        candidate_review_rejected=_read_json_list(root / "artifacts/candidate_review_rejected.json"),
+        alignment_qc_by_buffer=_read_json_list(root / "artifacts/alignment_qc_by_buffer.json"),
+        transcripts=_read_json_list(root / "artifacts/transcripts.json"),
+        aligned_words=_read_json_list(root / "artifacts/aligned_words.jsonl"),
+    )
+
+
 def get_dataset_slicer_results(repository: Any, run_id: str) -> DatasetSlicerResultsView:
+    from .clip_lab_state import clip_lab_run_lock
+
     with Session(repository.engine) as session:
         run = session.get(ProcessingRun, run_id)
         if run is None:
             raise KeyError("Dataset run not found")
         root = _run_root(repository, run)
-        return DatasetSlicerResultsView(
-            run_id=run_id,
-            safe_cutpoint_summary=_read_json_object(root / "artifacts/safe_cutpoint_summary.json"),
-            candidate_review_summary=_read_json_object(root / "artifacts/candidate_review_summary.json"),
-            candidate_review_manifest=_read_json_list(root / "artifacts/candidate_review_manifest.json"),
-            candidate_review_rejected=_read_json_list(root / "artifacts/candidate_review_rejected.json"),
-            alignment_qc_by_buffer=_read_json_list(root / "artifacts/alignment_qc_by_buffer.json"),
-            transcripts=_read_json_list(root / "artifacts/transcripts.json"),
-            aligned_words=_read_json_list(root / "artifacts/aligned_words.jsonl"),
-        )
+    with clip_lab_run_lock(root):
+        return _read_dataset_slicer_results_from_root(run_id, root)
 
 
 def get_dataset_export_results(repository: Any, run_id: str) -> DatasetExportResultsView:
@@ -690,24 +704,50 @@ def get_dataset_export_results(repository: Any, run_id: str) -> DatasetExportRes
         )
 
 
-def get_candidate_review_media_path(repository: Any, run_id: str, clip_id: str) -> Path:
-    results = get_dataset_slicer_results(repository, run_id)
-    clip = next(
-        (
-            row
-            for row in results.candidate_review_manifest
-            if str(row.get("id") or row.get("clip_id") or "") == clip_id
-        ),
-        None,
-    )
-    if clip is None:
-        raise KeyError("Candidate review clip not found")
+def _resolve_candidate_review_media(
+    repository: Any,
+    run_id: str,
+    clip_id: str,
+) -> tuple[Path, bytes]:
+    from .clip_lab_state import clip_lab_run_lock
+
     with Session(repository.engine) as session:
         run = session.get(ProcessingRun, run_id)
-        assert run is not None and run.artifact_root is not None
-        path = resolve_run_artifact_path(dataset_storage_root(repository), run.artifact_root, str(clip["audio_path"]))
-    if not path.exists() or not path.is_file():
-        raise KeyError("Candidate review audio not found")
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+        artifact_root = run.artifact_root
+    with clip_lab_run_lock(root):
+        results = _read_dataset_slicer_results_from_root(run_id, root)
+        clip = next(
+            (
+                row
+                for row in results.candidate_review_manifest
+                if str(row.get("id") or row.get("clip_id") or "") == clip_id
+            ),
+            None,
+        )
+        if clip is None:
+            raise KeyError("Candidate review clip not found")
+        if artifact_root is None:
+            raise KeyError("Candidate review audio not found")
+        path = resolve_run_artifact_path(
+            dataset_storage_root(repository),
+            artifact_root,
+            str(clip["audio_path"]),
+        )
+        if not path.exists() or not path.is_file():
+            raise KeyError("Candidate review audio not found")
+        return path, path.read_bytes()
+
+
+def get_candidate_review_media_bytes(repository: Any, run_id: str, clip_id: str) -> bytes:
+    _, audio_bytes = _resolve_candidate_review_media(repository, run_id, clip_id)
+    return audio_bytes
+
+
+def get_candidate_review_media_path(repository: Any, run_id: str, clip_id: str) -> Path:
+    path, _ = _resolve_candidate_review_media(repository, run_id, clip_id)
     return path
 
 

@@ -11,7 +11,7 @@ from typing import Any
 
 from . import __version__
 from .alignment_qc import run_alignment_qc
-from .assembly import assemble_candidate_review_clips
+from .clip_lab_coordination import assemble_candidate_review_clips_locked
 from .audio import create_analysis_audio_variants, inspect_wav
 from .asr import build_asr_queue, run_asr
 from .buffers import run_processing_buffers
@@ -446,7 +446,7 @@ def run_dataset_worker(args: argparse.Namespace) -> int:
 
         status.update({"stage": "candidate_review_clips", "summary": safe_cutpoint_summary})
         write_status(run_root, status)
-        candidate_review_summary = assemble_candidate_review_clips(run_root, config)
+        candidate_review_summary = assemble_candidate_review_clips_locked(run_root, config)
         log_line(run_root, f"candidate_review_clips completed summary={candidate_review_summary}")
         if should_stop("candidate_review_clips", args.stop_after):
             status.update(

@@ -250,6 +250,7 @@ class RunArtifactKind(str, Enum):
     SPEAKER_PURITY_SUMMARY_JSON = "speaker_purity_summary_json"
     DATASET_QC_JSON = "dataset_qc_json"
     DATASET_QC_SUMMARY_JSON = "dataset_qc_summary_json"
+    CLIP_LAB_STATE_JSON = "clip_lab_state_json"
     VOXCPM_MANIFEST_JSONL = "voxcpm_manifest_jsonl"
     EXPORT_MANIFEST_JSON = "export_manifest_json"
     EXPORT_AUDIT_JSON = "export_audit_json"
@@ -872,6 +873,31 @@ class DatasetClipLabClipView(SQLModel):
     acceptance_stale: bool = False
     transcript_match: float | None = None
     speaker_check: float | None = None
+    sample_rate_hz: int | None = None
+    effective_audio_kind: Literal["candidate_original", "rendered_revision"] | None = None
+    effective_audio_revision_key: str | None = None
+    source_audio_sha256: str | None = None
+    audio_revision_hash: str | None = None
+    rendered_audio_sha256: str | None = None
+    audio_url: str | None = None
+    waveform_peaks_url: str | None = None
+    current_duration_sec: float | None = None
+    audio_edit_op_count: int = 0
+    audio_edit_ops: list[dict[str, Any]] = Field(default_factory=list)
+    can_undo_audio: bool = False
+    can_redo_audio: bool = False
+    render_status: Literal["ready", "pending", "failed"] = "ready"
+
+
+class DatasetClipLabAudioOperationRequest(SQLModel):
+    expected_manifest_sha256: str
+    expected_clip_version: int
+    operation: dict[str, Any]
+
+
+class DatasetClipLabAudioStackRequest(SQLModel):
+    expected_manifest_sha256: str
+    expected_clip_version: int
 
 
 class DatasetClipLabView(SQLModel):

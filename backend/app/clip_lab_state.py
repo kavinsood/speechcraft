@@ -1,14 +1,15 @@
 """Dataset Clip Lab durable review state.
 
 Acceptance fingerprint (v1): protects transcript edits and stored internal EDL
-recipe hashes when present. When the candidate manifest exposes ``audio_sha256``,
-that worker-written hash participates in acceptance identity for unedited clips.
-Manifests without ``audio_sha256`` do not yet independently fingerprint an
-unchanged candidate WAV if the file is replaced without regenerating the manifest.
+recipe hashes when present. When the candidate manifest exposes ``audio_sha256``
+(or legacy ``audio_hash``), that worker-written hash participates in acceptance
+identity for unedited clips. Manifests without a source hash do not yet
+independently fingerprint an unchanged candidate WAV if the file is replaced
+without regenerating the manifest.
 
-TODO(slicer-coordination): slicer rerun must acquire ``clip_lab_run_lock`` before
-replacing ``candidate_review_manifest.json`` / ``candidate_review_clips/`` so Clip
-Lab edits and candidate regeneration cannot race.
+Candidate regeneration acquires ``clip_lab_run_lock`` before replacing
+``candidate_review_manifest.json`` / ``candidate_review_clips/`` so Clip Lab
+edits and candidate regeneration cannot race.
 """
 
 from __future__ import annotations
@@ -18,17 +19,22 @@ import json
 import logging
 import os
 import re
+import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
+from uuid import uuid4
 
 from filelock import FileLock, Timeout
 
 logger = logging.getLogger(__name__)
 
 CLIP_LAB_STATE_REL = "artifacts/clip_lab_state.json"
+CLIP_LAB_STATE_ARCHIVE_REL = "artifacts/clip_lab_state_archive"
+CLIP_LAB_RENDERS_REL = "artifacts/clip_lab_renders"
+CLIP_LAB_PEAKS_REL = "artifacts/clip_lab_peaks"
 CANDIDATE_MANIFEST_REL = "artifacts/candidate_review_manifest.json"
 TRANSCRIPT_QC_REL = "artifacts/transcript_qc.json"
 SPEAKER_PURITY_REL = "artifacts/speaker_purity.json"
@@ -62,6 +68,10 @@ PIPELINE_FINDING_LABELS: dict[str, str] = {
 
 class ClipLabStateError(Exception):
     """Base error for clip lab state operations."""
+
+
+class ClipLabStateBusyError(ClipLabStateError):
+    """Clip Lab run lock is held by another operation."""
 
 
 class ClipLabValidationError(ClipLabStateError):
@@ -105,6 +115,46 @@ def clip_lab_state_path(run_root: Path) -> Path:
 
 def clip_lab_lock_path(run_root: Path) -> Path:
     return run_root / LOCK_FILENAME
+
+
+def clip_lab_renders_root(run_root: Path) -> Path:
+    return run_root / CLIP_LAB_RENDERS_REL
+
+
+def clip_lab_peaks_root(run_root: Path) -> Path:
+    return run_root / CLIP_LAB_PEAKS_REL
+
+
+def clear_clip_lab_render_caches(run_root: Path) -> None:
+    for relative in (CLIP_LAB_RENDERS_REL, CLIP_LAB_PEAKS_REL):
+        path = run_root / relative
+        if path.exists():
+            shutil.rmtree(path)
+
+
+def archive_clip_lab_state(run_root: Path, *, previous_manifest_sha256: str) -> Path | None:
+    state_path = clip_lab_state_path(run_root)
+    if not state_path.exists():
+        return None
+    archive_dir = run_root / CLIP_LAB_STATE_ARCHIVE_REL / previous_manifest_sha256
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_path = archive_dir / f"{stamp}-{uuid4().hex}.json"
+    if archive_path.exists():
+        raise ClipLabStateError(f"refusing to overwrite existing clip lab archive: {archive_path}")
+    shutil.move(str(state_path), str(archive_path))
+    return archive_path
+
+
+def finalize_candidate_regeneration(
+    run_root: Path,
+    *,
+    previous_manifest_sha256: str | None,
+    new_manifest_sha256: str,
+) -> None:
+    if previous_manifest_sha256 and previous_manifest_sha256 != new_manifest_sha256:
+        archive_clip_lab_state(run_root, previous_manifest_sha256=previous_manifest_sha256)
+        clear_clip_lab_render_caches(run_root)
 
 
 def candidate_manifest_path(run_root: Path) -> Path:
@@ -231,6 +281,7 @@ def load_candidate_manifest(run_root: Path) -> list[dict[str, Any]]:
         if clip_id in seen:
             raise ClipLabValidationError(f"duplicate clip_id in candidate manifest: {clip_id}")
         seen.add(clip_id)
+        _validate_manifest_source_audio_hash_fields(row, clip_id=clip_id)
         rows.append(row)
     return rows
 
@@ -254,10 +305,51 @@ def _manifest_transcript(row: dict[str, Any]) -> str:
 
 
 def _manifest_base_audio_hash(row: dict[str, Any]) -> str | None:
-    value = row.get("audio_sha256")
+    return resolve_manifest_source_audio_hash(row)
+
+
+def _normalize_source_audio_sha256(value: str) -> str | None:
     if isinstance(value, str) and _SHA256_HEX.fullmatch(value):
         return value
+    if isinstance(value, str) and value.startswith("sha256:"):
+        digest = value[7:]
+        if _SHA256_HEX.fullmatch(digest):
+            return digest
     return None
+
+
+def _validate_manifest_source_audio_hash_fields(row: dict[str, Any], *, clip_id: str) -> None:
+    sha256_value = row.get("audio_sha256")
+    legacy_value = row.get("audio_hash")
+    sha256_ok = _normalize_source_audio_sha256(sha256_value) if isinstance(sha256_value, str) else None
+    legacy_ok = _normalize_source_audio_sha256(legacy_value) if isinstance(legacy_value, str) else None
+
+    if sha256_value is not None and sha256_ok is None:
+        raise ClipLabValidationError(f"{clip_id} audio_sha256 is malformed")
+    if legacy_value is not None and legacy_ok is None:
+        raise ClipLabValidationError(f"{clip_id} audio_hash is malformed")
+    if sha256_ok and legacy_ok and sha256_ok != legacy_ok:
+        raise ClipLabValidationError(f"{clip_id} audio_sha256 and audio_hash must match")
+
+
+def resolve_manifest_source_audio_hash(row: dict[str, Any], *, clip_id: str | None = None) -> str | None:
+    resolved_clip_id = clip_id or _manifest_clip_id(row)
+    _validate_manifest_source_audio_hash_fields(row, clip_id=resolved_clip_id)
+    sha256_value = row.get("audio_sha256")
+    if isinstance(sha256_value, str):
+        normalized = _normalize_source_audio_sha256(sha256_value)
+        if normalized is not None:
+            return normalized
+    legacy_value = row.get("audio_hash")
+    if isinstance(legacy_value, str):
+        normalized = _normalize_source_audio_sha256(legacy_value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def manifest_has_source_audio_identity(row: dict[str, Any], *, clip_id: str | None = None) -> bool:
+    return resolve_manifest_source_audio_hash(row, clip_id=clip_id) is not None
 
 
 def _validate_clip_version(raw: Any, *, clip_id: str) -> int:
@@ -342,13 +434,27 @@ def save_clip_lab_state(run_root: Path, payload: dict[str, Any]) -> None:
 
 
 @contextmanager
-def clip_lab_run_lock(run_root: Path) -> Iterator[None]:
-    lock = FileLock(str(clip_lab_lock_path(run_root)), timeout=LOCK_TIMEOUT_SEC)
+def clip_lab_run_lock(run_root: Path, *, timeout: float = LOCK_TIMEOUT_SEC) -> Iterator[None]:
+    lock = FileLock(str(clip_lab_lock_path(run_root)), timeout=timeout)
     try:
         with lock:
             yield
     except Timeout as exc:
         raise ClipLabStateError("Clip Lab state is busy; retry shortly.") from exc
+
+
+@contextmanager
+def clip_lab_run_lock_nowait(run_root: Path) -> Iterator[None]:
+    with clip_lab_run_lock(run_root, timeout=0):
+        yield
+
+
+def assert_clip_lab_run_available(run_root: Path) -> None:
+    try:
+        with clip_lab_run_lock_nowait(run_root):
+            return
+    except ClipLabStateError as exc:
+        raise ClipLabStateBusyError(str(exc)) from exc
 
 
 def _default_clip_entry() -> dict[str, Any]:
@@ -387,14 +493,27 @@ def _effective_transcript(manifest_row: dict[str, Any], clip_entry: dict[str, An
 def _current_content_hash(manifest_row: dict[str, Any], clip_entry: dict[str, Any]) -> str:
     override = clip_entry.get("transcript_override")
     transcript_override = override if isinstance(override, str) else None
-    audio_hash = clip_entry.get("audio_revision_hash")
-    audio_revision_hash = audio_hash if isinstance(audio_hash, str) else None
+    audio_revision_hash = _effective_audio_revision_for_content(manifest_row, clip_entry)
     return compute_content_hash(
         manifest_transcript=_manifest_transcript(manifest_row),
         transcript_override=transcript_override,
         audio_revision_hash=audio_revision_hash,
         base_audio_hash=_manifest_base_audio_hash(manifest_row),
     )
+
+
+def _effective_audio_revision_for_content(
+    manifest_row: dict[str, Any],
+    clip_entry: dict[str, Any],
+) -> str | None:
+    audio_edit = clip_entry.get("audio_edit")
+    if isinstance(audio_edit, dict):
+        ops = audio_edit.get("ops") or []
+        revision = audio_edit.get("audio_revision_hash")
+        if ops and isinstance(revision, str):
+            return revision
+    legacy_hash = clip_entry.get("audio_revision_hash")
+    return legacy_hash if isinstance(legacy_hash, str) else None
 
 
 def _clip_rows_from_qc_artifact(payload: Any, *, artifact_name: str) -> list[dict[str, Any]]:
@@ -497,6 +616,7 @@ def _build_clip_view(
     clip_entry: dict[str, Any],
     transcript_by_id: dict[str, dict[str, Any]],
     speaker_by_id: dict[str, dict[str, Any]],
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     clip_id = _manifest_clip_id(manifest_row)
     original_transcript = _manifest_transcript(manifest_row)
@@ -522,7 +642,7 @@ def _build_clip_view(
     transcript_row = transcript_by_id.get(clip_id, {})
     speaker_row = speaker_by_id.get(clip_id, {})
 
-    return {
+    view = {
         "clip_id": clip_id,
         "clip_version": int(clip_entry.get("clip_version") or 0),
         "review_status": review_status,
@@ -535,9 +655,15 @@ def _build_clip_view(
         "accepted_content_hash": accepted_hash,
         "accepted_at": clip_entry.get("accepted_at") if isinstance(clip_entry.get("accepted_at"), str) else None,
         "acceptance_stale": acceptance_stale,
+        "source_audio_identity_available": manifest_has_source_audio_identity(manifest_row, clip_id=clip_id),
         "transcript_match": _transcript_match_score(transcript_row),
         "speaker_check": _speaker_check_score(speaker_row),
     }
+    if run_id is not None:
+        from .clip_lab_audio_ops import audio_view_fields
+
+        view.update(audio_view_fields(run_id=run_id, manifest_row=manifest_row, clip_entry=clip_entry))
+    return view
 
 
 def build_clip_lab_view(run_root: Path, *, run_id: str) -> dict[str, Any]:
@@ -583,6 +709,7 @@ def build_clip_lab_view(run_root: Path, *, run_id: str) -> dict[str, Any]:
                 clip_entry=clip_entry,
                 transcript_by_id=qc_state.transcript_by_id,
                 speaker_by_id=qc_state.speaker_by_id,
+                run_id=run_id,
             )
         )
 
@@ -637,6 +764,8 @@ def _normalize_stale_acceptance(
 def _apply_patch_fields(
     clip_entry: dict[str, Any],
     *,
+    run_root: Path,
+    clip_id: str,
     manifest_row: dict[str, Any],
     review_status: str | None,
     transcript_override: str | None | _UnsetType,
@@ -671,8 +800,20 @@ def _apply_patch_fields(
 
     if review_status is not None:
         validated_status = _validate_review_status(review_status)
+        if validated_status == "accepted" and not manifest_has_source_audio_identity(manifest_row):
+            raise ClipLabValidationError(
+                "cannot accept clip without source audio identity; legacy manifest rows lack audio_sha256"
+            )
         clip_entry["review_status"] = validated_status
         if validated_status == "accepted":
+            from .clip_lab_audio_ops import assert_clip_audio_acceptable
+
+            assert_clip_audio_acceptable(
+                clip_entry,
+                manifest_row=manifest_row,
+                run_root=run_root,
+                clip_id=clip_id,
+            )
             _set_acceptance_fields(clip_entry, manifest_row=manifest_row)
         else:
             _clear_acceptance_fields(clip_entry)
@@ -708,6 +849,7 @@ def patch_clip_lab_clip(
     run_root: Path,
     clip_id: str,
     *,
+    run_id: str | None = None,
     expected_manifest_sha256: str,
     expected_clip_version: int,
     review_status: str | None = None,
@@ -752,6 +894,8 @@ def patch_clip_lab_clip(
 
         _apply_patch_fields(
             clip_entry,
+            run_root=run_root,
+            clip_id=clip_id,
             manifest_row=manifest_row,
             review_status=review_status,
             transcript_override=transcript_override,
@@ -771,6 +915,7 @@ def patch_clip_lab_clip(
             clip_entry=clip_entry,
             transcript_by_id=qc_state.transcript_by_id,
             speaker_by_id=qc_state.speaker_by_id,
+            run_id=run_id,
         )
 
 
@@ -805,6 +950,20 @@ def _serialize_clip_lab_clip(raw: dict[str, Any]) -> Any:
         acceptance_stale=bool(raw.get("acceptance_stale")),
         transcript_match=raw.get("transcript_match"),
         speaker_check=raw.get("speaker_check"),
+        sample_rate_hz=raw.get("sample_rate_hz"),
+        effective_audio_kind=raw.get("effective_audio_kind"),
+        effective_audio_revision_key=raw.get("effective_audio_revision_key"),
+        source_audio_sha256=raw.get("source_audio_sha256"),
+        audio_revision_hash=raw.get("audio_revision_hash"),
+        rendered_audio_sha256=raw.get("rendered_audio_sha256"),
+        audio_url=raw.get("audio_url"),
+        waveform_peaks_url=raw.get("waveform_peaks_url"),
+        current_duration_sec=raw.get("current_duration_sec"),
+        audio_edit_op_count=int(raw.get("audio_edit_op_count") or 0),
+        audio_edit_ops=list(raw.get("audio_edit_ops") or []),
+        can_undo_audio=bool(raw.get("can_undo_audio")),
+        can_redo_audio=bool(raw.get("can_redo_audio")),
+        render_status=raw.get("render_status") or "ready",
     )
 
 
@@ -836,7 +995,8 @@ def get_dataset_clip_lab(repository: Any, run_id: str) -> Any:
         if run is None:
             raise KeyError("Dataset run not found")
         root = _run_root(repository, run)
-    return _serialize_clip_lab_view(build_clip_lab_view(root, run_id=run_id))
+    with clip_lab_run_lock(root):
+        return _serialize_clip_lab_view(build_clip_lab_view(root, run_id=run_id))
 
 
 def patch_dataset_clip_lab_clip(
@@ -868,5 +1028,176 @@ def patch_dataset_clip_lab_clip(
     if "reviewer_tags" in fields_set:
         patch_kwargs["reviewer_tags"] = payload.reviewer_tags
 
-    updated = patch_clip_lab_clip(run_root=root, clip_id=clip_id, **patch_kwargs)
+    updated = patch_clip_lab_clip(run_root=root, clip_id=clip_id, run_id=run_id, **patch_kwargs)
     return _serialize_clip_lab_clip(updated)
+
+
+def post_dataset_clip_audio_operation(
+    repository: Any,
+    run_id: str,
+    clip_id: str,
+    payload: Any,
+) -> Any:
+    from sqlmodel import Session
+
+    from .clip_lab_audio_ops import append_clip_audio_operation
+    from .dataset_runs import _run_root
+    from .models import ProcessingRun
+
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+
+    updated = append_clip_audio_operation(
+        root,
+        run_id=run_id,
+        clip_id=clip_id,
+        expected_manifest_sha256=payload.expected_manifest_sha256,
+        expected_clip_version=payload.expected_clip_version,
+        operation=payload.operation,
+    )
+    return _serialize_clip_lab_clip(updated)
+
+
+def undo_dataset_clip_audio_operation(
+    repository: Any,
+    run_id: str,
+    clip_id: str,
+    payload: Any,
+) -> Any:
+    from sqlmodel import Session
+
+    from .clip_lab_audio_ops import undo_clip_audio_operation
+    from .dataset_runs import _run_root
+    from .models import ProcessingRun
+
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+
+    updated = undo_clip_audio_operation(
+        root,
+        run_id=run_id,
+        clip_id=clip_id,
+        expected_manifest_sha256=payload.expected_manifest_sha256,
+        expected_clip_version=payload.expected_clip_version,
+    )
+    return _serialize_clip_lab_clip(updated)
+
+
+def redo_dataset_clip_audio_operation(
+    repository: Any,
+    run_id: str,
+    clip_id: str,
+    payload: Any,
+) -> Any:
+    from sqlmodel import Session
+
+    from .clip_lab_audio_ops import redo_clip_audio_operation
+    from .dataset_runs import _run_root
+    from .models import ProcessingRun
+
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+
+    updated = redo_clip_audio_operation(
+        root,
+        run_id=run_id,
+        clip_id=clip_id,
+        expected_manifest_sha256=payload.expected_manifest_sha256,
+        expected_clip_version=payload.expected_clip_version,
+    )
+    return _serialize_clip_lab_clip(updated)
+
+
+def get_dataset_clip_lab_audio_bytes(
+    repository: Any,
+    run_id: str,
+    clip_id: str,
+    revision_key: str,
+) -> bytes:
+    from sqlmodel import Session
+
+    from .clip_lab_audio_ops import ClipLabRevisionNotFoundError, resolve_revision_media_bytes
+    from .dataset_runs import _run_root
+    from .models import ProcessingRun
+
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+
+    with clip_lab_run_lock(root):
+        manifest = load_candidate_manifest(root)
+        manifest_by_id = index_manifest_by_clip_id(manifest)
+        if clip_id not in manifest_by_id:
+            raise ClipNotFoundError(f"unknown clip_id: {clip_id}")
+        saved_state = load_clip_lab_state(root)
+        clip_entry = _stored_clip_entry(saved_state or {}, clip_id)
+        return resolve_revision_media_bytes(
+            root,
+            clip_id=clip_id,
+            revision_key=revision_key,
+            manifest_row=manifest_by_id[clip_id],
+            clip_entry=clip_entry,
+        )
+
+
+def get_dataset_clip_lab_waveform_peaks(
+    repository: Any,
+    run_id: str,
+    clip_id: str,
+    revision_key: str,
+) -> dict[str, Any]:
+    from sqlmodel import Session
+
+    from .clip_lab_audio_ops import (
+        ClipLabRevisionNotFoundError,
+        _capture_source_wav_bytes,
+        _source_identity,
+        effective_revision_key,
+        load_revision_peaks_payload,
+    )
+    from .dataset_runs import _run_root
+    from .models import ProcessingRun
+
+    with Session(repository.engine) as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            raise KeyError("Dataset run not found")
+        root = _run_root(repository, run)
+
+    with clip_lab_run_lock(root):
+        manifest = load_candidate_manifest(root)
+        manifest_by_id = index_manifest_by_clip_id(manifest)
+        if clip_id not in manifest_by_id:
+            raise ClipNotFoundError(f"unknown clip_id: {clip_id}")
+        saved_state = load_clip_lab_state(root)
+        clip_entry = _stored_clip_entry(saved_state or {}, clip_id)
+        manifest_row = manifest_by_id[clip_id]
+        expected_key = effective_revision_key(manifest_row, clip_entry, clip_id=clip_id)
+        if revision_key != expected_key:
+            raise ClipLabRevisionNotFoundError(
+                f"revision key {revision_key!r} is not current for clip {clip_id}"
+            )
+        source_wav_bytes: bytes | None = None
+        source_sha = _source_identity(manifest_row, clip_id=clip_id)
+        if revision_key == source_sha:
+            source_wav_bytes = _capture_source_wav_bytes(root, manifest_row, source_sha=source_sha)
+
+    return load_revision_peaks_payload(
+        root,
+        clip_id=clip_id,
+        revision_key=revision_key,
+        manifest_row=manifest_row,
+        clip_entry=clip_entry,
+        source_wav_bytes=source_wav_bytes,
+    )

@@ -172,19 +172,15 @@ export default function InspectorPane({
                     {statusLabels[status]}
                   </button>
                 ))}
+                {activeClip.tags.map((tag) => (
+                  <span key={tag.id} className="status-button">
+                    {tag.name}
+                  </span>
+                ))}
               </div>
             ) : (
               <p className="muted-copy">Status controls are unavailable for this Clip Lab item.</p>
             )}
-            <div className="tag-list">
-              {activeClip.tags.length > 0 ? (
-                activeClip.tags.map((tag) => (
-                  <span key={tag.id} className="tag-pill" style={{ backgroundColor: tag.color }}>
-                    {tag.name}
-                  </span>
-                ))
-              ) : null}
-            </div>
           </section>
 
           <section className="inspector-block">

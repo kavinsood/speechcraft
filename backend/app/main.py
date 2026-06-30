@@ -6,14 +6,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .reference_clip_candidates import mark_dataset_clip_as_reference_candidate
 from .dataset_worker_client import run_dataset_worker_preflight
 from .defaults import resolve_asr_device_and_compute_type, resolve_whisper_model
 from .dataset_runs import (
     create_dataset_run,
-    get_candidate_review_media_path,
+    get_candidate_review_media_bytes,
     get_dataset_export_results,
     get_dataset_run,
     get_dataset_run_log,
@@ -38,11 +38,25 @@ from .clip_lab_state import (
     StaleClipError,
     StaleManifestError,
     get_dataset_clip_lab,
+    get_dataset_clip_lab_audio_bytes,
+    get_dataset_clip_lab_waveform_peaks,
     patch_dataset_clip_lab_clip,
+    post_dataset_clip_audio_operation,
+    redo_dataset_clip_audio_operation,
+    undo_dataset_clip_audio_operation,
+)
+from .clip_lab_audio import ClipLabAudioValidationError
+from .clip_lab_audio_ops import (
+    ClipLabPeaksCacheMissingError,
+    ClipLabRenderError,
+    ClipLabRevisionNotFoundError,
+    ClipLabUnrenderedAudioError,
 )
 from .native_cliplab import NativeClipLabStore
 from .models import (
     DatasetClipLabClipView,
+    DatasetClipLabAudioOperationRequest,
+    DatasetClipLabAudioStackRequest,
     DatasetClipLabPatchRequest,
     DatasetClipLabView,
     DatasetExportResultsView,
@@ -272,6 +286,8 @@ def read_dataset_slicer_results(run_id: str) -> DatasetSlicerResultsView:
         return get_dataset_slicer_results(repository, run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset-runs/{run_id}/export-rerun", response_model=DatasetRunView, status_code=202)
@@ -335,6 +351,120 @@ def read_dataset_clip_lab(run_id: str) -> DatasetClipLabView:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.post(
+    "/api/dataset-runs/{run_id}/clips/{clip_id}/audio/operations",
+    response_model=DatasetClipLabClipView,
+)
+def post_dataset_clip_audio_operation_route(
+    run_id: str,
+    clip_id: str,
+    payload: DatasetClipLabAudioOperationRequest,
+) -> DatasetClipLabClipView:
+    try:
+        return post_dataset_clip_audio_operation(repository, run_id, clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (StaleManifestError, StaleClipError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabUnrenderedAudioError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabAudioValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabRenderError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/dataset-runs/{run_id}/clips/{clip_id}/audio/undo",
+    response_model=DatasetClipLabClipView,
+)
+def undo_dataset_clip_audio_route(
+    run_id: str,
+    clip_id: str,
+    payload: DatasetClipLabAudioStackRequest,
+) -> DatasetClipLabClipView:
+    try:
+        return undo_dataset_clip_audio_operation(repository, run_id, clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (StaleManifestError, StaleClipError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabRenderError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/dataset-runs/{run_id}/clips/{clip_id}/audio/redo",
+    response_model=DatasetClipLabClipView,
+)
+def redo_dataset_clip_audio_route(
+    run_id: str,
+    clip_id: str,
+    payload: DatasetClipLabAudioStackRequest,
+) -> DatasetClipLabClipView:
+    try:
+        return redo_dataset_clip_audio_operation(repository, run_id, clip_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (StaleManifestError, StaleClipError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabRenderError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/media/dataset-runs/{run_id}/clip-lab/{clip_id}/audio/{revision_key}.wav")
+def get_dataset_clip_lab_audio_media(run_id: str, clip_id: str, revision_key: str) -> Response:
+    try:
+        audio_bytes = get_dataset_clip_lab_audio_bytes(repository, run_id, clip_id, revision_key)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipLabRevisionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(content=audio_bytes, media_type="audio/wav")
+
+
+@app.get("/api/dataset-runs/{run_id}/clips/{clip_id}/waveform-peaks/{revision_key}")
+def get_dataset_clip_lab_waveform_peaks_route(
+    run_id: str,
+    clip_id: str,
+    revision_key: str,
+) -> dict[str, object]:
+    try:
+        return get_dataset_clip_lab_waveform_peaks(repository, run_id, clip_id, revision_key)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipLabRevisionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ClipLabPeaksCacheMissingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.patch(
     "/api/dataset-runs/{run_id}/clips/{clip_id}/clip-lab",
     response_model=DatasetClipLabClipView,
@@ -352,6 +482,8 @@ def patch_dataset_clip_lab_route(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (StaleManifestError, StaleClipError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabUnrenderedAudioError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ClipLabValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ClipLabStateError as exc:
@@ -359,12 +491,14 @@ def patch_dataset_clip_lab_route(
 
 
 @app.get("/media/dataset-runs/{run_id}/candidate-review/{clip_id}.wav")
-def get_dataset_candidate_review_media(run_id: str, clip_id: str) -> FileResponse:
+def get_dataset_candidate_review_media(run_id: str, clip_id: str) -> Response:
     try:
-        path = get_candidate_review_media_path(repository, run_id, clip_id)
+        audio_bytes = get_candidate_review_media_bytes(repository, run_id, clip_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(path=path, media_type="audio/wav")
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(content=audio_bytes, media_type="audio/wav")
 
 
 @app.post(

@@ -1522,6 +1522,10 @@ button:disabled.is-busy {
   background: rgba(222, 238, 239, 0.95);
 }
 
+.status-group span.status-button {
+  cursor: default;
+}
+
 .transcript-editor {
   min-height: 0;
   overflow-y: hidden;

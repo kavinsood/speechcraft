@@ -19,7 +19,9 @@ from app.clip_lab_state import (
   compute_content_hash,
   load_candidate_manifest,
   load_clip_lab_state,
+  manifest_has_source_audio_identity,
   patch_clip_lab_clip,
+  resolve_manifest_source_audio_hash,
   save_clip_lab_state,
   validate_reviewer_tags,
 )
@@ -36,9 +38,26 @@ class ClipLabStateTests(unittest.TestCase):
     shutil.copy(FIXTURES_ROOT / "candidate_review_manifest.json", artifacts / "candidate_review_manifest.json")
     shutil.copy(FIXTURES_ROOT / "transcript_qc.json", artifacts / "transcript_qc.json")
     shutil.copy(FIXTURES_ROOT / "speaker_purity.json", artifacts / "speaker_purity.json")
+    self._stamp_manifest_source_audio_hashes()
 
   def tearDown(self) -> None:
     self.temp_dir.cleanup()
+
+  def _stamp_manifest_source_audio_hashes(self) -> None:
+    manifest_path = self.run_root / CANDIDATE_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for index, row in enumerate(manifest):
+      row["audio_sha256"] = f"{index:064x}"
+      row["audio_hash"] = row["audio_sha256"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+  def _legacy_manifest_without_source_hashes(self) -> None:
+    manifest_path = self.run_root / CANDIDATE_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for row in manifest:
+      row.pop("audio_sha256", None)
+      row.pop("audio_hash", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
   def _manifest_sha(self) -> str:
     from app.clip_lab_state import compute_manifest_sha256
@@ -179,6 +198,7 @@ class ClipLabStateTests(unittest.TestCase):
       manifest_transcript="I don't think that's what happened.",
       transcript_override=None,
       audio_revision_hash=None,
+      base_audio_hash="0" * 64,
     )
     self.assertEqual(updated["accepted_content_hash"], expected_hash)
     self.assertIsNotNone(updated["accepted_at"])
@@ -326,6 +346,7 @@ class ClipLabStateTests(unittest.TestCase):
     manifest_path = self.run_root / CANDIDATE_MANIFEST_REL
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest[0]["audio_sha256"] = "a" * 64
+    manifest[0]["audio_hash"] = "a" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     manifest_sha = self._manifest_sha()
 
@@ -476,6 +497,7 @@ class ClipLabStateTests(unittest.TestCase):
       manifest_transcript="I don't think that's what happened.",
       transcript_override="Corrected final transcript.",
       audio_revision_hash=None,
+      base_audio_hash="0" * 64,
     )
     self.assertEqual(updated["review_status"], "accepted")
     self.assertEqual(updated["transcript"], "Corrected final transcript.")
@@ -599,6 +621,57 @@ class ClipLabStateTests(unittest.TestCase):
     clip = next(row for row in view["clips"] if row["clip_id"] == "candidate_review_clip_000001")
     self.assertEqual(clip["transcript_match"], 95.0)
     self.assertEqual(clip["speaker_check"], 88.0)
+
+  def test_resolve_manifest_source_audio_hash_prefers_audio_sha256(self) -> None:
+    row = {"id": "clip-1", "audio_sha256": "a" * 64, "audio_hash": "a" * 64}
+    self.assertEqual(resolve_manifest_source_audio_hash(row), "a" * 64)
+
+  def test_resolve_manifest_source_audio_hash_accepts_legacy_audio_hash(self) -> None:
+    row = {"id": "clip-1", "audio_hash": "b" * 64}
+    self.assertEqual(resolve_manifest_source_audio_hash(row), "b" * 64)
+
+  def test_resolve_manifest_source_audio_hash_returns_none_when_missing(self) -> None:
+    row = {"id": "clip-1"}
+    self.assertIsNone(resolve_manifest_source_audio_hash(row))
+
+  def test_resolve_manifest_source_audio_hash_rejects_mismatched_hashes(self) -> None:
+    row = {"id": "clip-1", "audio_sha256": "a" * 64, "audio_hash": "b" * 64}
+    with self.assertRaisesRegex(ClipLabValidationError, "must match"):
+      resolve_manifest_source_audio_hash(row)
+
+  def test_resolve_manifest_source_audio_hash_rejects_malformed_sha256(self) -> None:
+    row = {"id": "clip-1", "audio_sha256": "not-a-hash"}
+    with self.assertRaisesRegex(ClipLabValidationError, "malformed"):
+      resolve_manifest_source_audio_hash(row)
+
+  def test_load_candidate_manifest_rejects_mismatched_audio_hashes(self) -> None:
+    manifest_path = self.run_root / CANDIDATE_MANIFEST_REL
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[0]["audio_sha256"] = "a" * 64
+    manifest[0]["audio_hash"] = "b" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with self.assertRaisesRegex(ClipLabValidationError, "must match"):
+      load_candidate_manifest(self.run_root)
+
+  def test_build_clip_lab_view_marks_legacy_manifest_without_source_hash(self) -> None:
+    self._legacy_manifest_without_source_hashes()
+    view = build_clip_lab_view(self.run_root, run_id="run-1")
+    clip = next(row for row in view["clips"] if row["clip_id"] == "candidate_review_clip_000001")
+    self.assertFalse(clip["source_audio_identity_available"])
+    self.assertFalse(manifest_has_source_audio_identity({"id": "clip-1"}))
+
+  def test_patch_accept_rejects_legacy_manifest_without_source_hash(self) -> None:
+    self._legacy_manifest_without_source_hashes()
+    manifest_sha = self._manifest_sha()
+    with self.assertRaisesRegex(ClipLabValidationError, "source audio identity"):
+      patch_clip_lab_clip(
+        self.run_root,
+        "candidate_review_clip_000001",
+        expected_manifest_sha256=manifest_sha,
+        expected_clip_version=0,
+        review_status="accepted",
+      )
 
 
 if __name__ == "__main__":

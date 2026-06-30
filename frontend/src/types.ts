@@ -224,6 +224,90 @@ export type DatasetQcFinalizeResponse = {
   };
 };
 
+export type DatasetClipLabPipelineFinding = {
+  code: string;
+  label: string;
+};
+
+export type DatasetClipLabClipRow = {
+  clip_id: string;
+  clip_version: number;
+  review_status: ReviewStatus;
+  transcript: string;
+  original_transcript: string;
+  transcript_override: string | null;
+  reviewer_tags: string[];
+  pipeline_findings: DatasetClipLabPipelineFinding[];
+  content_hash: string;
+  accepted_content_hash: string | null;
+  accepted_at: string | null;
+  acceptance_stale: boolean;
+  transcript_match: number | null;
+  speaker_check: number | null;
+  sample_rate_hz: number | null;
+  effective_audio_kind: "candidate_original" | "rendered_revision" | null;
+  effective_audio_revision_key: string | null;
+  source_audio_sha256: string | null;
+  audio_revision_hash: string | null;
+  rendered_audio_sha256: string | null;
+  audio_url: string | null;
+  waveform_peaks_url: string | null;
+  current_duration_sec: number | null;
+  audio_edit_op_count: number;
+  audio_edit_ops: DatasetAudioEditOperation[];
+  can_undo_audio: boolean;
+  can_redo_audio: boolean;
+  render_status: "ready" | "pending" | "failed";
+};
+
+export type DatasetAudioEditOperation = {
+  kind: "delete_range" | "insert_silence";
+  start_sample?: number;
+  end_sample?: number;
+  at_sample?: number;
+  duration_samples?: number;
+};
+
+export type DatasetClipLabAudioOperationRequest = {
+  expected_manifest_sha256: string;
+  expected_clip_version: number;
+  operation: DatasetAudioEditOperation;
+};
+
+export type DatasetClipLabAudioStackRequest = {
+  expected_manifest_sha256: string;
+  expected_clip_version: number;
+};
+
+export type DatasetWaveformPeaksPayload = {
+  revision_key: string;
+  bins: number;
+  peaks: number[];
+  duration_sec: number;
+  sample_rate_hz: number;
+};
+
+export type DatasetClipLabView = {
+  run_id: string;
+  candidate_manifest_sha256: string;
+  stale_state: boolean;
+  stale_reason: string | null;
+  invalid_state: boolean;
+  invalid_state_reason: string | null;
+  saved_state_clip_count: number;
+  qc_available: boolean;
+  qc_error: string | null;
+  clips: DatasetClipLabClipRow[];
+};
+
+export type DatasetClipLabPatchRequest = {
+  expected_manifest_sha256: string;
+  expected_clip_version: number;
+  review_status?: ReviewStatus;
+  transcript_override?: string | null;
+  reviewer_tags?: string[];
+};
+
 export type DatasetPreflight = {
   ok: boolean;
   reason_codes?: string[];

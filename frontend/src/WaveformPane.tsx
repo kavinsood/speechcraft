@@ -6,6 +6,9 @@ type WaveformPaneProps = {
   audioUrl: string;
   durationSeconds: number;
   peaks: number[] | null;
+  loadRevisionKey?: string | null;
+  peaksLoadState?: "idle" | "loading" | "ready" | "failed";
+  requirePeaksBeforeLoad?: boolean;
   desiredCursorSeconds?: number;
   selectionStart: number;
   selectionEnd: number;
@@ -20,6 +23,9 @@ export default function WaveformPane({
   audioUrl,
   durationSeconds,
   peaks,
+  loadRevisionKey = null,
+  peaksLoadState = "idle",
+  requirePeaksBeforeLoad = false,
   desiredCursorSeconds = 0,
   selectionStart,
   selectionEnd,
@@ -37,6 +43,7 @@ export default function WaveformPane({
   const zoomRef = useRef(90);
   const isPointerDownRef = useRef(false);
   const pointerStartXRef = useRef<number | null>(null);
+  const pointerStartTimeRef = useRef<number | null>(null);
   const draggedThisGestureRef = useRef(false);
   const selectionChangeRef = useRef(onSelectionChange);
   const cursorChangeRef = useRef(onCursorChange);
@@ -44,6 +51,9 @@ export default function WaveformPane({
   const readyRef = useRef(onReady);
   const playingChangeRef = useRef(onPlayingChange);
   const lastAudioUrlRef = useRef<string | null>(null);
+  const lastLoadedRevisionRef = useRef<string | null>(null);
+  const loadGenerationRef = useRef(0);
+  const peaksRef = useRef(peaks);
   const desiredCursorRef = useRef(desiredCursorSeconds);
   const [audioState, setAudioState] = useState<"loading" | "ready" | "error">("loading");
   const [audioError, setAudioError] = useState<string | null>(null);
@@ -77,6 +87,14 @@ export default function WaveformPane({
   }, [desiredCursorSeconds]);
 
   useEffect(() => {
+    peaksRef.current = peaks;
+  }, [peaks]);
+
+  useEffect(() => {
+    lastLoadedRevisionRef.current = null;
+  }, [loadRevisionKey, audioUrl]);
+
+  useEffect(() => {
     if (!containerRef.current) {
       return;
     }
@@ -103,9 +121,22 @@ export default function WaveformPane({
     regionsRef.current = regions;
     readyRef.current?.(waveSurfer);
 
-    regions.enableDragSelection({
-      color: "rgba(247, 203, 104, 0.2)",
-    });
+    const timeAtClientX = (clientX: number): number | null => {
+      const wrapper = waveSurfer.getWrapper();
+      const scrollContainer = wrapper.parentElement;
+      const duration = waveSurfer.getDuration();
+      if (!scrollContainer || duration <= 0 || wrapper.scrollWidth <= 0) {
+        return null;
+      }
+
+      const viewport = scrollContainer.getBoundingClientRect();
+      const localX = Math.max(0, Math.min(clientX - viewport.left, viewport.width));
+      const absoluteX = Math.max(
+        0,
+        Math.min(scrollContainer.scrollLeft + localX, wrapper.scrollWidth),
+      );
+      return roundTime((absoluteX / wrapper.scrollWidth) * duration);
+    };
 
     const handleTimeUpdate = (time: number) => {
       if (!waveSurfer.isPlaying()) {
@@ -179,6 +210,7 @@ export default function WaveformPane({
       if (isAbortLikeError(error)) {
         return;
       }
+      lastLoadedRevisionRef.current = null;
       const message =
         error instanceof Error
           ? error.message
@@ -212,21 +244,13 @@ export default function WaveformPane({
     const handlePointerDown = (event: PointerEvent) => {
       isPointerDownRef.current = true;
       pointerStartXRef.current = event.clientX;
+      pointerStartTimeRef.current = timeAtClientX(event.clientX);
       draggedThisGestureRef.current = false;
     };
 
     const handlePointerMove = (event: PointerEvent) => {
-      const wrapper = waveSurfer.getWrapper();
-      const scrollContainer = wrapper.parentElement;
-      const duration = waveSurfer.getDuration();
-      if (scrollContainer && duration > 0 && wrapper.scrollWidth > 0) {
-        const viewport = scrollContainer.getBoundingClientRect();
-        const localX = Math.max(0, Math.min(event.clientX - viewport.left, viewport.width));
-        const absoluteX = Math.max(
-          0,
-          Math.min(scrollContainer.scrollLeft + localX, wrapper.scrollWidth),
-        );
-        const hoverTime = roundTime((absoluteX / wrapper.scrollWidth) * duration);
+      const hoverTime = timeAtClientX(event.clientX);
+      if (hoverTime !== null) {
         hoverTimeChangeRef.current?.(hoverTime);
       }
 
@@ -238,16 +262,27 @@ export default function WaveformPane({
       }
     };
 
-    const handlePointerUp = () => {
+    const handlePointerUp = (event: PointerEvent) => {
+      const didDrag = draggedThisGestureRef.current;
+      const startTime = pointerStartTimeRef.current;
+      const endTime = timeAtClientX(event.clientX);
+
       isPointerDownRef.current = false;
       pointerStartXRef.current = null;
-      // Keep this true briefly so the click event right after drag is ignored.
-      if (!draggedThisGestureRef.current) {
+      pointerStartTimeRef.current = null;
+
+      if (didDrag && startTime !== null && endTime !== null) {
+        selectionChangeRef.current(
+          Math.min(startTime, endTime),
+          Math.max(startTime, endTime),
+        );
+        setTimeout(() => {
+          draggedThisGestureRef.current = false;
+        }, 120);
         return;
       }
-      setTimeout(() => {
-        draggedThisGestureRef.current = false;
-      }, 120);
+
+      draggedThisGestureRef.current = false;
     };
 
     const handleWheel = (event: WheelEvent) => {
@@ -273,16 +308,16 @@ export default function WaveformPane({
     containerRef.current.addEventListener("wheel", handleWheel, { passive: false });
     containerRef.current.addEventListener("pointerdown", handlePointerDown);
     containerRef.current.addEventListener("pointermove", handlePointerMove);
-    containerRef.current.addEventListener("pointerup", handlePointerUp);
-    containerRef.current.addEventListener("pointercancel", handlePointerUp);
+    containerRef.current.addEventListener("pointerup", handlePointerUp as EventListener);
+    containerRef.current.addEventListener("pointercancel", handlePointerUp as EventListener);
     containerRef.current.addEventListener("pointerleave", handlePointerLeave);
 
     return () => {
       containerRef.current?.removeEventListener("wheel", handleWheel);
       containerRef.current?.removeEventListener("pointerdown", handlePointerDown);
       containerRef.current?.removeEventListener("pointermove", handlePointerMove);
-      containerRef.current?.removeEventListener("pointerup", handlePointerUp);
-      containerRef.current?.removeEventListener("pointercancel", handlePointerUp);
+      containerRef.current?.removeEventListener("pointerup", handlePointerUp as EventListener);
+      containerRef.current?.removeEventListener("pointercancel", handlePointerUp as EventListener);
       containerRef.current?.removeEventListener("pointerleave", handlePointerLeave);
       readyRef.current?.(null);
       waveSurfer.destroy();
@@ -293,7 +328,23 @@ export default function WaveformPane({
 
   useEffect(() => {
     const waveSurfer = waveSurferRef.current;
-    if (!waveSurfer) {
+    if (!waveSurfer || !audioUrl) {
+      return;
+    }
+
+    const revisionKey = loadRevisionKey ?? audioUrl;
+    const waitForPeaks =
+      requirePeaksBeforeLoad
+      && peaksLoadState !== "ready"
+      && peaksLoadState !== "failed";
+    if (peaksLoadState === "loading" || waitForPeaks) {
+      loadGenerationRef.current += 1;
+      setAudioState("loading");
+      setAudioError(null);
+      return;
+    }
+
+    if (lastLoadedRevisionRef.current === revisionKey) {
       return;
     }
 
@@ -313,8 +364,39 @@ export default function WaveformPane({
     setAudioState("loading");
     setAudioError(null);
 
-    void waveSurfer.load(audioUrl);
-  }, [audioUrl, durationSeconds, peaks]);
+    const currentPeaks = peaksRef.current;
+    const peaksArg =
+      peaksLoadState === "ready" && currentPeaks && currentPeaks.length > 0
+        ? [currentPeaks]
+        : undefined;
+
+    const generation = ++loadGenerationRef.current;
+    const revisionKeyAtStart = revisionKey;
+
+    void waveSurfer
+      .load(
+        audioUrl,
+        peaksArg,
+        durationSeconds > 0 ? durationSeconds : undefined,
+      )
+      .then(() => {
+        if (
+          generation !== loadGenerationRef.current
+          || revisionKeyAtStart !== (loadRevisionKey ?? audioUrl)
+        ) {
+          return;
+        }
+        lastLoadedRevisionRef.current = revisionKeyAtStart;
+      })
+      .catch((error) => {
+        if (generation !== loadGenerationRef.current) {
+          return;
+        }
+        if (!isAbortLikeError(error)) {
+          lastLoadedRevisionRef.current = null;
+        }
+      });
+  }, [audioUrl, durationSeconds, loadRevisionKey, peaksLoadState, requirePeaksBeforeLoad]);
 
   useEffect(() => {
     const regions = regionsRef.current;
@@ -360,10 +442,18 @@ export default function WaveformPane({
           className={`waveform-overlay waveform-overlay-${audioState}`}
           role={audioState === "error" ? "alert" : "status"}
         >
-          <strong>{audioState === "loading" ? "Loading audio..." : "Audio unavailable"}</strong>
+          <strong>
+            {audioState === "loading"
+              ? peaksLoadState === "loading"
+                ? "Loading waveform..."
+                : "Loading audio..."
+              : "Audio unavailable"}
+          </strong>
           <span>
             {audioState === "loading"
-              ? "Fetching clip audio and preparing the waveform."
+              ? peaksLoadState === "loading"
+                ? "Fetching cached peaks before decoding clip audio."
+                : "Fetching clip audio and preparing the waveform."
               : audioError ?? "The backend could not decode this clip."}
           </span>
         </div>

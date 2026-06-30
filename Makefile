@@ -15,6 +15,7 @@ SPEECHCRAFT_MFA_ACOUSTIC_MODEL ?= english_mfa
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 BACKEND_DIR := $(ROOT_DIR)/backend
 FRONTEND_DIR := $(ROOT_DIR)/frontend
+WORKER_ROOT := $(ROOT_DIR)/workers/dataset
 
 export SPEECHCRAFT_MFA_BIN
 export SPEECHCRAFT_MFA_DICTIONARY
@@ -64,6 +65,7 @@ check: check-backend check-frontend
 check-backend:
 	cd $(ROOT_DIR) && python3 -m compileall backend/app
 	cd $(BACKEND_DIR) && ./.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+	cd $(WORKER_ROOT) && PYTHONPATH=. $(BACKEND_DIR)/.venv/bin/python tests/test_clip_lab_coordination.py
 
 check-frontend:
 	cd $(FRONTEND_DIR) && npm run build

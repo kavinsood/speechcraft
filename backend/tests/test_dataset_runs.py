@@ -12,6 +12,7 @@ from sqlmodel import Session
 from app.dataset_runs import (
     create_dataset_run,
     generate_dataset_qc_scores,
+    get_candidate_review_media_bytes,
     get_candidate_review_media_path,
     get_dataset_export_results,
     get_dataset_run_log,
@@ -296,6 +297,37 @@ class DatasetRunTests(TestCase):
 
         self.assertEqual(resolved, clip_path)
 
+    def test_candidate_review_media_bytes_snapshot_is_stable_after_file_changes(self) -> None:
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        clip_dir = artifacts / "candidate_review_clips"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = clip_dir / "candidate_review_clip_000000.wav"
+        original_bytes = b"RIFF-original"
+        clip_path.write_bytes(original_bytes)
+        (artifacts / "candidate_review_manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "clip_id": "candidate_review_clip_000000",
+                        "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000000.wav",
+                        "duration_sec": 1.0,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        captured = get_candidate_review_media_bytes(
+            self.repository,
+            run.id,
+            "candidate_review_clip_000000",
+        )
+        clip_path.write_bytes(b"RIFF-replaced-on-disk")
+        self.assertEqual(captured, original_bytes)
+        self.assertNotEqual(clip_path.read_bytes(), captured)
+
     def test_log_response_is_bounded_and_falls_back_to_process_log(self) -> None:
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
         run_root = self.repository.media_root / str(run.artifact_root)
@@ -389,6 +421,20 @@ class DatasetRunTests(TestCase):
                 run.id,
                 DatasetSlicerRerunRequest(config={"cutpoint_frame_ms": 99}),
             )
+
+    def test_slicer_rerun_rejects_when_clip_lab_lock_is_held(self) -> None:
+        from app.clip_lab_state import clip_lab_run_lock
+
+        run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())
+        run_root = self.repository.media_root / str(run.artifact_root)
+        artifacts = run_root / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        for relative in ("asr_mfa_queue.json", "aligned_words.jsonl", "alignment_qc_by_buffer.json"):
+            (artifacts / relative).write_text("[]" if relative.endswith(".json") else "", encoding="utf-8")
+
+        with clip_lab_run_lock(run_root):
+            with self.assertRaisesRegex(ValueError, "Clip Lab state is busy"):
+                rerun_dataset_slicer(self.repository, run.id, DatasetSlicerRerunRequest())
 
     def test_qc_score_generation_launches_worker(self) -> None:
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())

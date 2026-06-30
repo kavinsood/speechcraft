@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .assembly import assemble_candidate_review_clips
+from .clip_lab_coordination import assemble_candidate_review_clips_locked
 from .io import read_json, write_json
 from .qc_artifacts import clear_downstream_after_candidate_regeneration
 from .qc_score_stages import run_speaker_purity_stage, run_transcript_qc_stage
@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
         safe_summary = generate_safe_cutpoint_diagnostics(run_root, config)
         log_line(run_root, f"safe_cutpoints rerun completed summary={safe_summary}")
         write_status(run_root, {"ok": None, "stage": "candidate_review_clips", "summary": safe_summary})
-        candidate_summary = assemble_candidate_review_clips(run_root, config)
+        candidate_summary = assemble_candidate_review_clips_locked(run_root, config)
         log_line(run_root, f"candidate_review_clips rerun completed summary={candidate_summary}")
         try:
             write_status(run_root, {"ok": None, "stage": "transcript_qc", "summary": candidate_summary})

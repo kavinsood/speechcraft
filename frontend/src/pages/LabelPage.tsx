@@ -2,8 +2,9 @@ import { startTransition, useCallback, useEffect, useMemo, useRef, useState, typ
 import {
   ApiError,
   appendClipEdlOperation,
-  buildCandidateReviewAudioUrl,
+  appendDatasetAudioOperation,
   fetchClipLabItem,
+  fetchDatasetClipLab,
   fetchDatasetQc,
   fetchDatasetSlicerResults,
   fetchProjectDatasetRuns,
@@ -12,7 +13,9 @@ import {
   fetchProjectReferenceAssets,
   markDatasetClipAsReferenceCandidate,
   mergeWithNextClip,
+  patchDatasetClipLabClip,
   redoClip,
+  redoDatasetAudioOperation,
   resolveApiUrl,
   runClipLabModel,
   saveCurrentSliceAsReference,
@@ -20,12 +23,25 @@ import {
   setActiveVariant,
   splitClip,
   undoClip,
+  undoDatasetAudioOperation,
 } from "../api";
 import ErrorBoundary from "../ErrorBoundary";
 import ClipQueuePane from "../workspace/ClipQueuePane";
 import EditorPane from "../workspace/EditorPane";
 import InspectorPane from "../workspace/InspectorPane";
 import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
+import {
+  buildDatasetTagReadOnlyConfig,
+  isDatasetClipLabEditable,
+  resolveDatasetClipTags,
+  type DatasetClipLabLoadState,
+} from "./labelPageDatasetHelpers";
+import {
+  buildReviewerTagSuggestions,
+  createClipLabPatchCoordinator,
+  type ClipPatchBuilder,
+} from "../workspace/dataset-clip-lab-patch";
+import { datasetAudioOperationFromEdlPayload, requireDatasetSampleRateHz } from "../workspace/audioSampleCoords";
 import { usePipelineContext } from "../pipeline/PipelineContext";
 import { isEligibleLabDatasetRun, resolveLabDatasetRunId } from "../pipeline/datasetRunHelpers";
 import {
@@ -44,6 +60,10 @@ import type {
   ClipLabCommit,
   ClipLabTranscript,
   ClipLabVariant,
+  DatasetClipLabClipRow,
+  DatasetClipLabPatchRequest,
+  DatasetClipLabView,
+  DatasetAudioEditOperation,
   DatasetQcPayload,
   DatasetRun,
   DatasetSlicerResults,
@@ -70,12 +90,13 @@ type LabelPageProps = {
 };
 
 type DatasetCandidateClip = Record<string, unknown>;
-type DatasetClipLocalState = {
-  status: ReviewStatus;
-  modifiedText: string | null;
-  tags: Tag[];
-  message?: string | null;
-};
+
+const RESERVED_REVIEW_STATUS_LABELS = new Set<ReviewStatus>([
+  "accepted",
+  "rejected",
+  "quarantined",
+  "unresolved",
+]);
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
@@ -107,18 +128,6 @@ function summarizeSlice(slice: Slice): SliceSummary {
   };
 }
 
-function candidateReviewTags(row: DatasetCandidateClip, overrideTags?: Tag[] | null): Tag[] {
-  if (overrideTags) {
-    return overrideTags;
-  }
-  const reasonCodes = Array.isArray(row.review_reason_codes) ? row.review_reason_codes : [];
-  return reasonCodes.map((reason, index) => ({
-    id: `${String(row.id)}-tag-${index}`,
-    name: String(reason).replace(/_/g, " "),
-    color: "#7c3aed",
-  }));
-}
-
 function datasetVariant(row: DatasetCandidateClip): ClipLabVariant {
   return {
     id: `${String(row.id)}:variant:analysis`,
@@ -129,20 +138,56 @@ function datasetVariant(row: DatasetCandidateClip): ClipLabVariant {
   };
 }
 
-function datasetCapabilities(): ClipLabCapabilities {
+function datasetCapabilities(editable: boolean): ClipLabCapabilities {
   return {
-    can_edit_transcript: true,
-    can_edit_tags: true,
-    can_set_status: true,
-    can_save: true,
+    can_edit_transcript: editable,
+    can_edit_tags: editable,
+    can_set_status: editable,
+    can_save: editable,
     can_split: false,
     can_merge: false,
-    can_edit_waveform: false,
+    can_edit_waveform: editable,
     can_run_processing: false,
     can_switch_variants: false,
     can_export: false,
     can_finalize: false,
   };
+}
+
+function assertDatasetClipLabEditable(
+  datasetMode: boolean,
+  loadState: DatasetClipLabLoadState,
+  view: DatasetClipLabView | null,
+): void {
+  if (!isDatasetClipLabEditable(datasetMode, loadState, view)) {
+    throw new Error("Clip Lab state is unavailable, stale, or invalid. Reload before editing.");
+  }
+}
+
+function datasetAudioOpsToEdl(
+  ops: DatasetAudioEditOperation[],
+  sampleRateHz: number,
+): ClipLabCommit["edl_operations"] {
+  if (!Number.isFinite(sampleRateHz) || sampleRateHz <= 0) {
+    return [];
+  }
+  return ops.map((operation) => {
+    if (operation.kind === "delete_range") {
+      const startSeconds = (operation.start_sample ?? 0) / sampleRateHz;
+      const endSeconds = (operation.end_sample ?? 0) / sampleRateHz;
+      return {
+        op: "delete_range",
+        range: { start_seconds: startSeconds, end_seconds: endSeconds },
+      };
+    }
+    const atSeconds = (operation.at_sample ?? 0) / sampleRateHz;
+    const durationSeconds = (operation.duration_samples ?? 0) / sampleRateHz;
+    return {
+      op: "insert_silence",
+      range: { start_seconds: atSeconds, end_seconds: atSeconds },
+      duration_seconds: durationSeconds,
+    };
+  });
 }
 
 function datasetCommit(
@@ -203,12 +248,13 @@ function candidateReviewManifestIndex(clipId: string): number | null {
 function datasetSliceSummary(
   row: DatasetCandidateClip,
   sourceRecordingId: string,
-  localState?: DatasetClipLocalState,
+  clipLabRow?: DatasetClipLabClipRow,
   qcScores?: DatasetQcScores | null,
   manifestIndex?: number,
 ): SliceSummary {
-  const tags = candidateReviewTags(row, localState?.tags ?? null);
-  const transcript = datasetTranscriptSummary(row, localState?.modifiedText ?? null);
+  const tags = resolveDatasetClipTags(row, clipLabRow);
+  const modifiedText = clipLabRow?.transcript_override ?? null;
+  const transcript = datasetTranscriptSummary(row, modifiedText);
   const sampleRate = Number(row.sample_rate ?? 16000);
   const sourceStartSample = Number(row.source_start_sample ?? 0);
   const sourceEndSample = Number(row.source_end_sample ?? 0);
@@ -222,6 +268,7 @@ function datasetSliceSummary(
       : originalStartTime + Number(row.duration_sec ?? 0);
   const orderIndex = manifestIndex ?? candidateReviewManifestIndex(String(row.id)) ?? 0;
   const transcriptMatch =
+    clipLabRow?.transcript_match ??
     qcScores?.transcriptMatch ??
     (typeof row.transcript_match === "number"
       ? row.transcript_match
@@ -229,6 +276,7 @@ function datasetSliceSummary(
         ? row.transcript_match_score
         : null);
   const speakerCheck =
+    clipLabRow?.speaker_check ??
     qcScores?.speakerCheck ??
     (typeof row.speaker_check === "number"
       ? row.speaker_check
@@ -240,7 +288,7 @@ function datasetSliceSummary(
     source_recording_id: sourceRecordingId,
     active_variant_id: `${String(row.id)}:variant:analysis`,
     active_commit_id: `${String(row.id)}:commit:current`,
-    status: localState?.status ?? "unresolved",
+    status: clipLabRow?.review_status ?? "unresolved",
     is_locked: false,
     duration_seconds: Number(row.duration_sec ?? 0),
     model_metadata: {
@@ -271,16 +319,30 @@ function datasetClipLabItem(
   row: DatasetCandidateClip,
   sourceRecording: SourceRecordingQueue,
   runId: string,
-  localState?: DatasetClipLocalState,
+  clipLabRow?: DatasetClipLabClipRow,
   qcScores?: DatasetQcScores | null,
+  clipLabEditable = false,
 ): ClipLabItem {
-  const tags = candidateReviewTags(row, localState?.tags ?? null);
-  const transcriptText = localState?.modifiedText ?? String(row.training_text ?? "");
-  const status = localState?.status ?? "unresolved";
-  const variant = datasetVariant(row);
-  const transcript = datasetTranscript(row, localState?.modifiedText ?? null);
-  const commit = datasetCommit(row, transcriptText, status, tags, localState?.message ?? "Dataset candidate clip");
+  const tags = resolveDatasetClipTags(row, clipLabRow);
+  const transcriptText = clipLabRow?.transcript ?? String(row.training_text ?? "");
+  const status = clipLabRow?.review_status ?? "unresolved";
+  const sampleRate = Number(clipLabRow?.sample_rate_hz ?? row.sample_rate ?? 16000);
+  const durationSeconds = Number(
+    clipLabRow?.current_duration_sec ?? row.duration_sec ?? 0,
+  );
+  const variant = {
+    ...datasetVariant(row),
+    sample_rate: sampleRate,
+    num_samples: Math.max(0, Math.round(durationSeconds * sampleRate)),
+  };
+  const transcript = datasetTranscript(row, clipLabRow?.transcript_override ?? null);
+  const audioEditOps = clipLabRow?.audio_edit_ops ?? [];
+  const commit = {
+    ...datasetCommit(row, transcriptText, status, tags, "Dataset candidate clip"),
+    edl_operations: datasetAudioOpsToEdl(audioEditOps, sampleRate),
+  };
   const transcriptMatch =
+    clipLabRow?.transcript_match ??
     qcScores?.transcriptMatch ??
     (typeof row.transcript_match === "number"
       ? row.transcript_match
@@ -288,6 +350,7 @@ function datasetClipLabItem(
         ? row.transcript_match_score
         : null);
   const speakerCheck =
+    clipLabRow?.speaker_check ??
     qcScores?.speakerCheck ??
     (typeof row.speaker_check === "number"
       ? row.speaker_check
@@ -301,7 +364,7 @@ function datasetClipLabItem(
     source_recording: sourceRecording,
     start_seconds: Number(row.source_start_sample ?? 0) / Number(row.sample_rate ?? 16000),
     end_seconds: Number(row.source_end_sample ?? 0) / Number(row.sample_rate ?? 16000),
-    duration_seconds: Number(row.duration_sec ?? 0),
+    duration_seconds: durationSeconds,
     status,
     is_locked: false,
     created_at: new Date(0).toISOString(),
@@ -309,7 +372,7 @@ function datasetClipLabItem(
     tags,
     speaker_name: null,
     language: "en",
-    audio_url: buildCandidateReviewAudioUrl(runId, String(row.id)),
+    audio_url: clipLabRow?.audio_url ?? `/media/dataset-runs/${runId}/candidate-review/${String(row.id)}.wav`,
     item_metadata: {
       candidate_review: true,
       review_reason_codes: Array.isArray(row.review_reason_codes) ? row.review_reason_codes : [],
@@ -318,12 +381,16 @@ function datasetClipLabItem(
       source_end_sample: row.source_end_sample ?? null,
       transcript_match: transcriptMatch,
       speaker_check: speakerCheck,
+      effective_audio_revision_key: clipLabRow?.effective_audio_revision_key ?? null,
+      waveform_peaks_url: clipLabRow?.waveform_peaks_url ?? null,
+      render_status: clipLabRow?.render_status ?? "ready",
+      sample_rate_hz: sampleRate,
     },
     can_run_asr: false,
     active_variant_generator_model: null,
-    can_undo: false,
-    can_redo: false,
-    capabilities: datasetCapabilities(),
+    can_undo: clipLabRow?.can_undo_audio ?? false,
+    can_redo: clipLabRow?.can_redo_audio ?? false,
+    capabilities: datasetCapabilities(clipLabEditable),
     variants: [variant],
     commits: [commit],
     active_variant: variant,
@@ -365,13 +432,186 @@ export default function LabelPage({
     [datasetRuns, selectedLabDatasetRunId, selectedSlicerDatasetRunId, selectedQcDatasetRunId],
   );
   const datasetMode = Boolean(datasetRunId);
-  const [datasetClipState, setDatasetClipState] = useState<Record<string, DatasetClipLocalState>>({});
+  const [datasetClipLab, setDatasetClipLabState] = useState<DatasetClipLabView | null>(null);
+  const [datasetClipLabLoadState, setDatasetClipLabLoadStateInternal] =
+    useState<DatasetClipLabLoadState>("idle");
+  const datasetClipLabRef = useRef<DatasetClipLabView | null>(null);
+  const datasetClipLabLoadStateRef = useRef<DatasetClipLabLoadState>("idle");
+  const activeClipItemRef = useRef(activeClipItem);
+  const rowUpdatedRef = useRef<(runId: string, updated: DatasetClipLabClipRow) => void>(() => {});
+  const conflictRef = useRef<(runId: string, clipId: string) => Promise<void>>(async () => {});
   const [isSavingReference, setIsSavingReference] = useState(false);
   const latestWorkspaceRequestRef = useRef(0);
   const latestDetailRequestRef = useRef(0);
 
   const NO_DATASET_RUN_MESSAGE =
     "No dataset run with candidate clips yet. Complete Processing and Slicer, then return to Clip Lab.";
+
+  function setDatasetClipLab(next: DatasetClipLabView | null) {
+    datasetClipLabRef.current = next;
+    setDatasetClipLabState(next);
+  }
+
+  function setDatasetClipLabLoadState(next: DatasetClipLabLoadState) {
+    datasetClipLabLoadStateRef.current = next;
+    setDatasetClipLabLoadStateInternal(next);
+  }
+
+  const patchCoordinator = useMemo(
+    () =>
+      createClipLabPatchCoordinator({
+        getView: () => datasetClipLabRef.current,
+        patchClip: patchDatasetClipLabClip,
+        appendAudioOp: appendDatasetAudioOperation,
+        undoAudio: undoDatasetAudioOperation,
+        redoAudio: redoDatasetAudioOperation,
+        onViewChange: (next) => {
+          datasetClipLabRef.current = next;
+          setDatasetClipLabState(next);
+        },
+        onRowUpdated: (runId, updated) => rowUpdatedRef.current(runId, updated),
+        onConflict: (runId, clipId) => conflictRef.current(runId, clipId),
+      }),
+    [],
+  );
+
+  useEffect(() => {
+    activeClipItemRef.current = activeClipItem;
+  }, [activeClipItem]);
+
+  const clipLabRowById = useMemo(
+    () => new Map((datasetClipLab?.clips ?? []).map((row) => [row.clip_id, row])),
+    [datasetClipLab],
+  );
+
+  function buildDatasetSlicesFromManifest(
+    results: DatasetSlicerResults,
+    recordingId: string,
+    clipLabView: DatasetClipLabView | null,
+    qcScoreIndex: Map<string, DatasetQcScores>,
+  ): SliceSummary[] {
+    const clipLabById = new Map((clipLabView?.clips ?? []).map((row) => [row.clip_id, row]));
+    return results.candidate_review_manifest.map((row, index) =>
+      datasetSliceSummary(
+        row as DatasetCandidateClip,
+        recordingId,
+        clipLabById.get(String(row.id)),
+        qcScoreIndex.get(String(row.id)) ?? null,
+        index,
+      ),
+    );
+  }
+
+  rowUpdatedRef.current = (runId, updated) => {
+    if (datasetClipLabRef.current?.run_id !== runId) {
+      return;
+    }
+    refreshDatasetSliceForClip(updated.clip_id, updated);
+    if (activeClipItemRef.current?.id === updated.clip_id) {
+      refreshActiveDatasetClip(updated.clip_id, updated);
+    }
+  };
+
+  conflictRef.current = async (runId, clipId) => {
+    if (datasetRunId !== runId || datasetClipLabRef.current?.run_id !== runId) {
+      return;
+    }
+    const reloaded = await fetchDatasetClipLab(runId);
+    setDatasetClipLab(reloaded);
+    const primaryRecording = recordings[0];
+    if (primaryRecording && datasetSlicerResults) {
+      const qcPayload = await fetchDatasetQc(runId).catch(() => null);
+      const qcScoreIndex = buildDatasetQcScoreIndex(qcPayload);
+      setSlices(
+        buildDatasetSlicesFromManifest(
+          datasetSlicerResults,
+          primaryRecording.id,
+          reloaded,
+          qcScoreIndex,
+        ),
+      );
+    }
+    if (activeClipItemRef.current?.id === clipId) {
+      const refreshedRow = reloaded.clips.find((clip) => clip.clip_id === clipId);
+      if (refreshedRow) {
+        refreshActiveDatasetClip(clipId, refreshedRow);
+      }
+    }
+    setWorkspaceNotice("Clip Lab state was out of date and has been reloaded.");
+  };
+
+  function refreshDatasetSliceForClip(clipId: string, clipLabRow: DatasetClipLabClipRow) {
+    const manifestRow = datasetSlicerResults?.candidate_review_manifest.find(
+      (row) => String(row.id) === clipId,
+    ) as DatasetCandidateClip | undefined;
+    const primaryRecording = recordings[0];
+    if (!manifestRow || !primaryRecording) {
+      return;
+    }
+    const manifestIndex =
+      datasetSlicerResults?.candidate_review_manifest.findIndex((row) => String(row.id) === clipId) ?? 0;
+    const qcScores: DatasetQcScores | null =
+      clipLabRow.transcript_match !== null || clipLabRow.speaker_check !== null
+        ? {
+            transcriptMatch: clipLabRow.transcript_match,
+            speakerCheck: clipLabRow.speaker_check,
+          }
+        : null;
+    const nextSummary = datasetSliceSummary(
+      manifestRow,
+      primaryRecording.id,
+      clipLabRow,
+      qcScores,
+      manifestIndex >= 0 ? manifestIndex : undefined,
+    );
+    setSlices((current) => current.map((slice) => (slice.id === clipId ? nextSummary : slice)));
+  }
+
+  function refreshActiveDatasetClip(clipId: string, clipLabRow: DatasetClipLabClipRow) {
+    const manifestRow = datasetSlicerResults?.candidate_review_manifest.find(
+      (row) => String(row.id) === clipId,
+    ) as DatasetCandidateClip | undefined;
+    const primaryRecording = recordings[0];
+    if (!manifestRow || !primaryRecording || !datasetRunId) {
+      return;
+    }
+    const qcScores: DatasetQcScores | null =
+      clipLabRow.transcript_match !== null || clipLabRow.speaker_check !== null
+        ? {
+            transcriptMatch: clipLabRow.transcript_match,
+            speakerCheck: clipLabRow.speaker_check,
+          }
+        : null;
+    setActiveClip(
+      datasetClipLabItem(
+        manifestRow,
+        primaryRecording,
+        datasetRunId,
+        clipLabRow,
+        qcScores,
+        isDatasetClipLabEditable(
+          datasetMode,
+          datasetClipLabLoadStateRef.current,
+          datasetClipLabRef.current,
+        ),
+      ),
+    );
+  }
+
+  function patchDatasetClipLab(
+    clipId: string,
+    buildPatch: ClipPatchBuilder,
+  ): Promise<DatasetClipLabClipRow> {
+    if (!datasetRunId) {
+      throw new Error("Select a dataset run before editing Clip Lab state.");
+    }
+    assertDatasetClipLabEditable(
+      datasetMode,
+      datasetClipLabLoadStateRef.current,
+      datasetClipLabRef.current,
+    );
+    return patchCoordinator.patchDatasetClipLab(datasetRunId, clipId, buildPatch);
+  }
 
   async function loadWorkspace(projectId: string | null | undefined, options?: { silent?: boolean }) {
     const requestId = latestWorkspaceRequestRef.current + 1;
@@ -388,6 +628,8 @@ export default function LabelPage({
       setRecordings([]);
       setExportRuns([]);
       setReferenceAssets([]);
+      setDatasetClipLab(null);
+      setDatasetClipLabLoadState("idle");
       onActiveClipItemChange(null);
       setVisibleQueueClipIds([]);
       setWorkspaceStatus("ready");
@@ -401,6 +643,8 @@ export default function LabelPage({
           return;
         }
         setDatasetSlicerResults(null);
+        setDatasetClipLab(null);
+        setDatasetClipLabLoadState("idle");
         setSlices([]);
         setRecordings([]);
         setExportRuns([]);
@@ -433,17 +677,45 @@ export default function LabelPage({
       } catch {
         datasetQcPayload = null;
       }
+      let nextClipLab: DatasetClipLabView | null = null;
+      let nextClipLabLoadState: DatasetClipLabLoadState = "loading";
+      let clipLabLoadError: unknown = null;
+
+      if (latestWorkspaceRequestRef.current === requestId) {
+        setDatasetClipLabLoadState("loading");
+      }
+
+      try {
+        nextClipLab = await fetchDatasetClipLab(datasetRunId);
+        nextClipLabLoadState = "ready";
+      } catch (error) {
+        nextClipLabLoadState = "unavailable";
+        clipLabLoadError = error;
+      }
+
       if (latestWorkspaceRequestRef.current !== requestId) {
         return;
       }
+
+      setDatasetClipLab(nextClipLab);
+      setDatasetClipLabLoadState(nextClipLabLoadState);
+      if (nextClipLabLoadState === "unavailable") {
+        setWorkspaceNotice(
+          getErrorMessage(
+            clipLabLoadError,
+            "Clip Lab state unavailable. Tags and review edits are disabled until you reload.",
+          ),
+        );
+      }
       const primaryRecording = nextRecordings[0] ?? null;
       const qcScoreIndex = buildDatasetQcScoreIndex(datasetQcPayload);
+      const clipLabById = new Map((nextClipLab?.clips ?? []).map((row) => [row.clip_id, row]));
       const nextSlices: SliceSummary[] = primaryRecording
         ? results.candidate_review_manifest.map((row, index) =>
             datasetSliceSummary(
-              row,
+              row as DatasetCandidateClip,
               primaryRecording.id,
-              datasetClipState[String(row.id)],
+              clipLabById.get(String(row.id)),
               qcScoreIndex.get(String(row.id)) ?? null,
               index,
             ),
@@ -530,7 +802,10 @@ export default function LabelPage({
   }, [activeProject?.id]);
 
   function handleLabDatasetRunChange(runId: string) {
+    patchCoordinator.resetQueues();
     selectLabDatasetRun(runId);
+    setDatasetClipLab(null);
+    setDatasetClipLabLoadState("idle");
     onActiveClipItemChange(null);
     setActiveClip(null);
   }
@@ -551,6 +826,14 @@ export default function LabelPage({
   }, [activeProject?.id, projectLoadStatus, projectLoadError, datasetRunId]);
 
   const allClipTagNames = useMemo(() => {
+    if (datasetMode && datasetClipLab) {
+      return buildReviewerTagSuggestions(
+        datasetClipLab.clips
+          .flatMap((clip) => clip.reviewer_tags)
+          .filter((tag) => !RESERVED_REVIEW_STATUS_LABELS.has(tag.toLocaleLowerCase() as ReviewStatus)),
+      );
+    }
+
     return Array.from(
       new Set(
         slices
@@ -559,7 +842,7 @@ export default function LabelPage({
           .sort(),
       ),
     );
-  }, [slices, queueSortMode]);
+  }, [datasetClipLab, datasetMode, slices]);
 
   const sliceMap = useMemo(() => new Map(slices.map((slice) => [slice.id, slice])), [slices]);
   const queueSlices = useMemo(() => slices, [slices]);
@@ -606,6 +889,7 @@ export default function LabelPage({
       return;
     }
     const summary = sliceMap.get(nextActiveTarget.id);
+    const clipLabRow = clipLabRowById.get(nextActiveTarget.id);
     const qcScores: DatasetQcScores | null = summary
       ? {
           transcriptMatch: getSliceTranscriptConfidence(summary),
@@ -617,11 +901,32 @@ export default function LabelPage({
         candidateRow,
         primaryRecording,
         datasetRunId,
-        datasetClipState[nextActiveTarget.id],
+        clipLabRow,
         qcScores,
+        isDatasetClipLabEditable(datasetMode, datasetClipLabLoadState, datasetClipLab),
       ),
     );
-  }, [activeClipItem, activeSliceSummary?.id, datasetRunId, datasetSlicerResults, recordings, datasetClipState, sliceMap]);
+  }, [
+    activeClipItem,
+    activeSliceSummary?.id,
+    clipLabRowById,
+    datasetClipLab?.invalid_state,
+    datasetClipLab?.stale_state,
+    datasetClipLabLoadState,
+    datasetMode,
+    datasetRunId,
+    datasetSlicerResults,
+    recordings,
+    sliceMap,
+  ]);
+
+  const activeClipWaveformPeaksUrl = useMemo(() => {
+    if (!activeClip?.item_metadata) {
+      return null;
+    }
+    const peaksPath = activeClip.item_metadata.waveform_peaks_url;
+    return typeof peaksPath === "string" && peaksPath.trim() ? resolveApiUrl(peaksPath) : null;
+  }, [activeClip]);
 
   const activeClipAudioUrl = useMemo(() => {
     if (!activeClip) {
@@ -683,28 +988,51 @@ export default function LabelPage({
     },
   ): Promise<ClipLabItem> {
     if (datasetMode && datasetRunId) {
-      const existingRow = datasetSlicerResults?.candidate_review_manifest.find((row) => String(row.id) === clipItem.id) as DatasetCandidateClip | undefined;
+      const existingRow = datasetSlicerResults?.candidate_review_manifest.find(
+        (row) => String(row.id) === clipItem.id,
+      ) as DatasetCandidateClip | undefined;
       const primaryRecording = recordings[0];
       if (!existingRow || !primaryRecording) {
         throw new Error("Dataset candidate clip could not be updated.");
       }
-      const nextState: DatasetClipLocalState = {
-        status: payload.status ?? datasetClipState[clipItem.id]?.status ?? "unresolved",
-        modifiedText:
-          payload.modified_text !== undefined
-            ? payload.modified_text
-            : datasetClipState[clipItem.id]?.modifiedText ?? null,
-        tags:
-          payload.tags !== undefined
-            ? (payload.tags ?? []).map((tag, index) => ({
-                id: `${clipItem.id}-tag-${index}`,
-                name: tag.name,
-                color: tag.color,
-              }))
-            : datasetClipState[clipItem.id]?.tags ?? candidateReviewTags(existingRow),
-        message: payload.message ?? datasetClipState[clipItem.id]?.message ?? null,
-      };
-      setDatasetClipState((current) => ({ ...current, [clipItem.id]: nextState }));
+
+      assertDatasetClipLabEditable(
+        datasetMode,
+        datasetClipLabLoadStateRef.current,
+        datasetClipLabRef.current,
+      );
+
+      const currentRow = datasetClipLabRef.current?.clips.find((clip) => clip.clip_id === clipItem.id);
+      if (!currentRow) {
+        throw new Error("Clip Lab row is no longer available.");
+      }
+
+      const partial: Omit<
+        DatasetClipLabPatchRequest,
+        "expected_manifest_sha256" | "expected_clip_version"
+      > = {};
+      if (payload.status !== undefined && payload.status !== null) {
+        partial.review_status = payload.status;
+      }
+      if (payload.modified_text !== undefined) {
+        partial.transcript_override = payload.modified_text;
+      }
+      if (payload.tags !== undefined) {
+        partial.reviewer_tags = (payload.tags ?? []).map((tag) => tag.name);
+      }
+
+      if (Object.keys(partial).length === 0) {
+        const summary = sliceMap.get(clipItem.id);
+        const qcScores: DatasetQcScores | null = summary
+          ? {
+              transcriptMatch: getSliceTranscriptConfidence(summary),
+              speakerCheck: getSliceSpeakerPurityScore(summary),
+            }
+          : null;
+        return buildDatasetClipLabItem(existingRow, currentRow, qcScores);
+      }
+
+      const updatedRow = await patchDatasetClipLab(clipItem.id, () => partial);
       const summary = sliceMap.get(clipItem.id);
       const qcScores: DatasetQcScores | null = summary
         ? {
@@ -712,14 +1040,32 @@ export default function LabelPage({
             speakerCheck: getSliceSpeakerPurityScore(summary),
           }
         : null;
-      const updated = datasetClipLabItem(existingRow, primaryRecording, datasetRunId, nextState, qcScores);
-      replaceSlice(updated as unknown as Slice);
+      const updated = buildDatasetClipLabItem(existingRow, updatedRow, qcScores);
       setActiveClip(updated);
       return updated;
     }
     const updatedSlice = await saveClipState(clipItem.id, payload);
     replaceSlice(updatedSlice);
     return await refreshActiveClipItem(clipItem);
+  }
+
+  function buildDatasetClipLabItem(
+    manifestRow: DatasetCandidateClip,
+    clipLabRow?: DatasetClipLabClipRow,
+    qcScores?: DatasetQcScores | null,
+  ): ClipLabItem {
+    const primaryRecording = recordings[0];
+    if (!primaryRecording || !datasetRunId) {
+      throw new Error("Dataset candidate clip could not be loaded.");
+    }
+    return datasetClipLabItem(
+      manifestRow,
+      primaryRecording,
+      datasetRunId,
+      clipLabRow,
+      qcScores,
+      isDatasetClipLabEditable(datasetMode, datasetClipLabLoadStateRef.current, datasetClipLabRef.current),
+    );
   }
 
   async function saveClipEdl(
@@ -731,7 +1077,43 @@ export default function LabelPage({
     },
   ): Promise<ClipLabItem> {
     if (datasetMode) {
-      throw new Error("Waveform edits are unavailable for dataset candidate clips.");
+      if (!datasetRunId) {
+        throw new Error("Select a dataset run before editing audio.");
+      }
+      assertDatasetClipLabEditable(
+        datasetMode,
+        datasetClipLabLoadStateRef.current,
+        datasetClipLabRef.current,
+      );
+
+      const manifestRow = datasetSlicerResults?.candidate_review_manifest.find(
+        (row) => String(row.id) === clipItem.id,
+      ) as DatasetCandidateClip | undefined;
+      const currentRow = datasetClipLabRef.current?.clips.find((clip) => clip.clip_id === clipItem.id);
+      if (!manifestRow || !currentRow) {
+        throw new Error("Clip Lab row is no longer available.");
+      }
+
+      const sampleRateHz = requireDatasetSampleRateHz(
+        currentRow.sample_rate_hz,
+        manifestRow.sample_rate,
+      );
+      const operation = datasetAudioOperationFromEdlPayload(payload, sampleRateHz);
+      const updatedRow = await patchCoordinator.appendDatasetAudioOperation(
+        datasetRunId,
+        clipItem.id,
+        operation,
+      );
+      const summary = sliceMap.get(clipItem.id);
+      const qcScores: DatasetQcScores | null = summary
+        ? {
+            transcriptMatch: getSliceTranscriptConfidence(summary),
+            speakerCheck: getSliceSpeakerPurityScore(summary),
+          }
+        : null;
+      const updated = buildDatasetClipLabItem(manifestRow, updatedRow, qcScores);
+      setActiveClip(updated);
+      return updated;
     }
     const updatedSlice = await appendClipEdlOperation(clipItem.id, payload);
     replaceSlice(updatedSlice);
@@ -740,7 +1122,33 @@ export default function LabelPage({
 
   async function undoClipMutation(clipItem: ClipLabItemRef): Promise<ClipLabItem> {
     if (datasetMode) {
-      throw new Error("Undo is unavailable for dataset candidate clips.");
+      if (!datasetRunId) {
+        throw new Error("Select a dataset run before editing audio.");
+      }
+      assertDatasetClipLabEditable(
+        datasetMode,
+        datasetClipLabLoadStateRef.current,
+        datasetClipLabRef.current,
+      );
+
+      const manifestRow = datasetSlicerResults?.candidate_review_manifest.find(
+        (row) => String(row.id) === clipItem.id,
+      ) as DatasetCandidateClip | undefined;
+      if (!manifestRow) {
+        throw new Error("Clip Lab row is no longer available.");
+      }
+
+      const updatedRow = await patchCoordinator.undoDatasetAudioOperation(datasetRunId, clipItem.id);
+      const summary = sliceMap.get(clipItem.id);
+      const qcScores: DatasetQcScores | null = summary
+        ? {
+            transcriptMatch: getSliceTranscriptConfidence(summary),
+            speakerCheck: getSliceSpeakerPurityScore(summary),
+          }
+        : null;
+      const updated = buildDatasetClipLabItem(manifestRow, updatedRow, qcScores);
+      setActiveClip(updated);
+      return updated;
     }
     const updatedSlice = await undoClip(clipItem.id);
     replaceSlice(updatedSlice);
@@ -749,7 +1157,33 @@ export default function LabelPage({
 
   async function redoClipMutation(clipItem: ClipLabItemRef): Promise<ClipLabItem> {
     if (datasetMode) {
-      throw new Error("Redo is unavailable for dataset candidate clips.");
+      if (!datasetRunId) {
+        throw new Error("Select a dataset run before editing audio.");
+      }
+      assertDatasetClipLabEditable(
+        datasetMode,
+        datasetClipLabLoadStateRef.current,
+        datasetClipLabRef.current,
+      );
+
+      const manifestRow = datasetSlicerResults?.candidate_review_manifest.find(
+        (row) => String(row.id) === clipItem.id,
+      ) as DatasetCandidateClip | undefined;
+      if (!manifestRow) {
+        throw new Error("Clip Lab row is no longer available.");
+      }
+
+      const updatedRow = await patchCoordinator.redoDatasetAudioOperation(datasetRunId, clipItem.id);
+      const summary = sliceMap.get(clipItem.id);
+      const qcScores: DatasetQcScores | null = summary
+        ? {
+            transcriptMatch: getSliceTranscriptConfidence(summary),
+            speakerCheck: getSliceSpeakerPurityScore(summary),
+          }
+        : null;
+      const updated = buildDatasetClipLabItem(manifestRow, updatedRow, qcScores);
+      setActiveClip(updated);
+      return updated;
     }
     const updatedSlice = await redoClip(clipItem.id);
     replaceSlice(updatedSlice);
@@ -936,6 +1370,37 @@ export default function LabelPage({
     };
   }, [onHeaderActionsChange]);
 
+  const datasetClipLabEditable = isDatasetClipLabEditable(datasetMode, datasetClipLabLoadState, datasetClipLab);
+  const activeClipLabRow =
+    datasetClipLabEditable && activeClipItem ? clipLabRowById.get(activeClipItem.id) : undefined;
+  const datasetTagComposer = activeClipLabRow
+    ? {
+        reviewStatus: activeClipLabRow.review_status,
+        machineFindings: activeClipLabRow.pipeline_findings,
+        reviewerTags: activeClipLabRow.reviewer_tags,
+        acceptanceStale: activeClipLabRow.acceptance_stale,
+        onReviewStatusChange: (status: ReviewStatus) =>
+          patchDatasetClipLab(activeClipLabRow.clip_id, () => ({ review_status: status })),
+        onAddReviewerTag: (tag: string) =>
+          patchDatasetClipLab(activeClipLabRow.clip_id, (row) => ({
+            reviewer_tags: [...row.reviewer_tags, tag],
+          })),
+        onRemoveReviewerTag: (tag: string) =>
+          patchDatasetClipLab(activeClipLabRow.clip_id, (row) => ({
+            reviewer_tags: row.reviewer_tags.filter(
+              (entry) => entry.toLowerCase() !== tag.toLowerCase(),
+            ),
+          })),
+      }
+    : undefined;
+  const datasetTagReadOnly = buildDatasetTagReadOnlyConfig(
+    datasetMode,
+    datasetClipLabEditable,
+    activeClip,
+    datasetClipLab,
+    datasetClipLabLoadState,
+  );
+
   return (
     <ErrorBoundary
       resetKey={activeProject?.id ?? "no-project"}
@@ -950,6 +1415,23 @@ export default function LabelPage({
     >
       <div className="workspace-shell">
         {workspaceNotice ? <p className="workspace-notice">{workspaceNotice}</p> : null}
+        {datasetClipLabLoadState === "unavailable" ? (
+          <p className="workspace-notice workspace-warning" role="alert">
+            Clip Lab state unavailable. Reload the workspace before editing tags, status, or transcript.
+          </p>
+        ) : null}
+        {datasetClipLab?.invalid_state ? (
+          <p className="workspace-notice workspace-warning" role="alert">
+            Clip Lab state is invalid
+            {datasetClipLab.invalid_state_reason ? `: ${datasetClipLab.invalid_state_reason}` : "."}
+          </p>
+        ) : null}
+        {datasetClipLab?.stale_state ? (
+          <p className="workspace-notice workspace-warning" role="alert">
+            Clip Lab state is stale
+            {datasetClipLab.stale_reason ? `: ${datasetClipLab.stale_reason}` : "."}
+          </p>
+        ) : null}
 
         {workspaceStatus === "error" && !activeProject ? (
           <WorkspaceStatePanel
@@ -980,7 +1462,7 @@ export default function LabelPage({
             workspaceError={workspaceError}
             workspaceEmptyMessage={workspaceEmptyMessage}
             activeClip={activeClip}
-            disableWaveformPeaks={datasetMode}
+            waveformPeaksUrl={datasetMode ? activeClipWaveformPeaksUrl : null}
             activeClipAudioUrl={activeClipAudioUrl}
             canUndo={canUndo}
             canRedo={canRedo}
@@ -996,6 +1478,9 @@ export default function LabelPage({
             onMergeClip={mergeNextClipMutation}
             onRunClipLabModel={runClipLabModelMutation}
             onMarkReferenceClipCandidate={datasetRunId ? handleMarkReferenceClipCandidate : undefined}
+            datasetTagComposer={datasetTagComposer}
+            datasetTagReadOnly={datasetTagReadOnly}
+            datasetEditingDisabled={datasetMode && !datasetClipLabEditable}
           />
 
           <InspectorPane

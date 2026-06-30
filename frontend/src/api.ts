@@ -1,5 +1,11 @@
 import type {
   ClipLabItem,
+  DatasetClipLabClipRow,
+  DatasetClipLabAudioOperationRequest,
+  DatasetClipLabAudioStackRequest,
+  DatasetClipLabPatchRequest,
+  DatasetClipLabView,
+  DatasetWaveformPeaksPayload,
   DatasetPreflight,
   DatasetExportResults,
   DatasetQcFinalizeRequest,
@@ -295,6 +301,77 @@ export async function fetchDatasetExportResults(runId: string): Promise<DatasetE
 
 export async function fetchDatasetQc(runId: string): Promise<DatasetQcPayload> {
   return await requestJson<DatasetQcPayload>(`${API_BASE}/api/dataset-runs/${runId}/qc`);
+}
+
+export async function fetchDatasetClipLab(runId: string): Promise<DatasetClipLabView> {
+  return await requestJson<DatasetClipLabView>(`${API_BASE}/api/dataset-runs/${runId}/clip-lab`);
+}
+
+export async function patchDatasetClipLabClip(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabPatchRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/clip-lab`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function appendDatasetAudioOperation(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabAudioOperationRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/audio/operations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function undoDatasetAudioOperation(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabAudioStackRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/audio/undo`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function redoDatasetAudioOperation(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabAudioStackRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/audio/redo`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function fetchDatasetClipLabWaveformPeaks(
+  peaksPath: string,
+): Promise<DatasetWaveformPeaksPayload> {
+  const url = peaksPath.startsWith("http") ? peaksPath : `${API_BASE}${peaksPath}`;
+  return await requestJson<DatasetWaveformPeaksPayload>(url);
 }
 
 export async function finalizeDatasetQc(

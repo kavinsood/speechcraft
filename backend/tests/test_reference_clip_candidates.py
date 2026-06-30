@@ -32,17 +32,15 @@ class ReferenceClipCandidateHelpersTests(unittest.TestCase):
 
 class ReferenceClipCandidatePromotionTests(unittest.TestCase):
     @patch("app.reference_clip_candidates._get_dataset_run_for_project")
-    @patch("app.reference_clip_candidates.get_candidate_review_media_path")
+    @patch("app.reference_clip_candidates.get_candidate_review_media_bytes")
     def test_mark_dataset_clip_copies_audio_into_project_folder(
         self,
-        get_media_path,
+        get_media_bytes,
         validate_run,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             media_root = Path(temp_dir)
-            source_path = media_root / "source.wav"
-            source_path.write_bytes(b"RIFF")
-            get_media_path.return_value = source_path
+            get_media_bytes.return_value = b"RIFF"
 
             class FakeRepository:
                 def __init__(self) -> None:

@@ -13,6 +13,7 @@ from unittest.mock import patch
 from speechcraft_dataset.alignment_qc import run_alignment_qc
 from speechcraft_dataset.analyze_vad_mfa_gaps import analyze_vad_mfa_gaps
 from speechcraft_dataset.assembly import assemble_candidate_review_clips
+from speechcraft_dataset.io import sha256_file
 from speechcraft_dataset.asr import run_asr
 from speechcraft_dataset.buffers import run_processing_buffers
 from speechcraft_dataset.export import export_native_candidate_clips
@@ -1882,6 +1883,11 @@ class DatasetWorkerRunCliTests(unittest.TestCase):
                 self.assertLessEqual(word["source_end_sample"], clip["source_end_sample"])
             with wave.open(str(clip_path), "rb") as handle:
                 self.assertEqual(handle.getnframes(), clip["duration_samples"])
+                self.assertEqual(handle.getnchannels(), 1)
+                self.assertEqual(handle.getsampwidth(), 2)
+            expected_hash = sha256_file(clip_path)
+            self.assertEqual(clip["audio_sha256"], expected_hash)
+            self.assertEqual(clip["audio_hash"], expected_hash)
 
     @unittest.skipUnless(HAS_WORKER_AUDIO_DEPS, "requires worker audio deps")
     def test_candidate_review_assembly_fails_closed_without_qc(self) -> None:

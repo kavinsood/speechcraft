@@ -21,7 +21,13 @@ def reconstruct_training_text(words: list[dict[str, Any]]) -> str:
     return " ".join(raw_tokens).strip()
 
 
-def assemble_candidate_review_clips(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+def assemble_candidate_review_clips(
+    run_root: Path,
+    config: dict[str, Any],
+    *,
+    artifact_root: Path | None = None,
+) -> dict[str, Any]:
+    destination_root = artifact_root or run_root
     sample_rate = int(config.get("analysis_sample_rate") or 16000)
     min_clip_sec = float(config.get("candidate_min_clip_sec", 3.0))
     target_clip_sec = float(config.get("candidate_target_clip_sec", 8.0))
@@ -45,7 +51,7 @@ def assemble_candidate_review_clips(run_root: Path, config: dict[str, Any]) -> d
     for cutpoint in read_jsonl(cutpoints_path):
         cutpoints_by_buffer.setdefault(str(cutpoint["buffer_id"]), []).append(cutpoint)
 
-    review_dir = resolve_under_root(run_root, "artifacts/candidate_review_clips")
+    review_dir = resolve_under_root(destination_root, "artifacts/candidate_review_clips")
     if review_dir.exists():
         shutil.rmtree(review_dir)
     review_dir.mkdir(parents=True, exist_ok=True)
@@ -162,16 +168,20 @@ def assemble_candidate_review_clips(run_root: Path, config: dict[str, Any]) -> d
 
             clip_id = f"candidate_review_clip_{len(manifest):06d}"
             rel_audio_path = f"artifacts/candidate_review_clips/{clip_id}.wav"
-            clip_path = resolve_under_root(run_root, rel_audio_path)
+            clip_path = resolve_under_root(destination_root, rel_audio_path)
             write_pcm16_mono(clip_path, audio[start_local:end_local], sample_rate)
             duration_samples = end_local - start_local
+            audio_sha256 = sha256_file(clip_path)
+            # Compatibility release: emit both fields with the same value. New code reads
+            # audio_sha256; audio_hash remains a legacy alias until consumers migrate.
             manifest.append(
                 {
                     "id": clip_id,
                     "buffer_id": buffer_id,
                     "source_audio_id": buffer.get("source_audio_id"),
                     "audio_path": rel_audio_path,
-                    "audio_hash": sha256_file(clip_path),
+                    "audio_sha256": audio_sha256,
+                    "audio_hash": audio_sha256,
                     "sample_rate": sample_rate,
                     "start_cutpoint_ref": start["id"],
                     "end_cutpoint_ref": end["id"],
@@ -192,8 +202,8 @@ def assemble_candidate_review_clips(run_root: Path, config: dict[str, Any]) -> d
             )
             start_index = cutpoints.index(end)
 
-    manifest_path = resolve_under_root(run_root, "artifacts/candidate_review_manifest.json")
-    rejected_path = resolve_under_root(run_root, "artifacts/candidate_review_rejected.json")
+    manifest_path = resolve_under_root(destination_root, "artifacts/candidate_review_manifest.json")
+    rejected_path = resolve_under_root(destination_root, "artifacts/candidate_review_rejected.json")
     write_json(manifest_path, manifest)
     write_json(rejected_path, rejected)
     durations = [float(row["duration_sec"]) for row in manifest]
@@ -237,5 +247,5 @@ def assemble_candidate_review_clips(run_root: Path, config: dict[str, Any]) -> d
         },
         "output_dir": "artifacts/candidate_review_clips",
     }
-    write_json(resolve_under_root(run_root, "artifacts/candidate_review_summary.json"), summary)
+    write_json(resolve_under_root(destination_root, "artifacts/candidate_review_summary.json"), summary)
     return summary

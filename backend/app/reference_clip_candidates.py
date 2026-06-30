@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .dataset_runs import get_candidate_review_media_path
+from .dataset_runs import get_candidate_review_media_bytes
 
 REFERENCE_CLIP_CANDIDATES_DIR = "reference-clip-candidates"
 FORBIDDEN_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -75,15 +74,15 @@ def mark_dataset_clip_as_reference_candidate(
     repository.get_project(project_id)
     _get_dataset_run_for_project(repository, project_id, dataset_run_id)
 
-    source_path = get_candidate_review_media_path(repository, dataset_run_id, clip_id)
+    audio_bytes = get_candidate_review_media_bytes(repository, dataset_run_id, clip_id)
     destination_root = reference_clip_candidates_root(repository.media_root, project_id)
     stem = transcript_filename_stem(transcript_text, clip_id)
     destination_path = resolve_unique_wav_path(destination_root, stem)
-    shutil.copy2(source_path, destination_path)
+    destination_path.write_bytes(audio_bytes)
 
     media_root = repository.media_root.resolve()
     relative_path = destination_path.relative_to(media_root).as_posix()
-    source_relative = source_path.relative_to(media_root).as_posix() if source_path.is_relative_to(media_root) else str(source_path)
+    source_relative = f"dataset-runs/{dataset_run_id}/candidate-review/{clip_id}.wav"
     entry = {
         "project_id": project_id,
         "dataset_run_id": dataset_run_id,
