@@ -1,698 +1,407 @@
-Speechcraft Sprint Spec: Overview / Prep, Slicer, QC
-1. Scope and current product flow
-Current happy path
+# Speechcraft Current Pipeline Contract
 
-Ingest -> Overview -> Prep -> Slicer -> QC -> Lab -> Export
+This document replaces the early sprint plan for Overview/Prep, Slicer, QC, and Lab. It describes the current implemented contract after the pipeline phases.
 
-This is the intended flow for this sprint.
+## 1. Current Product Flow
 
-Navigation
+```text
+Ingest -> Overview -> Slicer -> QC -> Lab -> Export
+```
 
-Full backward/forward navigation between stages is not required in this sprint.
-The system may allow limited movement between pages, but “jump anywhere at any time with perfect consistency” is explicitly deferred.
+Reference remains available as a separate route/workstation and is not part of the main sprint path.
 
-Page ownership
+## 2. Page Ownership
 
-Each page owns a different unit of truth:
+Each page owns a different unit of truth.
 
-Overview owns imported raw recordings and preparation configuration
-Slicer owns slicer runs over prepared recordings
-QC owns QC runs and QC results for one slicer run
-Lab owns slice-level manual review/editing
+| Page | Owns | Does Not Own |
+| --- | --- | --- |
+| Ingest | project creation, raw WAV import staging/upload | preparation, slicing, QC, review |
+| Overview | source recordings, preparation, active prepared output, ASR, alignment | slice QC, human review |
+| Slicer | slicer run launch/history/summary/deletion | ASR/alignment, QC scoring, Lab review |
+| QC | QC runs/results for one slicer run | live human review truth |
+| Lab | live slice review/edit state | prep, slicer run creation, QC run creation |
+| Export | downstream dataset output | upstream run generation |
 
-Do not blur these boundaries.
+## 3. Global Rules
 
-2. Global product assumptions for this sprint
-In scope
-.wav import only
-English only
-single-speaker assumption
-no-review fast path
-advanced controls for expert users
-manual review path in Lab
-Out of scope for this sprint
-transcript import
-diarization
-multi-speaker workflows
-multilingual/code-switching
-dataset-size recommendations
-region-level exclusion tools
-recommendation engine telling users what to do
-complex graph interactions
-full cross-stage reversible navigation
-3. Cross-page system rules
-3.1 Originals are immutable
+### Raw Imports Are Immutable
 
-Imported raw audio is never mutated in place.
+Imported WAV files are source truth. Preparation creates derived recordings and does not mutate raw imports.
 
-3.2 Preparation creates derived data
+### Prepared Output Is Explicit
 
-Preparation actions create a new derived dataset copy on disk using the chosen prep settings.
+Preparation creates a derived output group. The project stores the active prepared output group, and Slicer consumes that scope.
 
-3.3 Runs are first-class
+### ASR And Alignment Belong To Overview
 
-Slicer and QC are both run-based.
-No hidden in-place replacement of previous outputs.
+ASR and alignment are source-level preparation jobs over the active prepared output group.
 
-3.4 Human decision is king
+Slicer does not request or fake ASR metadata.
 
-Machine QC may classify, rank, and filter.
-Human review may always override it.
+### Slicer And QC Are Run-Based
 
-3.5 Reviewed/locked material is protected
+Every slicer execution creates a distinct slicer run.
 
-Reviewed and locked slices are preserved and visually separated from machine-QC-only material.
+Every QC execution creates a distinct QC run tied to one slicer run.
 
-3.6 Advanced controls are hidden by default
+### Human Review Wins
 
-Default UX is for the lazy user.
-Power user detail is available but collapsed.
+QC is advisory machine triage. Lab owns live human review state.
 
-3.7 Long-running jobs must be visibly alive
+### Stale State Must Be Visible
 
-For preparation, slicing, QC, and similar operations, the frontend must show:
+Changing upstream preparation/ASR/alignment or slice/audio/transcript basis can stale downstream slicer/QC state.
 
-that a job is running
-what type of job is running
-current status/state
-log output or streamed terminal-style messages
-success/failure completion state
-a clear message when the job finishes
+### Long Jobs Need A Visible Activity Surface
 
-This is mandatory. Silent background jobs are garbage UX.
+Preparation, ASR, alignment, slicing, and QC-style work must show status through job activity UI. The worker must be running for queued jobs to progress.
 
-4. Overview page spec
-4.1 Purpose
+## 4. Ingest Contract
 
-The Overview page is the post-ingest source-level page.
+Current Ingest behavior:
 
-Its job is to answer:
+- project name required
+- native browser file picker
+- `.wav` only
+- multiple files
+- staged selected-file list
+- per-file remove
+- clear all
+- create project and import as one explicit submit action
+- serial upload queue
+- per-file progress
+- clear submit error
+- cleanup project on failed import where possible
 
-what raw audio was imported
-what basic technical properties the dataset has
-what preparation settings will be applied
-whether the dataset is ready to move into slicing
+Implementation rules:
 
-It is not a slice-quality page.
+- do not read audio into browser memory with `FileReader`
+- pass `File` objects directly into `FormData`
+- backend streams `UploadFile` to disk
+- backend validates WAV headers before creating `SourceRecording`
 
-4.2 Unit of truth
+## 5. Overview Contract
 
-The Overview page is recording-centric.
+Overview is recording-centric.
 
-It operates on imported raw recordings, not slices.
+It displays:
 
-4.3 Mandatory displayed stats
+- total duration
+- recording count
+- raw/derived counts
+- sample rates
+- channel counts
+- active prepared output status
+- ASR completion count
+- alignment completion count
 
-For this sprint, Overview must show:
+Warnings include:
 
-total duration
-number of recordings
-sample rate(s)
-channel count(s)
+- empty import
+- mixed sample rates
+- mixed channel counts
+- missing/stale prepared output
+- missing ASR
+- missing alignment
 
-That is the required baseline.
+Overview does not display slice-level quality graphs or human review decisions.
 
-4.4 Warnings/checks
+## 6. Preparation Contract
 
-For this sprint, Overview should support only simple technical warnings, not fake intelligence.
+Preparation controls:
 
-Initial warning set
-mixed sample rates across imported recordings
-mixed channel counts across imported recordings
-no recordings imported
-preparation settings changed but no prepared derivative generated yet
+- target sample rate
+- channel mode
+- channel selection
 
-Do not invent a nonsense “dataset quality score” here.
+Preparation behavior:
 
-4.5 Preparation tools on Overview
+- creates a `PREPROCESS` job
+- worker materializes derived WAV files
+- creates derived `SourceRecording` rows
+- stores parent recording id
+- stores processing recipe metadata
+- updates active prepared output group
+- keeps raw recordings untouched
 
-Preparation tools live on the Overview page.
+The prepared output group becomes the input scope for Slicer.
 
-In-scope preparation actions
-downsampling
-mono/downmix
-channel selection
-Deferred preparation action
-loudness normalization
+## 7. ASR Contract
 
-Loudness normalization is intentionally deferred until the standard and policy are decided.
+Project ASR endpoint:
 
-4.6 Preparation behavior
+- `POST /api/projects/{project_id}/transcription`
 
-Preparation is explicit and user-triggered.
+Scope:
 
-Required interaction
+- active prepared output group only
 
-User:
+UI controls:
 
-chooses prep settings
-clicks a button to run preparation
-system creates a new prepared dataset copy on disk
-Important rule
+- model size: `base`, `small`, `medium`, `large-v3`, `turbo`
+- batch size
+- initial prompt
 
-Preparation must not silently mutate current source files or sneakily modify prior prepared outputs.
+Defaults:
 
-4.7 Preparation output
+- `turbo`
+- batch size `8`
+- English
 
-Preparation produces a derived output dataset suitable for downstream slicing.
+Backend:
 
-This prepared output becomes the input scope for slicer runs.
+- default backend is `faster_whisper`
+- `turbo` maps to `large-v3-turbo`
+- stub ASR requires `SPEECHCRAFT_ALLOW_STUB_ASR=1` and is test-only
 
-4.8 Overview layout requirements
+Output:
 
-The page should include:
+- transcript text artifact
+- transcript JSON artifact
+- word count
+- model/backend metadata
 
-A. Dataset summary section
-total duration
-recording count
-sample rates
-channel counts
-B. Preparation controls section
-target sample rate
-mono/downmix options
-channel selection options
-run prep button
-C. Warning/status section
-mixed sample rate warning
-mixed channel count warning
-stale prep warning
-prep completed state
-D. Job activity section
+Rerunning ASR marks downstream slicer runs stale.
 
-A visible job panel for preparation jobs showing:
+## 8. Alignment Contract
 
-current state
-streamed logs or terminal-style messages
-completion/failure message
-4.9 Overview non-goals
+Project alignment endpoint:
 
-Overview should not show:
+- `POST /api/projects/{project_id}/alignment`
 
-slice-level quality analysis
-QC graphs
-clip acceptance/rejection logic
-transcript quality scoring
-speaker analytics
+Scope:
 
-That belongs later or elsewhere.
+- active prepared output group only
 
-5. Preparation job UX / terminal log panel
+UI controls:
 
-This is shared behavior across Overview, Slicer, and QC.
+- acoustic model
+- text normalization strategy
+- batch size
 
-5.1 Required job feedback UI
+Rules:
 
-Any long-running backend operation must expose a visible frontend activity surface.
+- alignment is blocked until ASR exists
+- alignment is blocked while ASR jobs are pending/running
+- alignment refuses known stub ASR transcript text
+- rerunning alignment marks downstream slicer runs stale
 
-Minimum requirements
-job type label
-running / completed / failed state
-start time
-simple progress state when available
-log output or terminal-like streamed text
-clear completion message
-clear failure message
-5.2 Jobs requiring this treatment
+Output:
 
-At minimum:
+- source-recording alignment artifact
+- alignment summary/metadata
 
-preparation
-slicing
-QC
+## 9. Slicer Contract
 
-Potentially later:
+Slicer input:
 
-export
-model processing jobs
-alignment-related jobs
-5.3 UX rule
+- active prepared output group
+- ASR transcript artifacts
+- alignment artifacts
 
-The user must never wonder whether the app is frozen or whether a job is doing anything.
+Slicer launch is blocked when prepared recordings are not aligned.
 
-That means:
+Visible controls:
 
-spinner alone is not enough
-toast alone is not enough
-silent async polling is not enough
+- target clip length
+- maximum clip length
+- segmentation sensitivity
 
-You need a persistent visible job panel.
+Advanced:
 
-6. Slicer page spec
-6.1 Purpose
+- JSON override object for power users
+- frontend validates that overrides are a JSON object
+- backend validates normalized config
 
-The Slicer page exists to create candidate slices from prepared recordings.
+Run behavior:
 
-It is a run launcher and run summary page, not a manual waveform editing tool.
+- creates a distinct slicer run
+- queues per-recording `SOURCE_SLICING` jobs
+- materializes real `Slice` rows and audio variants
+- stores source-order/provenance metadata
+- shows run history and summary
+- stale runs are visible but constrained for QC handoff
 
-6.2 Unit of truth
+Run deletion:
 
-The Slicer page is run-centric.
+- deletes generated slices and related media/data
+- deletes grouped slicer jobs
+- deletes downstream QC runs/results
+- returns cleanup counts
 
-Each execution creates a distinct slicer run.
+## 10. QC Data Contract
 
-6.3 Slicer input
+QC run endpoint:
 
-Slicer runs over prepared recordings from Overview.
+- `GET /api/projects/{project_id}/qc-runs?slicer_run_id=...`
+- `POST /api/projects/{project_id}/qc-runs`
+- `GET /api/qc-runs/{qc_run_id}`
 
-It should not run over ambiguous or half-applied source state.
+`QCRun` stores:
 
-6.4 Slicer execution model
+- project id
+- slicer run id
+- status
+- threshold config
+- slice population hash
+- transcript basis hash
+- audio basis hash
+- stale state
+- timestamps
 
-Each slicer execution creates a new slicer run.
+`SliceQCResult` stores:
 
-Rules
-prior slicer runs remain available
-slicer runs are not silently overwritten
-a user may rerun slicing with new settings
-reviewed/locked slices remain protected by the existing overlap-preservation mechanism
-6.5 Relationship to existing reviewed/locked slices
+- QC run id
+- slice id
+- aggregate score
+- machine bucket
+- raw metrics
+- reason codes
+- human review status snapshot
+- lock snapshot
 
-When a new slicer run is generated:
+Machine QC state is separate from human review state.
 
-new slices are created
-slices overlapping heavily with locked/accepted material are handled by the existing preservation logic
-locked/reviewed material is not casually destroyed
+## 11. Current QC Scoring
 
-This behavior should be preserved as-is for this sprint.
+Current raw metrics:
 
-6.6 Visible slicer controls
+- `duration_seconds`
+- `word_count`
+- `avg_alignment_confidence`
+- `edge_start_energy`
+- `edge_end_energy`
+- `duration_score`
+- `confidence_score`
+- `transcript_score`
+- `edge_penalty`
+- `flag_penalty`
+- `hard_gate_penalty`
 
-Because defaults reportedly work most of the time, the default UI should be restrained.
+Current reason codes:
 
-Directly visible controls
+- `broken_audio`
+- `near_silence_unusable_clip`
+- `transcript_mismatch`
+- `severe_clipping_corruption`
+- `overlap_second_speaker`
 
-For this sprint, top-level visible controls should be limited to a small core set such as:
+Current scoring formula:
 
-target clip length
-maximum clip length
-one general segmentation sensitivity control
-optional ASR on/off, if applicable in your current backend flow
+```text
+score =
+  duration_score * 0.30
++ confidence_score * 0.30
++ transcript_score * 0.25
++ 0.15
+- edge_penalty
+- flag_penalty
+- hard_gate_penalty
+```
 
-Do not dump every backend parameter in the main view.
+This is heuristic triage, not a learned ML quality model.
 
-6.7 Advanced section
+## 12. QC Page Contract
 
-All other slicer parameters may exist under a collapsed Advanced section.
+QC page shows:
 
-This section is hidden by default.
+- run history for selected slicer run
+- Run QC action
+- keep threshold
+- reject threshold
+- preset
+- visible yield by count
+- visible yield by duration
+- machine bucket counts
+- review snapshot count
+- stale state
+- score histogram
+- source-order timeline strip
+- preview table
+- advanced metrics toggle
+- bucket filter
+- source-order / score sorting
+- Lab handoff
 
-6.8 Presets
+Persisted machine bucket and visible threshold bucket are separate.
 
-Presets are optional in this sprint.
+## 13. Stale QC Contract
 
-Because current defaults already work well in most observed cases, presets are not required to ship this phase.
+QC becomes stale when current basis hashes differ from stored hashes:
 
-6.9 Slicer summary after run
+- slice population
+- transcript basis
+- audio basis
 
-After a slicer run completes, the page should show:
+Stale QC remains viewable. The user is warned to rerun QC before relying on threshold-driven decisions.
 
-slices created
-total sliced duration
-average slice length
-minimum slice length
-maximum slice length
-skipped/failed regions or counts, when available
-whether downstream ASR/QC-relevant data is available
-warnings about suspicious segmentation, if available
-6.10 Job activity section
+## 14. Lab Handoff Contract
 
-The Slicer page must include the same visible job/log panel behavior as Overview.
+QC transfers to Lab:
 
-When slicing is running, the user must see:
+- slicer run id
+- QC run id
+- bucket filter
+- sort mode
+- keep threshold
+- reject threshold
+- preset
 
-that slicing is running
-current run state
-logs/messages
-completion/failure state
-6.11 Transition to QC
+Lab validates that the QC run matches the current project and slicer run. If the handoff is stale/mismatched/missing, Lab falls back to source-order review with a notice.
 
-After slicing completes, the next intended step is QC.
+Lab shows QC context as advisory metadata and keeps live human review status authoritative.
 
-QC is not automatically run.
-The user manually triggers it from the QC page.
+## 15. URL And Selection State
 
-7. QC page spec
-7.1 Purpose
+Run/QC/Lab navigation state is URL-backed where needed:
 
-The QC page is the post-slice triage page.
+- `run`
+- `qc`
+- `bucket`
+- `sort`
+- `keep`
+- `reject`
+- `preset`
 
-Its job is, in this order:
+Project changes clear downstream selection. Slicer run changes clear QC selection and Lab handoff.
 
-macro triage before labeling
-automatic pruning for the fast path
-dataset analytics for the current slicer run
+## 16. Export Contract
 
-That priority order matters.
+Export is the downstream handoff page.
 
-7.2 Unit of truth
+Current state:
 
-QC is tied to one slicer run.
+- backend export preview/run endpoints exist
+- frontend Export page is still mostly a shell
+- final selection policy is not fully productized in the Export UI
 
-Do not mix QC across multiple slicer runs in this sprint.
+It should consume final slice state, not raw QC buckets as if they were human approval.
 
-7.3 Trigger model
+## 17. Current Non-Goals
 
-QC is manually triggered.
+Not currently implemented:
 
-The page may initially show no QC results until the user clicks a button to start QC.
+- diarization-first multi-speaker workflow
+- transcript import as the main path
+- learned QC model
+- SNR/LUFS/clipping-percent/VAD-ratio QC metrics
+- multilingual/code-switching support
+- complex graph brushing/cross-filtering
+- recommendation engine
+- custom file browser
 
-7.4 QC scope
+## 18. Review Checklist
 
-For this sprint, QC operates on:
+When reviewing future changes, check:
 
-current unreviewed slices in the slicer run
-reviewed slices may still be shown, but clearly distinguished visually
-
-Reviewed/locked slices should not be casually modified by QC logic.
-
-7.5 Machine vs human separation
-
-QC results and human review state must remain conceptually separate.
-
-Required rule
-
-Machine QC does not equal human approval.
-
-The UI must make this obvious.
-
-7.6 Mandatory QC outcome buckets
-
-Use these UI-facing names:
-
-Auto-kept
-Needs review
-Auto-rejected
-
-These are the machine triage buckets.
-
-7.7 QC score
-
-There will be one visible aggregate QC score for ranking.
-
-Important rule
-
-This score is for ranking and thresholding.
-It is not the only truth.
-
-Reason codes and raw metrics still matter.
-
-7.8 Raw metrics
-
-Raw metric values should be available in Advanced mode.
-
-Normal users should not be dumped into metric soup by default.
-
-7.9 QC metrics policy
-
-The exact scoring implementation should follow the research-backed composite approach rather than ad hoc nonsense.
-
-Hard-gate classes
-
-Use the final agreed hard failure classes:
-
-transcript mismatch
-overlap / second speaker
-broken audio
-near-silence / unusable clip
-severe clipping / corruption
-Soft-score dimensions
-
-Use the research-recommended multi-signal scoring approach and compute one aggregate score for ranking.
-
-Do not reduce the page to a single opaque magic number with no reason breakdown.
-
-7.10 Thresholding
-
-The QC page must support:
-
-threshold sliders
-presets
-visible dataset yield impact for the current threshold
-Yield display
-
-At minimum, show the user what the current threshold would retain/reject in terms of dataset yield.
-
-7.11 No “worst 20%” shortcut for now
-
-For this sprint, thresholding is score-based.
-Do not add percentile-only pruning flows yet.
-
-7.12 QC page visuals required at launch
-
-Mandatory:
-
-summary cards
-histogram/distribution view
-threshold control
-preview table
-timeline strip
-
-Optional later:
-
-complex graph interactions
-advanced cross-selection behavior
-7.13 Graph interaction behavior
-
-For this sprint, graph selection does nothing special.
-
-The graphs are view/analysis surfaces, not full interactive selection tools yet.
-
-Good. Keep it simple.
-
-7.14 Preview table
-
-The QC page includes a preview table showing slices and their QC-related information.
-
-This supports the fast path and manual inspection before entering Lab.
-
-7.15 Reviewed slice visibility
-
-Reviewed slices may appear on the QC page, but must be visually distinguished from unreviewed/machine-triaged slices.
-
-A different color treatment is acceptable.
-
-7.16 QC actions
-
-The page should support these actions:
-
-run QC
-adjust threshold
-view retained/rejected yield
-send relevant slices to Lab with transferred filters/sort
-rerun QC for the same slicer run
-7.17 Recovery / reset behavior
-
-Keep this simple.
-
-For this sprint:
-
-allow reset to the QC run’s current threshold/default state
-allow rerun QC
-do not build a huge undo system
-
-QC is classification/filter state, not destructive deletion.
-
-8. QC data/state contract
-
-You said “whatever seems best.” Fine. This is what seems best.
-
-8.1 First-class backend objects required
-
-QC needs persisted backend truth.
-
-At minimum:
-
-A. QC Run
-
-Stores:
-
-qc run id
-slicer run id
-created time
-status
-threshold/preset configuration used
-B. Per-slice QC Result
-
-Stores per slice:
-
-slice id
-qc run id
-aggregate score
-raw metric values
-bucket
-reason codes
-reviewed/locked visibility context if needed
-
-This is the minimum sane substrate.
-
-8.2 Why this must exist
-
-Without stored QC run data:
-
-the QC page is not reproducible
-thresholds are not auditable
-results drift into frontend-only lies
-Lab handoff becomes vague garbage
-
-So no, this should not be “just tags in memory.”
-
-8.3 Relationship to human review
-
-Human review remains separate.
-
-Required rule
-
-A human review action may override machine QC outcome.
-
-Final authority
-
-Human action is king.
-
-9. QC stale-state policy
-
-You did not answer this, so here is the minimal correct policy.
-
-9.1 QC becomes stale when
-
-A QC run should be marked stale if:
-
-the slicer run changes
-the slice population changes
-slices are regenerated for that run
-a slice’s active audio basis changes in a way that invalidates QC assumptions
-transcript changes invalidate QC-relevant scoring inputs
-9.2 UI behavior for stale QC
-
-For this sprint:
-
-show a stale badge/state
-allow viewing old QC results
-require rerun before applying fresh QC threshold decisions
-
-Cheap, simple, sane.
-
-10. Lab handoff from QC
-10.1 Purpose
-
-QC must hand off machine-triaged context into Lab.
-
-10.2 Automatically transferred state
-
-When opening Lab from QC, transfer:
-
-selected QC bucket filters
-selected sort order
-current threshold context
-10.3 Default sort behavior
-
-Absent QC-driven sorting/filtering, Lab retains source order as default.
-
-10.4 Tags and slice metadata
-
-QC-related tags/state should be visible in Lab through existing slice tag/state display.
-
-10.5 Human override in Lab
-
-Lab must allow:
-
-restoring machine-rejected slices
-reviewing machine-kept slices
-overriding QC classification through human action
-
-Human decision overrides QC.
-
-11. Fast-path user flow
-
-This is the no-brains path.
-
-11.1 Minimal fast-path flow
-ingest wav(s)
-inspect Overview briefly
-confirm sample rate/channel setup
-run preparation if needed
-run slicer with defaults
-open QC
-run QC
-adjust threshold
-export using auto-selected result set
-
-That is the dumb-user path.
-
-11.2 No recommendation engine yet
-
-The app does not yet need to tell the user whether their dataset is “good enough” or what model size requirements imply.
-
-That is explicitly deferred.
-
-11.3 No aggressive guardrails yet
-
-If users make bad threshold choices, the system does not yet need to nanny them beyond showing yield.
-
-That is also deferred.
-
-12. Logging / activity UX spec
-
-This needs to be explicit because otherwise the agent will half-ass it.
-
-12.1 Shared component
-
-There should be a reusable job activity panel component used across pages.
-
-12.2 Behavior
-
-For any active long-running job, show:
-
-job name/type
-current state
-running indicator
-log stream / terminal-style output
-success message on completion
-failure message on error
-12.3 Placement
-
-Each relevant page should surface its own active job panel in a clearly visible area.
-
-No hidden modal nonsense.
-
-12.4 History
-
-Nice-to-have, but not required in this sprint:
-
-prior job log history per page
-
-Current requirement is only live visibility plus completion/failure messaging.
-
-13. Explicit non-goals for this sprint
-
-Do not let the agent invent these:
-
-transcript import workflow
-diarization workflows
-speaker selection flows
-region-level timeline mass actions
-complex graph brushing/linking behavior
-automatic dataset recommendations
-loudness normalization implementation
-multilingual handling
-small-dataset warnings
-percentile pruning workflow
-full backward/forward cross-stage navigation support
-giant undo system for QC
-14. Final naming for UI
-
-Use these page names:
-
-Overview
-Slicer
-QC
-Lab
-
-Keep it simple. Don’t get cute.
-
-Use these QC bucket labels in UI:
-
-Auto-kept
-Needs review
-Auto-rejected
-
-Internal enum names can be stricter if needed.
+- raw source files are not mutated
+- prepared output group is explicit
+- Slicer does not own ASR/alignment
+- Slicer runs are distinct and deletable
+- QC runs are tied to one slicer run
+- machine buckets are separate from human state
+- stale state is surfaced
+- Lab handoff carries complete filter/sort/threshold context
+- Lab human actions remain authoritative
+- long-running work is queued and visible

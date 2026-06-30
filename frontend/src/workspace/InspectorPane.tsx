@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import type { ClipLabItem, ExportRun, ReferenceAssetSummary, ReviewStatus } from "../types";
+import type { ClipLabItem, DatasetRun, ExportRun, ReferenceAssetSummary, ReviewStatus } from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatDurationCompact,
@@ -23,6 +23,9 @@ type InspectorPaneProps = {
   workspacePhase: WorkspacePhase;
   workspaceError: string | null;
   activeClip: ClipLabItem | null;
+  datasetRuns: DatasetRun[];
+  selectedDatasetRunId: string | null;
+  onDatasetRunChange: (runId: string) => void;
   totalClipCount: number;
   totalDurationSeconds: number;
   datasetStatusCounts: {
@@ -42,10 +45,17 @@ type InspectorPaneProps = {
   isSavingReference: boolean;
 };
 
+function formatDatasetRunStage(stage: string): string {
+  return stage.replace(/_/g, " ");
+}
+
 export default function InspectorPane({
   workspacePhase,
   workspaceError,
   activeClip,
+  datasetRuns,
+  selectedDatasetRunId,
+  onDatasetRunChange,
   totalClipCount,
   totalDurationSeconds,
   datasetStatusCounts,
@@ -82,6 +92,49 @@ export default function InspectorPane({
     setReferenceMoodLabel("");
   }
 
+  function renderDatasetRunPicker() {
+    if (datasetRuns.length === 0) {
+      return (
+        <section className="inspector-block lab-run-block">
+          <p className="eyebrow">Dataset run</p>
+          <p className="muted-copy">
+            No dataset run with candidate clips yet. Complete Processing and Slicer, then return to Clip Lab.
+          </p>
+        </section>
+      );
+    }
+
+    if (!selectedDatasetRunId) {
+      return (
+        <section className="inspector-block lab-run-block">
+          <p className="eyebrow">Dataset run</p>
+          <p className="muted-copy">Select a dataset run to review its candidate clips.</p>
+        </section>
+      );
+    }
+
+    return (
+      <section className="inspector-block lab-run-block">
+        <label className="lab-run-select-row">
+          <span className="eyebrow">Dataset run</span>
+          <select
+            aria-label="Dataset run"
+            className="lab-run-select"
+            value={selectedDatasetRunId}
+            onChange={(event) => onDatasetRunChange(event.target.value)}
+          >
+            {datasetRuns.map((run) => (
+              <option key={run.id} value={run.id}>
+                {run.id} · {run.status} · {formatDatasetRunStage(run.stage)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="muted-copy">Reviewing candidate clips from the selected dataset run.</p>
+      </section>
+    );
+  }
+
   return (
     <aside className="inspector-column panel">
       <div className="panel-header">
@@ -100,7 +153,10 @@ export default function InspectorPane({
           actionLabel="Retry load"
           onAction={onRetryLoad}
         />
-      ) : activeClip ? (
+      ) : workspacePhase === "ready" ? (
+        <>
+          {!activeClip ? renderDatasetRunPicker() : null}
+          {activeClip ? (
         <>
           <section className="inspector-block">
             <h3>Tags</h3>
@@ -116,19 +172,15 @@ export default function InspectorPane({
                     {statusLabels[status]}
                   </button>
                 ))}
+                {activeClip.tags.map((tag) => (
+                  <span key={tag.id} className="status-button">
+                    {tag.name}
+                  </span>
+                ))}
               </div>
             ) : (
               <p className="muted-copy">Status controls are unavailable for this Clip Lab item.</p>
             )}
-            <div className="tag-list">
-              {activeClip.tags.length > 0 ? (
-                activeClip.tags.map((tag) => (
-                  <span key={tag.id} className="tag-pill" style={{ backgroundColor: tag.color }}>
-                    {tag.name}
-                  </span>
-                ))
-              ) : null}
-            </div>
           </section>
 
           <section className="inspector-block">
@@ -175,6 +227,8 @@ export default function InspectorPane({
               </div>
             </div>
           </section>
+
+          {renderDatasetRunPicker()}
 
           <section className="inspector-block">
             <h3>Waveform EDL</h3>
@@ -386,10 +440,12 @@ export default function InspectorPane({
             </dl>
           </section>
         </>
+          ) : (
+            <div className="empty-state">No Clip Lab item selected.</div>
+          )}
+        </>
       ) : (
-        <div className="empty-state">
-          {workspacePhase === "empty" ? "No project selected." : "No Clip Lab item selected."}
-        </div>
+        <div className="empty-state">No project selected.</div>
       )}
     </aside>
   );

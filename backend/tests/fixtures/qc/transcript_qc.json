@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "stage": "transcript_qc",
+  "clips": [
+    {
+      "clip_id": "candidate_review_clip_000001",
+      "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000001.wav",
+      "transcript_match_score": 87,
+      "transcript_score_method": "min_meaningful_ctc_span",
+      "ctc_min_span_score": 0.87,
+      "weak_spans": [
+        {
+          "start_sec": 2.1,
+          "end_sec": 2.8,
+          "text": "that's what",
+          "score": 0.87
+        }
+      ],
+      "reason_codes": []
+    },
+    {
+      "clip_id": "candidate_review_clip_000002",
+      "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000002.wav",
+      "transcript_match_score": 52,
+      "transcript_score_method": "min_meaningful_ctc_span",
+      "ctc_min_span_score": 0.52,
+      "weak_spans": [],
+      "reason_codes": ["low_transcript_match", "weak_transcript_span"]
+    },
+    {
+      "clip_id": "candidate_review_clip_000003",
+      "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000003.wav",
+      "transcript_match_score": 91,
+      "transcript_score_method": "min_meaningful_ctc_span",
+      "ctc_min_span_score": 0.91,
+      "weak_spans": [],
+      "reason_codes": []
+    }
+  ]
+}

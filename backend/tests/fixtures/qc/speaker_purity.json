@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "stage": "speaker_purity",
+  "clips": [
+    {
+      "clip_id": "candidate_review_clip_000001",
+      "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000001.wav",
+      "speaker_check_score": 74,
+      "speaker_score_method": "min_valid_window_similarity",
+      "min_window_similarity": 0.74,
+      "mean_window_similarity": 0.86,
+      "p10_window_similarity": 0.78,
+      "scored_window_count": 8,
+      "suspicious_spans": [
+        {
+          "start_sec": 2.5,
+          "end_sec": 5.5,
+          "similarity": 0.74
+        }
+      ],
+      "reason_codes": []
+    },
+    {
+      "clip_id": "candidate_review_clip_000002",
+      "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000002.wav",
+      "speaker_check_score": 82,
+      "speaker_score_method": "min_valid_window_similarity",
+      "min_window_similarity": 0.82,
+      "mean_window_similarity": 0.9,
+      "p10_window_similarity": 0.85,
+      "scored_window_count": 7,
+      "suspicious_spans": [],
+      "reason_codes": []
+    },
+    {
+      "clip_id": "candidate_review_clip_000003",
+      "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000003.wav",
+      "speaker_check_score": 43,
+      "speaker_score_method": "min_valid_window_similarity",
+      "min_window_similarity": 0.43,
+      "mean_window_similarity": 0.71,
+      "p10_window_similarity": 0.49,
+      "scored_window_count": 7,
+      "suspicious_spans": [
+        {
+          "start_sec": 2.0,
+          "end_sec": 5.0,
+          "similarity": 0.43
+        }
+      ],
+      "reason_codes": ["low_speaker_similarity_window", "possible_other_speaker_or_voice_shift"]
+    }
+  ]
+}

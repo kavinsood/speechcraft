@@ -1,160 +1,218 @@
-# Dataset Overview
+# Ingest And Overview
 
-## What the Overview page is
+## Purpose
 
-The **Overview** page is the first real dataset page after ingest.
+Ingest and Overview are the source-recording side of Speechcraft.
 
-Its job is to help a user understand the raw recordings they imported, choose preparation settings, and decide whether the dataset is ready to move into slicing.
+They answer:
 
-It is a **recording-centric** page.
-It is not a slice review page.
-It is not a QC page.
-It is not a transcript quality page.
+1. What project is being created?
+2. Which raw `.wav` files were imported?
+3. What technical shape does the dataset have?
+4. Which prepared output should downstream stages use?
+5. Do prepared recordings have ASR and alignment artifacts?
 
-The Overview page answers four basic questions:
+Overview is not a QC page and not a slice-review page.
 
-1. **What raw audio is in this dataset?**
-2. **What basic technical properties does it have?**
-3. **What preparation settings will be applied before slicing?**
-4. **Is the dataset ready to move into the next stage?**
+## Ingest
 
-## What unit of truth it owns
+The current Ingest page is the front door for new projects.
 
-For this sprint, the Overview page owns:
-- imported raw recordings
-- source-level technical dataset state
-- preparation configuration
-- preparation job status
+It provides:
 
-It does **not** own:
-- slices
-- slice-level QC
-- clip acceptance/rejection decisions
-- machine review buckets
-- manual review state
+- project-name input
+- native `.wav` file picker
+- staged file list
+- per-file remove action
+- clear-all action
+- serial upload progress
+- clear validation and submit errors
 
-That separation is deliberate.
+Project creation and import are presented as one explicit user action: **Create project and import**.
 
-## What the user sees on the Overview page
+The backend currently uses separate project creation and per-file upload endpoints, but the frontend treats the flow as one operation and deletes the project on import failure when cleanup is possible.
 
-## 1. Dataset summary
+## Upload Rules
 
-The page should show the basic technical shape of the imported dataset.
+Current import behavior:
 
-For this sprint, the required summary information is:
+- `.wav` only
+- files are passed as `File` objects into `FormData`
+- frontend does not read audio into memory with `FileReader`
+- uploads are serial for predictable cleanup behavior
+- backend streams `UploadFile` to disk
+- backend validates WAV headers before creating `SourceRecording`
+- failed imports clean up written files where possible
+
+Raw imported recordings become immutable source material.
+
+## Overview Unit Of Truth
+
+Overview owns recording-level state:
+
+- raw imported recordings
+- derived prepared recordings
+- active prepared output group
+- source-level technical warnings
+- preparation settings
+- ASR settings
+- alignment settings
+- prep/ASR/alignment job status
+
+Overview does not own:
+
+- slicer runs
+- QC runs
+- slice acceptance/rejection
+- Lab human review
+
+## Dataset Summary
+
+Overview shows:
+
 - total duration
-- number of recordings
-- sample rate(s)
-- channel count(s)
+- recording count
+- sample-rate set
+- channel-count set
+- raw recording count
+- prepared recording count
+- active prepared output status
 
-This is the minimum sane snapshot of the dataset.
+Warnings are intentionally basic and deterministic:
 
-The goal is not to pretend to do smart analysis here.
-The goal is to give the user a clear source-level inventory.
-
-## 2. Technical warnings
-
-Overview should support simple, honest technical warnings.
-
-For this sprint, the initial warning set is:
-- mixed sample rates across imported recordings
-- mixed channel counts across imported recordings
 - no recordings imported
-- preparation settings changed but no prepared derivative has been generated yet
+- mixed sample rates
+- mixed channel counts
+- stale or missing prepared output for current settings
+- missing ASR
+- missing alignment
 
-These warnings are practical and deterministic.
+Overview should not invent a global “dataset quality score.”
 
-Overview should **not** invent a fake “dataset quality score.”
-That belongs later, after slicing, on the QC page.
+## Preparation
 
-## 3. Preparation controls
+Preparation creates derived `SourceRecording` rows from raw recordings.
 
-Preparation tools live on the Overview page.
+Current controls:
 
-For this sprint, the in-scope preparation actions are:
-- downsampling
-- mono/downmix
+- target sample rate
+- channel mode
 - channel selection
 
-Loudness normalization is intentionally deferred for now.
+Current behavior:
 
-Preparation is a dataset-level source operation.
-It exists to create a prepared dataset copy suitable for downstream slicing.
+- creates a `PREPROCESS` `ProcessingJob`
+- worker materializes derived WAVs
+- derived rows point back to raw parents
+- recipe metadata records settings, job id, source id, and output group
+- project stores the active prepared output group
+- source files are not mutated
 
-## How preparation works
+Preparation uses backend media management and cleanup rules so failed runs do not intentionally leave unmanaged database truth.
 
-Preparation is explicit and user-triggered.
+## Active Prepared Output
 
-The intended interaction is:
-- user chooses preparation settings
-- user clicks a button to run preparation
-- the system creates a new prepared dataset copy on disk
-- that prepared output becomes the input scope for slicer runs
+The active prepared output group is the downstream input scope.
 
-Important rule:
+Slicer runs use this active group rather than guessing from “latest-looking” recordings. Re-running preparation creates another derived group and can change the active prepared group.
 
-**Preparation must not silently mutate raw imported files.**
+This rule prevents downstream pages from mixing raw recordings, old prepared outputs, and new prepared outputs.
 
-Original audio stays immutable.
-Preparation produces a derived output.
+## ASR
 
-## Job visibility on Overview
+ASR is an Overview preparation action.
 
-Preparation can take time, so the Overview page must visibly show job activity.
+It runs over every recording in the active prepared output group.
 
-For this sprint, preparation jobs must have a visible activity surface showing:
-- job type
-- running / completed / failed state
-- start time
-- simple progress state when available
-- log output or terminal-style streamed text
-- clear completion message
-- clear failure message
+Current ASR controls:
 
-A spinner alone is not enough.
-A toast alone is not enough.
-Silent polling is not enough.
+- model size: `base`, `small`, `medium`, `large-v3`, `turbo`
+- batch size
+- optional initial prompt
 
-The user must never wonder whether the app is frozen.
+Current defaults:
 
-## What the Overview page is not
+- model size: `turbo`
+- batch size: `8`
+- language: English
 
-The Overview page is not where the user should see:
-- slice-level quality analysis
-- QC graphs
-- clip acceptance/rejection logic
-- transcript quality scoring
-- speaker analytics
+The backend uses faster-whisper by default. `turbo` maps to `large-v3-turbo`.
 
-Those belong to later stages.
+The stub backend is disabled unless `SPEECHCRAFT_ALLOW_STUB_ASR=1` is explicitly set for tests.
 
-Overview is about the state of the **raw imported dataset** and the **preparation settings** that will shape the input to slicing.
+ASR writes source-recording transcript artifacts:
 
-## What happens after Overview
+- transcript text
+- transcript JSON
+- model/backend metadata
+- word count
 
-Once the user has:
-- imported recordings
-- checked the source-level stats
-- reviewed warnings
-- applied preparation if needed
+## Alignment
 
-then the next intended stage is:
+Alignment is also an Overview preparation action.
 
-**Slicer**
+It runs over the active prepared output group after ASR has completed.
 
-The prepared dataset becomes the input for slicer runs.
+Current alignment controls:
 
-## Why this page exists
+- acoustic model
+- text normalization strategy
+- batch size
 
-Without an Overview page, ingest is just a file drop and the user has no clear idea:
-- what was imported
-- whether the dataset is technically consistent
-- whether preparation is needed
-- whether the system is ready to slice
+Current behavior:
 
-Overview gives the user a clean source-level checkpoint before the workflow becomes slice-based.
+- alignment is blocked while ASR jobs are pending/running
+- alignment is blocked if prepared recordings lack transcripts
+- alignment writes source-recording alignment artifacts
+- alignment refuses known stub ASR transcript text
 
-## In one sentence
+The default alignment backend is the current torchaudio forced-align worker path.
 
-The Overview page is the source-level dataset page where the user inspects imported recordings, sees basic technical warnings, chooses preparation settings, runs preparation jobs, and confirms the dataset is ready for slicing.
+## Downstream Invalidations
 
+Rerunning ASR or alignment marks downstream slicer runs stale for affected recordings.
+
+That is required because changing transcript or word timing invalidates slice boundaries and QC assumptions.
+
+## Job Activity
+
+Overview uses a reusable job activity panel and a batch-aware source job surface.
+
+It can show:
+
+- preparation jobs
+- ASR batch progress
+- alignment batch progress
+- queued/running/completed/failed states
+- logs or terminal-style messages
+
+If jobs stay queued, the processing worker is probably not running.
+
+Use:
+
+```bash
+make dev-backend
+```
+
+or:
+
+```bash
+make dev-worker
+```
+
+## What Happens Next
+
+Once a project has:
+
+- imported raw WAVs
+- a prepared output group
+- ASR artifacts
+- alignment artifacts
+
+the next stage is Slicer.
+
+Slicer refuses to launch on prepared recordings that do not have alignment artifacts.
+
+## One Sentence
+
+Ingest creates projects and imports raw WAV files; Overview turns those raw recordings into explicit prepared outputs, generates ASR/alignment artifacts, and exposes the source-level readiness state required before slicing.

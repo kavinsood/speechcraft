@@ -1,11 +1,35 @@
 import type {
   ClipLabItem,
+  DatasetClipLabClipRow,
+  DatasetClipLabAudioOperationRequest,
+  DatasetClipLabAudioStackRequest,
+  DatasetClipLabPatchRequest,
+  DatasetClipLabView,
+  DatasetWaveformPeaksPayload,
+  DatasetPreflight,
+  DatasetExportResults,
+  DatasetQcFinalizeRequest,
+  DatasetQcFinalizeResponse,
+  DatasetQcPayload,
+  DatasetSpeakerResults,
+  DatasetRun,
+  DatasetRunCreateRequest,
+  DatasetRunLog,
+  DatasetSpeakerSelection,
+  DatasetSlicerResults,
   ExportPreview,
   ExportRun,
   ImportBatch,
   MediaCleanupResult,
+  ProjectAlignmentSettings,
+  PreparationSettings,
+  ProjectRecordingJobsRun,
+  ProjectPreparationRun,
+  ProjectTranscriptionSettings,
+  ProcessingJob,
   ReferenceAssetDetail,
   ReferenceAssetSummary,
+  ReferenceClipCandidate,
   ReferenceCandidate,
   ReferenceRunRerankResponse,
   ReferenceRun,
@@ -17,7 +41,7 @@ import type {
   WaveformPeaks,
 } from "./types";
 
-export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8010";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -29,6 +53,23 @@ export class ApiError extends Error {
     this.status = status;
     this.url = url;
   }
+}
+
+function backendUnreachableMessage(): string {
+  return `Backend API is unreachable at ${API_BASE}. Restart make dev-backend, then refresh.`;
+}
+
+async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(input, init);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new ApiError(backendUnreachableMessage(), 0, input);
+    }
+    throw error;
+  }
+  return await parseJson<T>(response);
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
@@ -83,18 +124,75 @@ export function buildReferenceCandidateAudioUrl(runId: string, candidateId: stri
 }
 
 export async function fetchHealthStrict(): Promise<{ status: string }> {
-  const response = await fetch(`${API_BASE}/healthz`);
-  return await parseJson<{ status: string }>(response);
+  return await requestJson<{ status: string }>(`${API_BASE}/healthz`);
 }
 
 export async function fetchProjects(): Promise<ImportBatch[]> {
-  const response = await fetch(`${API_BASE}/api/projects`);
-  return await parseJson<ImportBatch[]>(response);
+  return await requestJson<ImportBatch[]>(`${API_BASE}/api/projects`);
 }
 
 export async function fetchProject(projectId: string): Promise<ImportBatch> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}`);
-  return await parseJson<ImportBatch>(response);
+  return await requestJson<ImportBatch>(`${API_BASE}/api/projects/${projectId}`);
+}
+
+export async function createImportBatch(payload: { id: string; name: string }): Promise<ImportBatch> {
+  return await requestJson<ImportBatch>(`${API_BASE}/api/import-batches`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteProject(
+  projectId: string,
+): Promise<{ project_id: string; deleted_file_count: number }> {
+  return await requestJson<{ project_id: string; deleted_file_count: number }>(`${API_BASE}/api/projects/${projectId}`, {
+    method: "DELETE",
+  });
+}
+
+export function uploadProjectSourceRecording(
+  projectId: string,
+  file: File,
+  onProgress: (progress: number) => void,
+): Promise<SourceRecording> {
+  const url = `${API_BASE}/api/projects/${projectId}/source-recordings/upload`;
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", url);
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable || event.total <= 0) {
+        return;
+      }
+      onProgress(Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100))));
+    };
+    request.onload = () => {
+      let payload: unknown = null;
+      try {
+        payload = request.responseText ? JSON.parse(request.responseText) : null;
+      } catch {
+        payload = null;
+      }
+      if (request.status >= 200 && request.status < 300 && payload) {
+        onProgress(100);
+        resolve(payload as SourceRecording);
+        return;
+      }
+      const message =
+        payload && typeof payload === "object" && "detail" in payload
+          ? String((payload as { detail?: unknown }).detail)
+          : `Upload failed: ${request.status}`;
+      reject(new ApiError(message, request.status, url));
+    };
+    request.onerror = () => {
+      reject(new ApiError("Upload failed before the server responded.", request.status || 0, url));
+    };
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    request.send(formData);
+  });
 }
 
 export async function fetchProjectSlices(projectId: string): Promise<SliceSummary[]> {
@@ -103,8 +201,211 @@ export async function fetchProjectSlices(projectId: string): Promise<SliceSummar
 }
 
 export async function fetchProjectSourceRecordings(projectId: string): Promise<SourceRecording[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/source-recordings`);
-  return await parseJson<SourceRecording[]>(response);
+  return await requestJson<SourceRecording[]>(`${API_BASE}/api/projects/${projectId}/source-recordings`);
+}
+
+export async function fetchDatasetPreflight(options?: {
+  artifactRoot?: string;
+  asrModel?: string;
+  asrModelPath?: string;
+  asrCacheDir?: string;
+  asrDevice?: string;
+  asrComputeType?: string;
+}): Promise<DatasetPreflight> {
+  const url = new URL(`${API_BASE}/api/system/preflight`);
+  if (options?.artifactRoot) url.searchParams.set("artifact_root", options.artifactRoot);
+  if (options?.asrModel) url.searchParams.set("asr_model", options.asrModel);
+  if (options?.asrModelPath) url.searchParams.set("asr_model_path", options.asrModelPath);
+  if (options?.asrCacheDir) url.searchParams.set("asr_cache_dir", options.asrCacheDir);
+  if (options?.asrDevice) url.searchParams.set("asr_device", options.asrDevice);
+  if (options?.asrComputeType) url.searchParams.set("asr_compute_type", options.asrComputeType);
+  return await requestJson<DatasetPreflight>(url.toString());
+}
+
+export async function fetchProjectDatasetRuns(projectId: string): Promise<DatasetRun[]> {
+  return await requestJson<DatasetRun[]>(`${API_BASE}/api/projects/${projectId}/dataset-runs`);
+}
+
+export async function createProjectDatasetRun(
+  projectId: string,
+  payload: DatasetRunCreateRequest,
+): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/projects/${projectId}/dataset-runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function startDatasetRun(runId: string): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/start`, { method: "POST" });
+}
+
+export async function refreshDatasetRun(runId: string): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/refresh`, { method: "POST" });
+}
+
+export async function fetchDatasetRunLog(runId: string): Promise<DatasetRunLog> {
+  return await requestJson<DatasetRunLog>(`${API_BASE}/api/dataset-runs/${runId}/log`);
+}
+
+export async function fetchDatasetSpeakerResults(runId: string): Promise<DatasetSpeakerResults> {
+  return await requestJson<DatasetSpeakerResults>(`${API_BASE}/api/dataset-runs/${runId}/speakers`);
+}
+
+export async function saveDatasetSpeakerSelection(
+  runId: string,
+  targetSpeakerId: string,
+): Promise<DatasetSpeakerSelection> {
+  return await requestJson<DatasetSpeakerSelection>(`${API_BASE}/api/dataset-runs/${runId}/speaker-selection`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_speaker_id: targetSpeakerId }),
+  });
+}
+
+export async function resumeDatasetRunProcessing(
+  runId: string,
+  stopAfter: "buffers" | "normalization" | "mfa" | "alignment_qc" = "alignment_qc",
+): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/resume-processing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stop_after: stopAfter }),
+  });
+}
+
+export async function rerunDatasetSlicer(runId: string, config: Record<string, unknown>): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/slicer-rerun`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+}
+
+export async function fetchDatasetSlicerResults(runId: string): Promise<DatasetSlicerResults> {
+  return await requestJson<DatasetSlicerResults>(`${API_BASE}/api/dataset-runs/${runId}/slicer-results`);
+}
+
+export async function rerunDatasetNativeExport(runId: string, config: Record<string, unknown> = {}): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/export-rerun`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+}
+
+export async function fetchDatasetExportResults(runId: string): Promise<DatasetExportResults> {
+  return await requestJson<DatasetExportResults>(`${API_BASE}/api/dataset-runs/${runId}/export-results`);
+}
+
+export async function fetchDatasetQc(runId: string): Promise<DatasetQcPayload> {
+  return await requestJson<DatasetQcPayload>(`${API_BASE}/api/dataset-runs/${runId}/qc`);
+}
+
+export async function fetchDatasetClipLab(runId: string): Promise<DatasetClipLabView> {
+  return await requestJson<DatasetClipLabView>(`${API_BASE}/api/dataset-runs/${runId}/clip-lab`);
+}
+
+export async function patchDatasetClipLabClip(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabPatchRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/clip-lab`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function appendDatasetAudioOperation(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabAudioOperationRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/audio/operations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function undoDatasetAudioOperation(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabAudioStackRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/audio/undo`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function redoDatasetAudioOperation(
+  runId: string,
+  clipId: string,
+  payload: DatasetClipLabAudioStackRequest,
+): Promise<DatasetClipLabClipRow> {
+  return await requestJson<DatasetClipLabClipRow>(
+    `${API_BASE}/api/dataset-runs/${runId}/clips/${encodeURIComponent(clipId)}/audio/redo`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function fetchDatasetClipLabWaveformPeaks(
+  peaksPath: string,
+): Promise<DatasetWaveformPeaksPayload> {
+  const url = peaksPath.startsWith("http") ? peaksPath : `${API_BASE}${peaksPath}`;
+  return await requestJson<DatasetWaveformPeaksPayload>(url);
+}
+
+export async function finalizeDatasetQc(
+  runId: string,
+  payload: DatasetQcFinalizeRequest,
+): Promise<DatasetQcFinalizeResponse> {
+  return await requestJson<DatasetQcFinalizeResponse>(`${API_BASE}/api/dataset-runs/${runId}/qc/finalize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function generateDatasetQcScores(
+  runId: string,
+  options?: { force?: boolean },
+): Promise<DatasetRun> {
+  return await requestJson<DatasetRun>(`${API_BASE}/api/dataset-runs/${runId}/qc/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force: options?.force ?? false }),
+  });
+}
+
+export function buildCandidateReviewAudioUrl(runId: string, clipId: string): string {
+  return `${API_BASE}/media/dataset-runs/${runId}/candidate-review/${clipId}.wav`;
+}
+
+export function buildNativeExportAudioUrl(runId: string, clipId: string): string {
+  return `${API_BASE}/media/dataset-runs/${runId}/native-export/${clipId}.wav`;
+}
+
+export function buildSpeakerSampleAudioUrl(runId: string, sampleId: string): string {
+  return `${API_BASE}/media/dataset-runs/${runId}/speaker-samples/${sampleId}.wav`;
 }
 
 export async function fetchProjectReferenceAssets(
@@ -191,6 +492,58 @@ export async function fetchReferenceAsset(assetId: string): Promise<ReferenceAss
 export async function fetchProjectRecordings(projectId: string): Promise<SourceRecordingQueue[]> {
   const response = await fetch(`${API_BASE}/api/projects/${projectId}/recordings`);
   return await parseJson<SourceRecordingQueue[]>(response);
+}
+
+export async function runProjectTranscription(
+  projectId: string,
+  settings: ProjectTranscriptionSettings,
+): Promise<ProjectRecordingJobsRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/transcription`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return await parseJson<ProjectRecordingJobsRun>(response);
+}
+
+export async function runProjectAlignment(
+  projectId: string,
+  settings: ProjectAlignmentSettings,
+): Promise<ProjectRecordingJobsRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/alignment`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return await parseJson<ProjectRecordingJobsRun>(response);
+}
+
+export async function runProjectPreparation(
+  projectId: string,
+  settings: PreparationSettings,
+): Promise<ProjectPreparationRun> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/preparation`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+  return await parseJson<ProjectPreparationRun>(response);
+}
+
+export async function fetchProjectPreparationJobs(projectId: string): Promise<ProcessingJob[]> {
+  const response = await fetch(`${API_BASE}/api/projects/${projectId}/preparation-jobs`);
+  return await parseJson<ProcessingJob[]>(response);
+}
+
+export async function fetchProcessingJob(jobId: string): Promise<ProcessingJob> {
+  const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+  return await parseJson<ProcessingJob>(response);
 }
 
 export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
@@ -370,6 +723,22 @@ export async function fetchClipLabWaveformPeaks(
 ): Promise<WaveformPeaks> {
   const response = await fetch(`${API_BASE}/api/slices/${sliceId}/waveform-peaks?bins=${bins}`);
   return await parseJson<WaveformPeaks>(response);
+}
+
+export async function markDatasetClipAsReferenceCandidate(
+  projectId: string,
+  datasetRunId: string,
+  payload: { clip_id: string; transcript_text: string },
+): Promise<ReferenceClipCandidate> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${projectId}/dataset-runs/${datasetRunId}/reference-clip-candidates`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  return await parseJson<ReferenceClipCandidate>(response);
 }
 
 export async function saveCurrentSliceAsReference(payload: {

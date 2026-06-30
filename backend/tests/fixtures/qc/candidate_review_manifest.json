@@ -1,0 +1,54 @@
+[
+  {
+    "id": "candidate_review_clip_000001",
+    "buffer_id": "buffer_000001",
+    "source_audio_id": "source_0",
+    "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000001.wav",
+    "duration_sec": 5.5,
+    "training_text": "I don't think that's what happened.",
+    "alignment_text": "I DON'T THINK THAT'S WHAT HAPPENED",
+    "word_ids": ["w1", "w2"],
+    "needs_review": false,
+    "review_reason_codes": [],
+    "status": "candidate_review"
+  },
+  {
+    "id": "candidate_review_clip_000002",
+    "buffer_id": "buffer_000002",
+    "source_audio_id": "source_0",
+    "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000002.wav",
+    "duration_sec": 4.2,
+    "training_text": "That sounds reasonable to me.",
+    "alignment_text": "THAT SOUNDS REASONABLE TO ME",
+    "word_ids": ["w3"],
+    "needs_review": false,
+    "review_reason_codes": [],
+    "status": "candidate_review"
+  },
+  {
+    "id": "candidate_review_clip_000003",
+    "buffer_id": "buffer_000003",
+    "source_audio_id": "source_0",
+    "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000003.wav",
+    "duration_sec": 3.8,
+    "training_text": "Maybe we should try again.",
+    "alignment_text": "MAYBE WE SHOULD TRY AGAIN",
+    "word_ids": ["w4"],
+    "needs_review": true,
+    "review_reason_codes": ["clip_contains_oov"],
+    "status": "candidate_review"
+  },
+  {
+    "id": "candidate_review_clip_000004",
+    "buffer_id": "buffer_000004",
+    "source_audio_id": "source_0",
+    "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000004.wav",
+    "duration_sec": 6.1,
+    "training_text": "Only in transcript manifest.",
+    "alignment_text": "ONLY IN TRANSCRIPT MANIFEST",
+    "word_ids": ["w5"],
+    "needs_review": false,
+    "review_reason_codes": [],
+    "status": "candidate_review"
+  }
+]

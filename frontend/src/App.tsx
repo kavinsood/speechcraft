@@ -1,19 +1,36 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useReducer, useState, type ReactNode } from "react";
 import { Settings2 } from "lucide-react";
 import { ApiError, fetchProjects } from "./api";
+import {
+  PipelineProvider,
+  initialPipelineSelection,
+  pipelineSelectionReducer,
+  type PipelineSelectionState,
+  type PipelineStage,
+} from "./pipeline/PipelineContext";
+import ExportPage from "./pages/ExportPage";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
+import OverviewPage from "./pages/OverviewPage";
+import ProcessingPage from "./pages/ProcessingPage";
+import QcPage from "./pages/QcPage";
 import ReferencePage from "./pages/ReferencePage";
-import StepPlaceholderPage from "./pages/StepPlaceholderPage";
+import SpeakersPage from "./pages/SpeakersPage";
+import SlicerPage from "./pages/SlicerPage";
 import type { ClipLabItemRef, Project } from "./types";
 
-type AppStep = "ingest" | "enhance" | "segment" | "label" | "reference" | "train" | "deploy";
+type AppStep = PipelineStage | "reference";
 type ProjectLoadStatus = "loading" | "ready" | "error";
 
 type AppRoute = {
   step: AppStep;
   projectId: string | null;
   clipItem: ClipLabItemRef | null;
+};
+
+type AppLocationState = {
+  route: AppRoute;
+  pipelineSelection: PipelineSelectionState;
 };
 
 type StepDefinition = {
@@ -32,12 +49,13 @@ type PageHeaderContent = {
 
 const stepDefinitions: StepDefinition[] = [
   { id: "ingest", label: "Ingest", shortLabel: "In", glyph: "I", tone: "Sources first" },
-  { id: "enhance", label: "Enhance", shortLabel: "En", glyph: "E", tone: "Clean the raw signal" },
-  { id: "segment", label: "Segment", shortLabel: "Se", glyph: "S", tone: "Split into candidates" },
-  { id: "label", label: "Label", shortLabel: "La", glyph: "L", tone: "Human review and repair" },
-  { id: "reference", label: "Reference", shortLabel: "Re", glyph: "R", tone: "Mine and curate steering clips" },
-  { id: "train", label: "Train", shortLabel: "Tr", glyph: "T", tone: "Fine-tune the voice" },
-  { id: "deploy", label: "Deploy", shortLabel: "De", glyph: "D", tone: "Ship for inference" },
+  { id: "overview", label: "Overview", shortLabel: "Ov", glyph: "O", tone: "Raw recordings and prep" },
+  { id: "speakers", label: "Speakers", shortLabel: "Sp", glyph: "S", tone: "Detect and choose the target voice" },
+  { id: "processing", label: "Processing", shortLabel: "Pr", glyph: "P", tone: "Align the selected speaker" },
+  { id: "slicer", label: "Slicer", shortLabel: "Sl", glyph: "C", tone: "Generate candidate review clips" },
+  { id: "qc", label: "QC", shortLabel: "QC", glyph: "Q", tone: "Machine triage for one run" },
+  { id: "lab", label: "Lab", shortLabel: "La", glyph: "L", tone: "Human review and override" },
+  { id: "export", label: "Export", shortLabel: "Ex", glyph: "E", tone: "Emit training-ready data" },
 ];
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -53,12 +71,41 @@ function getErrorMessage(error: unknown, fallback: string): string {
 }
 
 function isAppStep(value: string | null): value is AppStep {
-  return stepDefinitions.some((step) => step.id === value);
+  return value === "reference" || stepDefinitions.some((step) => step.id === value);
 }
 
-function readRouteFromLocation(): AppRoute {
+function readPipelineSelectionFromSearch(
+  searchParams: URLSearchParams,
+  step: AppStep,
+): PipelineSelectionState {
+  const processingRunId = searchParams.get("processingRun")?.trim() || null;
+  const speakersRunId = searchParams.get("speakersRun")?.trim() || null;
+  const runId = searchParams.get("run")?.trim() || null;
+
+  const selectedSpeakersRunId = step === "speakers" ? speakersRunId : null;
+  const selectedSlicerDatasetRunId = step === "slicer" ? runId : null;
+  const selectedQcDatasetRunId = step === "qc" ? runId : null;
+  const selectedLabDatasetRunId = step === "lab" ? runId : null;
+
+  return {
+    selectedSpeakersRunId,
+    selectedProcessingRunId: processingRunId,
+    selectedSlicerDatasetRunId,
+    selectedQcDatasetRunId,
+    selectedLabDatasetRunId,
+  };
+}
+
+function readLocationState(): AppLocationState {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
-  const maybeStep = path.length > 0 ? path : "ingest";
+  const legacyStepMap: Partial<Record<string, AppStep>> = {
+    enhance: "overview",
+    segment: "slicer",
+    label: "lab",
+    train: "export",
+    deploy: "export",
+  };
+  const maybeStep = path.length > 0 ? legacyStepMap[path] ?? path : "ingest";
   const step = isAppStep(maybeStep) ? maybeStep : "ingest";
   const searchParams = new URLSearchParams(window.location.search);
   const projectId = searchParams.get("project")?.trim() ?? null;
@@ -66,14 +113,21 @@ function readRouteFromLocation(): AppRoute {
   const clipItem = clipId ? ({ id: clipId } satisfies ClipLabItemRef) : null;
 
   return {
-    step,
-    projectId: projectId && projectId.length > 0 ? projectId : null,
-    clipItem,
+    route: {
+      step,
+      projectId: projectId && projectId.length > 0 ? projectId : null,
+      clipItem,
+    },
+    pipelineSelection: readPipelineSelectionFromSearch(searchParams, step),
   };
 }
 
-function writeRouteToLocation(route: AppRoute, replace = false) {
-  const url = new URL(window.location.href);
+function writeRouteToLocation(
+  route: AppRoute,
+  pipelineSelection: PipelineSelectionState,
+  replace = false,
+) {
+  const url = new URL(window.location.origin);
   url.pathname = route.step === "ingest" ? "/" : `/${route.step}`;
   if (route.projectId) {
     url.searchParams.set("project", route.projectId);
@@ -84,6 +138,28 @@ function writeRouteToLocation(route: AppRoute, replace = false) {
     url.searchParams.set("clip_id", route.clipItem.id);
   } else {
     url.searchParams.delete("clip_id");
+  }
+
+  if (route.step === "speakers" && pipelineSelection.selectedSpeakersRunId) {
+    url.searchParams.set("speakersRun", pipelineSelection.selectedSpeakersRunId);
+  } else {
+    url.searchParams.delete("speakersRun");
+  }
+
+  if (route.step === "processing" && pipelineSelection.selectedProcessingRunId) {
+    url.searchParams.set("processingRun", pipelineSelection.selectedProcessingRunId);
+  } else {
+    url.searchParams.delete("processingRun");
+  }
+
+  if (route.step === "slicer" && pipelineSelection.selectedSlicerDatasetRunId) {
+    url.searchParams.set("run", pipelineSelection.selectedSlicerDatasetRunId);
+  } else if (route.step === "qc" && pipelineSelection.selectedQcDatasetRunId) {
+    url.searchParams.set("run", pipelineSelection.selectedQcDatasetRunId);
+  } else if (route.step === "lab" && pipelineSelection.selectedLabDatasetRunId) {
+    url.searchParams.set("run", pipelineSelection.selectedLabDatasetRunId);
+  } else {
+    url.searchParams.delete("run");
   }
 
   if (replace) {
@@ -108,66 +184,87 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
     };
   }
 
-  if (step === "enhance") {
+  if (step === "overview") {
     return {
       eyebrow: "Step 02",
-      title: "Enhancement shell",
-      description:
-        "Prepare denoise, de-echo, de-reverb, and music removal as a focused workstation.",
+      title: "Overview",
+      description: "Inspect imported raw recordings and manage explicit preparation state.",
     };
   }
 
-  if (step === "segment") {
+  if (step === "speakers") {
     return {
       eyebrow: "Step 03",
-      title: "Segmentation shell",
-      description: "Own the split-and-propose stage before manual review begins.",
+      title: "Speakers",
+      description: "Run speech detection and diarization, audition samples, and choose the target voice.",
     };
   }
 
-  if (step === "label") {
+  if (step === "slicer") {
+    return {
+      eyebrow: "Step 05",
+      title: "Slicer",
+      description: "Generate candidate review clips from aligned runs and tune SafeCutPoint assembly.",
+    };
+  }
+
+  if (step === "processing") {
     return {
       eyebrow: "Step 04",
-      title: activeProject?.name ?? "Label Workstation",
-      description:
-        "Manual transcript verification, clip correction, and export readiness all live here.",
+      title: "Processing",
+      description: "Process the chosen speaker through buffers, ASR, MFA, and alignment QC before slicing.",
+    };
+  }
+
+  if (step === "qc") {
+    return {
+      eyebrow: "Step 06",
+      title: "QC",
+      description: "Run machine triage for one selected slicer run without claiming human approval.",
+    };
+  }
+
+  if (step === "lab") {
+    return {
+      eyebrow: "Step 07",
+      title: activeProject?.name ?? "Lab",
+      description: "Manual slice review, transcript repair, and human overrides live here.",
     };
   }
 
   if (step === "reference") {
     return {
-      eyebrow: "Step 05",
+      eyebrow: "Reference",
       title: activeProject?.name ?? "Reference Workstation",
       description:
-        "Curate reusable steering clips from source recordings and saved slice states without polluting the label queue.",
-    };
-  }
-
-  if (step === "train") {
-    return {
-      eyebrow: "Step 06",
-      title: "Training shell",
-      description: "Stage the fine-tuning workspace without forcing a job model too early.",
+        "Reference remains available as its existing workstation, outside the current sprint path.",
     };
   }
 
   return {
-    eyebrow: "Step 07",
-    title: "Deployment shell",
-    description: "Hold inference, serving, and release actions in a final workstation stage.",
+    eyebrow: "Step 08",
+    title: "Export",
+    description: "Emit the selected reviewed or machine-triaged dataset for downstream training.",
   };
 }
 
 export default function App() {
-  const [route, setRoute] = useState<AppRoute>(() => readRouteFromLocation());
+  const [route, setRoute] = useState<AppRoute>(() => readLocationState().route);
   const [projectLoadStatus, setProjectLoadStatus] = useState<ProjectLoadStatus>("loading");
   const [projectLoadError, setProjectLoadError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [pageHeaderActions, setPageHeaderActions] = useState<ReactNode>(null);
+  const [pipelineSelection, dispatchPipelineSelection] = useReducer(
+    pipelineSelectionReducer,
+    undefined,
+    () => readLocationState().pipelineSelection,
+  );
 
   useEffect(() => {
     const handlePopState = () => {
-      setRoute(readRouteFromLocation());
+      const nextLocationState = readLocationState();
+      setRoute(nextLocationState.route);
+      dispatchPipelineSelection({ type: "replace", state: nextLocationState.pipelineSelection });
     };
 
     window.addEventListener("popstate", handlePopState);
@@ -176,7 +273,7 @@ export default function App() {
     };
   }, []);
 
-  async function loadProjects(preferredProjectId?: string | null) {
+  async function loadProjects(preferredProjectId?: string | null, routeSnapshot = route) {
     setProjectLoadStatus("loading");
     setProjectLoadError(null);
 
@@ -189,21 +286,23 @@ export default function App() {
       const selectedProjectId =
         preferredProjectId && nextProjects.some((project) => project.id === preferredProjectId)
           ? preferredProjectId
-          : route.projectId && nextProjects.some((project) => project.id === route.projectId)
-            ? route.projectId
+          : routeSnapshot.projectId && nextProjects.some((project) => project.id === routeSnapshot.projectId)
+            ? routeSnapshot.projectId
             : fallbackProjectId;
 
       setProjects(sortedProjects);
       setProjectLoadStatus("ready");
 
-      if (selectedProjectId !== route.projectId) {
-        const nextRoute = { ...route, projectId: selectedProjectId };
+      if (selectedProjectId !== routeSnapshot.projectId) {
+        dispatchPipelineSelection({ type: "reset" });
+        const nextRoute = { ...routeSnapshot, projectId: selectedProjectId };
         setRoute(nextRoute);
-        writeRouteToLocation(nextRoute, true);
+        writeRouteToLocation(nextRoute, initialPipelineSelection, true);
       }
     } catch (error) {
       setProjects([]);
       setProjectLoadStatus("error");
+      dispatchPipelineSelection({ type: "reset" });
       setProjectLoadError(
         getErrorMessage(error, "The app could not load the project list from the backend."),
       );
@@ -219,6 +318,7 @@ export default function App() {
     [projects, route.projectId],
   );
   const activeStepIndex = getStepIndex(route.step);
+  const visibleStepIndex = activeStepIndex >= 0 ? activeStepIndex : 0;
   const pageHeaderContent = useMemo(
     () => getPageHeaderContent(route.step, activeProject),
     [route.step, activeProject],
@@ -229,19 +329,101 @@ export default function App() {
   }, [route.step]);
 
   function navigate(nextStep: AppStep, nextProjectId = route.projectId) {
+    let nextPipelineSelection = pipelineSelection;
+    if ((nextProjectId ?? null) !== route.projectId) {
+      nextPipelineSelection = initialPipelineSelection;
+      dispatchPipelineSelection({ type: "reset" });
+    }
+
     const nextRoute = { step: nextStep, projectId: nextProjectId ?? null, clipItem: route.clipItem };
     setRoute(nextRoute);
-    writeRouteToLocation(nextRoute);
+    writeRouteToLocation(nextRoute, nextPipelineSelection);
   }
 
   function handleProjectChange(nextProjectId: string) {
+    dispatchPipelineSelection({ type: "reset" });
     const nextRoute = {
       step: route.step,
       projectId: nextProjectId,
       clipItem: route.clipItem,
     };
     setRoute(nextRoute);
-    writeRouteToLocation(nextRoute);
+    writeRouteToLocation(nextRoute, initialPipelineSelection);
+  }
+
+  function selectProcessingRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedProcessingRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-processing-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectSpeakersRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedSpeakersRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-speakers-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectSlicerDatasetRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedSlicerDatasetRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-slicer-dataset-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectQcDatasetRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedQcDatasetRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-qc-dataset-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function selectLabDatasetRun(runId: string | null) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedLabDatasetRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-lab-dataset-run", runId });
+    writeRouteToLocation(route, nextPipelineSelection, true);
+  }
+
+  function openSlicerWithRun(runId: string) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedSlicerDatasetRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-slicer-dataset-run", runId });
+    const nextRoute = { step: "slicer" as const, projectId: route.projectId, clipItem: route.clipItem };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute, nextPipelineSelection);
+  }
+
+  function openProcessingWithRun(runId: string) {
+    const nextPipelineSelection: PipelineSelectionState = {
+      ...pipelineSelection,
+      selectedProcessingRunId: runId,
+    };
+    dispatchPipelineSelection({ type: "select-processing-run", runId });
+    const nextRoute = { step: "processing" as const, projectId: route.projectId, clipItem: route.clipItem };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute, nextPipelineSelection);
+  }
+
+  function handleImportComplete(projectId: string) {
+    dispatchPipelineSelection({ type: "reset" });
+    const nextRoute = { step: "overview" as const, projectId, clipItem: null };
+    setRoute(nextRoute);
+    writeRouteToLocation(nextRoute, initialPipelineSelection, true);
+    void loadProjects(projectId, nextRoute);
   }
 
   const pageProps = {
@@ -254,8 +436,34 @@ export default function App() {
   let pageContent = null;
 
   if (route.step === "ingest") {
-    pageContent = <IngestPage {...pageProps} />;
-  } else if (route.step === "label") {
+    pageContent = <IngestPage {...pageProps} onImportComplete={handleImportComplete} />;
+  } else if (route.step === "overview") {
+    pageContent = <OverviewPage {...pageProps} />;
+  } else if (route.step === "speakers") {
+    pageContent = (
+      <SpeakersPage
+        {...pageProps}
+        onOpenProcessing={() => navigate("processing")}
+        onOpenProcessingWithRun={openProcessingWithRun}
+      />
+    );
+  } else if (route.step === "processing") {
+    pageContent = (
+      <ProcessingPage
+        {...pageProps}
+        onOpenSpeakers={() => navigate("speakers")}
+        onOpenSlicerWithRun={openSlicerWithRun}
+      />
+    );
+  } else if (route.step === "slicer") {
+    pageContent = <SlicerPage {...pageProps} onOpenQc={() => navigate("qc")} />;
+  } else if (route.step === "qc") {
+    pageContent = (
+      <QcPage
+        {...pageProps}
+      />
+    );
+  } else if (route.step === "lab") {
     pageContent = (
       <LabelPage
         {...pageProps}
@@ -263,7 +471,7 @@ export default function App() {
         onActiveClipItemChange={(clipItem) => {
           const nextRoute = { ...route, clipItem };
           setRoute(nextRoute);
-          writeRouteToLocation(nextRoute, true);
+          writeRouteToLocation(nextRoute, pipelineSelection, true);
         }}
         onHeaderActionsChange={setPageHeaderActions}
       />
@@ -271,43 +479,7 @@ export default function App() {
   } else if (route.step === "reference") {
     pageContent = <ReferencePage {...pageProps} />;
   } else {
-    const configByStep: Record<Exclude<AppStep, "ingest" | "label" | "reference">, { leftTitle: string; rightTitle: string; leftItems: string[]; rightItems: string[]; centerTitle: string; centerBody: string; }> = {
-      enhance: {
-        leftTitle: "Planned modules",
-        rightTitle: "Notes",
-        leftItems: ["Denoise queue", "Dereverb presets", "Music removal routing"],
-        rightItems: ["Keep navigation open.", "Do not assume strict gating.", "This page should later reflect real project assets."],
-        centerTitle: "Signal cleanup canvas",
-        centerBody: "This shell is ready for the enhancement tools. The frame is in place so we can deepen this room without changing the global app structure again.",
-      },
-      segment: {
-        leftTitle: "Inputs",
-        rightTitle: "Outputs",
-        leftItems: ["Prepared sources", "Segmentation models", "Boundary configuration"],
-        rightItems: ["Candidate clips", "Initial transcript alignment", "Queue handoff to label"],
-        centerTitle: "Segmentation canvas",
-        centerBody: "This page will become the bridge between preprocessing and review. For now it keeps the shape of the workstation while we decide the exact model and job semantics.",
-      },
-      train: {
-        leftTitle: "Training inputs",
-        rightTitle: "Artifacts",
-        leftItems: ["Accepted dataset", "Model source", "Hyperparameter presets"],
-        rightItems: ["Checkpoints", "Metrics", "Evaluation notes"],
-        centerTitle: "Training canvas",
-        centerBody: "The app shell now has a dedicated room for training. We can wire the CLI-backed flow into this page incrementally instead of rethinking the navigation later.",
-      },
-      deploy: {
-        leftTitle: "Release setup",
-        rightTitle: "Destinations",
-        leftItems: ["Model selection", "Runtime profiles", "Access controls"],
-        rightItems: ["Local inference", "Hosted endpoints", "Publishing history"],
-        centerTitle: "Deployment canvas",
-        centerBody: "This final stage is intentionally skeletal for now. The shell makes the end-to-end product legible today without pretending the backend orchestration is already designed.",
-      },
-    };
-
-    const stepConfig = configByStep[route.step];
-    pageContent = <StepPlaceholderPage {...pageProps} {...stepConfig} />;
+    pageContent = <ExportPage {...pageProps} />;
   }
 
   return (
@@ -358,7 +530,24 @@ export default function App() {
 
       <section className="workstation-stage">
         {projectLoadError ? <p className="shell-notice shell-notice-error">{projectLoadError}</p> : null}
-        {pageContent}
+        <PipelineProvider
+          selectedSpeakersRunId={pipelineSelection.selectedSpeakersRunId}
+          selectedProcessingRunId={pipelineSelection.selectedProcessingRunId}
+          selectedSlicerDatasetRunId={pipelineSelection.selectedSlicerDatasetRunId}
+          selectedQcDatasetRunId={pipelineSelection.selectedQcDatasetRunId}
+          selectedLabDatasetRunId={pipelineSelection.selectedLabDatasetRunId}
+          selectSpeakersRun={selectSpeakersRun}
+          selectProcessingRun={selectProcessingRun}
+          selectSlicerDatasetRun={selectSlicerDatasetRun}
+          selectQcDatasetRun={selectQcDatasetRun}
+          selectLabDatasetRun={selectLabDatasetRun}
+          resetPipelineSelection={() => {
+            dispatchPipelineSelection({ type: "reset" });
+            writeRouteToLocation(route, initialPipelineSelection, true);
+          }}
+        >
+          {pageContent}
+        </PipelineProvider>
       </section>
 
       <nav className="resolve-dock" aria-label="Workflow steps">
@@ -368,7 +557,7 @@ export default function App() {
             style={{
               width:
                 stepDefinitions.length > 1
-                  ? `${(activeStepIndex / (stepDefinitions.length - 1)) * 100}%`
+                  ? `${(visibleStepIndex / (stepDefinitions.length - 1)) * 100}%`
                   : "0%",
             }}
           />
@@ -377,7 +566,7 @@ export default function App() {
         <div className="resolve-dock-items">
           {stepDefinitions.map((step, index) => {
             const state =
-              index < activeStepIndex ? "complete" : index === activeStepIndex ? "active" : "idle";
+              index < visibleStepIndex ? "complete" : index === visibleStepIndex ? "active" : "idle";
 
             return (
               <button
@@ -406,7 +595,7 @@ export default function App() {
           <span>
             export {activeProject.export_status ? activeProject.export_status.replace(/_/g, " ") : "n/a"}
           </span>
-          <span>{stepDefinitions[activeStepIndex]?.shortLabel ?? "In"} active</span>
+          <span>{stepDefinitions[visibleStepIndex]?.shortLabel ?? "In"} active</span>
         </footer>
       ) : null}
     </div>

@@ -58,12 +58,272 @@ export type AudioVariant = {
 export type SourceRecording = {
   id: string;
   batch_id: string;
+  display_name?: string | null;
   parent_recording_id?: string | null;
   sample_rate: number;
   num_channels: number;
   num_samples: number;
   processing_recipe?: string | null;
   duration_seconds: number;
+};
+
+export type DatasetRunStatus = "pending" | "running" | "completed" | "needs_review" | "rejected" | "failed";
+
+export type DatasetRunArtifact = {
+  id: string;
+  kind: string;
+  path: string;
+  byte_size?: number | null;
+  content_hash?: string | null;
+  summary: Record<string, unknown>;
+  reason_codes: string[];
+};
+
+export type DatasetRun = {
+  id: string;
+  project_id: string;
+  pipeline_version: string;
+  artifact_root?: string | null;
+  stage: string;
+  status: DatasetRunStatus;
+  config_hash?: string | null;
+  input_summary: Record<string, unknown>;
+  output_summary: Record<string, unknown>;
+  reason_codes: string[];
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  artifacts: DatasetRunArtifact[];
+};
+
+export type DatasetRunCreateRequest = {
+  source_recording_ids: string[];
+  config?: Record<string, unknown>;
+  single_speaker: boolean;
+  target_speaker_label: string;
+  stop_after: string;
+  language?: string;
+  whisper_model_size?: "large-v3" | "base";
+};
+
+export type DatasetSpeakerSample = {
+  sample_id: string;
+  speaker_id: string;
+  source_audio_id: string;
+  audio_path: string;
+  start_sample: number;
+  end_sample: number;
+  duration_sec: number;
+};
+
+export type DatasetSpeakerSelection = {
+  mode: string;
+  selected: boolean;
+  target_speaker_id?: string | null;
+  source: string;
+  available_speaker_ids: string[];
+  updated_at?: string | null;
+};
+
+export type DatasetSpeakerResults = {
+  run_id: string;
+  speaker_regions_summary: Record<string, unknown>;
+  speaker_samples_manifest: DatasetSpeakerSample[];
+  speaker_selection?: DatasetSpeakerSelection | null;
+};
+
+export type DatasetRunLog = {
+  run_id: string;
+  path: string;
+  text: string;
+  truncated: boolean;
+};
+
+export type DatasetSlicerResults = {
+  run_id: string;
+  safe_cutpoint_summary: Record<string, unknown>;
+  candidate_review_summary: Record<string, unknown>;
+  candidate_review_manifest: Array<Record<string, unknown>>;
+  candidate_review_rejected: Array<Record<string, unknown>>;
+  alignment_qc_by_buffer?: Array<Record<string, unknown>>;
+  transcripts?: Array<Record<string, unknown>>;
+  aligned_words?: Array<Record<string, unknown>>;
+};
+
+export type DatasetExportResults = {
+  run_id: string;
+  export_summary: Record<string, unknown>;
+  export_manifest: Array<Record<string, unknown>>;
+  export_audit: Array<Record<string, unknown>>;
+};
+
+export type ManualOverride = "force_keep" | "force_reject";
+
+export type DatasetQcWeakSpan = {
+  start_sec: number;
+  end_sec: number;
+  text?: string | null;
+  score?: number | null;
+};
+
+export type DatasetQcClip = {
+  clip_id: string;
+  audio_path: string;
+  audio_url: string;
+  duration_sec: number;
+  training_text: string;
+  alignment_text?: string | null;
+  transcript_match: number | null;
+  speaker_check: number | null;
+  transcript_reason_codes: string[];
+  speaker_reason_codes: string[];
+  candidate_reason_codes: string[];
+  qc_reason_codes: string[];
+  weak_transcript_spans: DatasetQcWeakSpan[];
+  weak_speaker_spans: DatasetQcWeakSpan[];
+  manual_override?: ManualOverride | null;
+};
+
+export type DatasetQcPayload = {
+  run_id: string;
+  ready: boolean;
+  missing_artifacts: string[];
+  invalid_artifacts: string[];
+  defaults: {
+    transcript_match_threshold: number;
+    speaker_check_threshold: number;
+  };
+  finalized: boolean;
+  finalized_thresholds?: {
+    transcript_match_min: number;
+    speaker_check_min: number;
+  } | null;
+  clips: DatasetQcClip[];
+};
+
+export type DatasetQcFinalizeRequest = {
+  thresholds: {
+    transcript_match_min: number;
+    speaker_check_min: number;
+  };
+  manual_overrides: Array<{
+    clip_id: string;
+    override: ManualOverride;
+    reason?: string | null;
+  }>;
+};
+
+export type DatasetQcFinalizeResponse = {
+  run_id: string;
+  dataset_qc_path: string;
+  summary: {
+    accepted_count: number;
+    rejected_count: number;
+    accepted_duration_sec: number;
+    rejected_duration_sec: number;
+  };
+};
+
+export type DatasetClipLabPipelineFinding = {
+  code: string;
+  label: string;
+};
+
+export type DatasetClipLabClipRow = {
+  clip_id: string;
+  clip_version: number;
+  review_status: ReviewStatus;
+  transcript: string;
+  original_transcript: string;
+  transcript_override: string | null;
+  reviewer_tags: string[];
+  pipeline_findings: DatasetClipLabPipelineFinding[];
+  content_hash: string;
+  accepted_content_hash: string | null;
+  accepted_at: string | null;
+  acceptance_stale: boolean;
+  transcript_match: number | null;
+  speaker_check: number | null;
+  sample_rate_hz: number | null;
+  effective_audio_kind: "candidate_original" | "rendered_revision" | null;
+  effective_audio_revision_key: string | null;
+  source_audio_sha256: string | null;
+  audio_revision_hash: string | null;
+  rendered_audio_sha256: string | null;
+  audio_url: string | null;
+  waveform_peaks_url: string | null;
+  current_duration_sec: number | null;
+  audio_edit_op_count: number;
+  audio_edit_ops: DatasetAudioEditOperation[];
+  can_undo_audio: boolean;
+  can_redo_audio: boolean;
+  render_status: "ready" | "pending" | "failed";
+};
+
+export type DatasetAudioEditOperation = {
+  kind: "delete_range" | "insert_silence";
+  start_sample?: number;
+  end_sample?: number;
+  at_sample?: number;
+  duration_samples?: number;
+};
+
+export type DatasetClipLabAudioOperationRequest = {
+  expected_manifest_sha256: string;
+  expected_clip_version: number;
+  operation: DatasetAudioEditOperation;
+};
+
+export type DatasetClipLabAudioStackRequest = {
+  expected_manifest_sha256: string;
+  expected_clip_version: number;
+};
+
+export type DatasetWaveformPeaksPayload = {
+  revision_key: string;
+  bins: number;
+  peaks: number[];
+  duration_sec: number;
+  sample_rate_hz: number;
+};
+
+export type DatasetClipLabView = {
+  run_id: string;
+  candidate_manifest_sha256: string;
+  stale_state: boolean;
+  stale_reason: string | null;
+  invalid_state: boolean;
+  invalid_state_reason: string | null;
+  saved_state_clip_count: number;
+  qc_available: boolean;
+  qc_error: string | null;
+  clips: DatasetClipLabClipRow[];
+};
+
+export type DatasetClipLabPatchRequest = {
+  expected_manifest_sha256: string;
+  expected_clip_version: number;
+  review_status?: ReviewStatus;
+  transcript_override?: string | null;
+  reviewer_tags?: string[];
+};
+
+export type DatasetPreflight = {
+  ok: boolean;
+  reason_codes?: string[];
+  error?: string;
+  asr_model?: {
+    ok: boolean;
+    model?: string;
+    error?: string | null;
+    snapshot_check?: {
+      ok: boolean;
+      missing_files?: string[];
+      error?: string | null;
+    };
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 };
 
 export type SourceRecordingArtifact = {
@@ -104,6 +364,35 @@ export type ProcessingJob = {
   started_at?: string | null;
   heartbeat_at?: string | null;
   completed_at?: string | null;
+};
+
+export type PreparationSettings = {
+  target_sample_rate?: number | null;
+  channel_mode: "original" | "mono" | "left" | "right";
+};
+
+export type ProjectTranscriptionSettings = {
+  model_size: "base" | "small" | "medium" | "large-v3" | "turbo";
+  batch_size: number;
+  initial_prompt?: string | null;
+};
+
+export type ProjectAlignmentSettings = {
+  acoustic_model: string;
+  text_normalization_strategy: "strict" | "loose" | "spoken_form";
+  batch_size: number;
+};
+
+export type ProjectPreparationRun = {
+  job: ProcessingJob;
+  created_recordings: SourceRecording[];
+  active_prepared_output_group_id?: string | null;
+};
+
+export type ProjectRecordingJobsRun = {
+  project_id: string;
+  prepared_output_group_id: string;
+  jobs: ProcessingJob[];
 };
 
 export type SourceRecordingQueue = SourceRecording & {
@@ -178,6 +467,17 @@ export type ClipLabCommit = {
   created_at: string;
 };
 
+export type ReferenceClipCandidate = {
+  project_id: string;
+  dataset_run_id: string;
+  clip_id: string;
+  transcript_text: string;
+  filename: string;
+  relative_path: string;
+  source_audio_path: string;
+  created_at: string;
+};
+
 export type ClipLabCapabilities = {
   can_edit_transcript: boolean;
   can_edit_tags: boolean;
@@ -228,6 +528,8 @@ export type ImportBatch = {
   created_at: string;
   updated_at: string;
   export_status?: "pending" | "running" | "completed" | "failed" | null;
+  active_prepared_output_group_id?: string | null;
+  active_preparation_job_id?: string | null;
 };
 
 export type Project = ImportBatch;

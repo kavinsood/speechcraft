@@ -41,16 +41,8 @@ def run_smoke(config: SmokeConfig) -> int:
         project = request_json(config, f"/api/projects/{quote(config.project_id)}")
         log("project", project.get("name", config.project_id))
 
-        slices = request_json(config, f"/api/projects/{quote(config.project_id)}/slices")
-        log("slices", f"{len(slices)} slice(s)")
-
-        if slices:
-            slice_id = slices[0]["id"]
-            detail = request_json(config, f"/api/slices/{quote(slice_id)}")
-            log("slice-detail", detail["id"])
-
-            peaks = request_json(config, f"/api/clips/{quote(slice_id)}/waveform-peaks?bins=48")
-            log("waveform-peaks", f"{peaks['bins']} bins for {slice_id}")
+        recordings = request_json(config, f"/api/projects/{quote(config.project_id)}/recordings")
+        log("recordings", f"{len(recordings)} recording(s)")
 
         preview = request_json(config, f"/api/projects/{quote(config.project_id)}/export-preview")
         log("export-preview", f"{preview['accepted_slice_count']} accepted slice(s)")

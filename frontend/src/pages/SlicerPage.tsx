@@ -1,0 +1,386 @@
+import { useEffect, useMemo, useState } from "react";
+import {
+  ApiError,
+  buildCandidateReviewAudioUrl,
+  buildNativeExportAudioUrl,
+  fetchDatasetExportResults,
+  fetchDatasetRunLog,
+  fetchDatasetSlicerResults,
+  fetchProjectDatasetRuns,
+  refreshDatasetRun,
+  rerunDatasetNativeExport,
+  rerunDatasetSlicer,
+} from "../api";
+import JobActivityPanel, { type JobActivity } from "../components/JobActivityPanel";
+import { usePipelineContext } from "../pipeline/PipelineContext";
+import { hasCandidateClipArtifacts, isSlicerInputReady } from "../pipeline/datasetRunHelpers";
+import type { DatasetExportResults, DatasetRun, DatasetRunLog, DatasetSlicerResults, Project } from "../types";
+import WorkspaceStatePanel from "../workspace/WorkspaceStatePanel";
+
+type Props = {
+  activeProject: Project | null;
+  projectLoadStatus: "loading" | "ready" | "error";
+  projectLoadError: string | null;
+  onRetryProjects: () => void;
+  onOpenQc: () => void;
+};
+
+const SLICER_DEFAULTS = {
+  candidate_min_clip_sec: 3,
+  candidate_target_clip_sec: 8,
+  candidate_max_clip_sec: 15,
+  cutpoint_min_gap_ms: 80,
+  cutpoint_left_word_edge_guard_ms: 30,
+  cutpoint_right_word_edge_guard_ms: 30,
+} as const;
+
+type SlicerSettings = typeof SLICER_DEFAULTS;
+
+const MAIN_CONTROLS = [
+  { label: "Target clip", key: "candidate_target_clip_sec", unit: "sec", min: 1, max: 20, step: 0.5, title: "Preferred clip duration for TTS training." },
+  { label: "Minimum clip", key: "candidate_min_clip_sec", unit: "sec", min: 1, max: 15, step: 0.5, title: "Clips shorter than this are rejected." },
+  { label: "Maximum clip", key: "candidate_max_clip_sec", unit: "sec", min: 1, max: 30, step: 0.5, title: "Clips longer than this are split or rejected." },
+  { label: "Smallest cuttable gap", key: "cutpoint_min_gap_ms", unit: "ms", min: 0, max: 1000, step: 5, title: "Minimum silence gap required before a cut is allowed." },
+] as const;
+
+const ADVANCED_CONTROLS = [
+  { label: "Left word-edge guard", key: "cutpoint_left_word_edge_guard_ms", unit: "ms", min: 0, max: 500, step: 5, title: "Keep cuts away from the start edge of aligned words." },
+  { label: "Right word-edge guard", key: "cutpoint_right_word_edge_guard_ms", unit: "ms", min: 0, max: 500, step: 5, title: "Keep cuts away from the end edge of aligned words." },
+] as const;
+
+function buildSlicerConfig(settings: SlicerSettings): Record<string, number> {
+  return { ...settings };
+}
+
+function NumericSetting({
+  label,
+  value,
+  unit,
+  min,
+  max,
+  step,
+  title,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  unit: string;
+  min: number;
+  max: number;
+  step: number;
+  title: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="processing-setting" title={title}>
+      <span>{label}</span>
+      <span className="processing-input-row">
+        <input aria-label={label} type="number" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+        <small>{unit}</small>
+      </span>
+    </label>
+  );
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof ApiError || error instanceof Error ? error.message || fallback : fallback;
+}
+
+function count(summary: Record<string, unknown>, key: string): number {
+  const value = Number(summary[key] ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function textValue(row: Record<string, unknown>, key: string): string {
+  const value = row[key];
+  return typeof value === "string" ? value : "";
+}
+
+function activity(run: DatasetRun | null, log: DatasetRunLog | null): JobActivity | null {
+  if (!run) return null;
+  return {
+    id: run.id,
+    name: `SafeCutPoint slicer · ${run.id}`,
+    type: "slicing",
+    state: run.status === "running" ? "running" : run.status === "failed" ? "failed" : run.status === "completed" ? "completed" : "idle",
+    startedAt: run.started_at,
+    completedAt: run.completed_at,
+    progressLabel: `${run.status} · ${run.stage.replace(/_/g, " ")}`,
+    logs: (log?.text ?? "").split("\n").filter(Boolean).map((message, index) => ({ id: `${run.id}-${index}`, timestamp: String(index + 1).padStart(3, "0"), message })),
+  };
+}
+
+export default function SlicerPage({ activeProject, projectLoadStatus, projectLoadError, onRetryProjects, onOpenQc }: Props) {
+  const { selectedSlicerDatasetRunId, selectSlicerDatasetRun } = usePipelineContext();
+  const [runs, setRuns] = useState<DatasetRun[]>([]);
+  const [results, setResults] = useState<DatasetSlicerResults | null>(null);
+  const [exportResults, setExportResults] = useState<DatasetExportResults | null>(null);
+  const [log, setLog] = useState<DatasetRunLog | null>(null);
+  const [settings, setSettings] = useState<SlicerSettings>(SLICER_DEFAULTS);
+  const [error, setError] = useState<string | null>(null);
+  const [pollWarning, setPollWarning] = useState<string | null>(null);
+  const [pollFailureCount, setPollFailureCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const selectedRun = useMemo(
+    () => runs.find((run) => run.id === selectedSlicerDatasetRunId) ?? null,
+    [runs, selectedSlicerDatasetRunId],
+  );
+
+  async function loadRuns(projectId: string) {
+    try {
+      const nextRuns = await fetchProjectDatasetRuns(projectId);
+      setRuns(nextRuns);
+      if (selectedSlicerDatasetRunId && !nextRuns.some((run) => run.id === selectedSlicerDatasetRunId)) {
+        selectSlicerDatasetRun(null);
+        setResults(null);
+        setExportResults(null);
+        setLog(null);
+      }
+    } catch (loadError) {
+      setError(errorMessage(loadError, "Dataset runs could not be loaded."));
+    }
+  }
+
+  async function loadSelected(runId: string, refresh = false, polling = false) {
+    try {
+      const [run, nextResults, nextExportResults, nextLog] = await Promise.all([
+        refresh ? refreshDatasetRun(runId) : Promise.resolve(runs.find((item) => item.id === runId) ?? null),
+        fetchDatasetSlicerResults(runId),
+        fetchDatasetExportResults(runId).catch(() => ({ run_id: runId, export_summary: {}, export_manifest: [], export_audit: [] })),
+        fetchDatasetRunLog(runId),
+      ]);
+      if (run) setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      setResults(nextResults);
+      setExportResults(nextExportResults);
+      setLog(nextLog);
+      setPollWarning(null);
+      setPollFailureCount(0);
+    } catch (loadError) {
+      const message = errorMessage(loadError, "Slicer results could not be loaded.");
+      if (polling) {
+        setPollWarning(message);
+        setPollFailureCount((current) => Math.min(current + 1, 3));
+      } else {
+        setError(message);
+      }
+    }
+  }
+
+  useEffect(() => {
+    setRuns([]);
+    setResults(null);
+    setLog(null);
+    if (activeProject) void loadRuns(activeProject.id);
+  }, [activeProject?.id]);
+
+  useEffect(() => {
+    if (selectedSlicerDatasetRunId && runs.some((run) => run.id === selectedSlicerDatasetRunId)) {
+      void loadSelected(selectedSlicerDatasetRunId);
+    } else {
+      setResults(null);
+      setExportResults(null);
+      setLog(null);
+    }
+  }, [selectedSlicerDatasetRunId, runs]);
+
+  useEffect(() => {
+    if (!selectedRun || selectedRun.status !== "running") return;
+    const intervalMs = pollFailureCount === 0 ? 2000 : pollFailureCount === 1 ? 5000 : 10000;
+    const timer = window.setInterval(() => void loadSelected(selectedRun.id, true, true), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [selectedRun?.id, selectedRun?.status, pollFailureCount]);
+
+  async function generateOrRegenerate() {
+    if (!selectedRun) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const run = await rerunDatasetSlicer(selectedRun.id, buildSlicerConfig(settings));
+      setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      await loadSelected(run.id, true);
+    } catch (rerunError) {
+      setError(errorMessage(rerunError, "SafeCutPoint slicer rerun failed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportNative() {
+    if (!selectedRun) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const run = await rerunDatasetNativeExport(selectedRun.id, {});
+      setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      await loadSelected(run.id, true);
+    } catch (exportError) {
+      setError(errorMessage(exportError, "Native export failed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (projectLoadStatus === "error") return <WorkspaceStatePanel title="Projects unavailable" message={projectLoadError ?? "Project load failed."} actionLabel="Retry" onAction={onRetryProjects} />;
+  if (projectLoadStatus === "loading") return <WorkspaceStatePanel title="Loading projects" message="Fetching project context." />;
+  if (!activeProject) return <WorkspaceStatePanel title="No project selected" message="Select a project before slicing." />;
+
+  const safe = results?.safe_cutpoint_summary ?? {};
+  const clips = results?.candidate_review_summary ?? {};
+  const manifest = results?.candidate_review_manifest ?? [];
+  const rejectionReasons = safe.rejection_reason_counts && typeof safe.rejection_reason_counts === "object" ? Object.entries(safe.rejection_reason_counts as Record<string, unknown>) : [];
+  const slicerReady = isSlicerInputReady(selectedRun);
+  const hasCandidates = hasCandidateClipArtifacts(selectedRun, results);
+  const exportManifest = exportResults?.export_manifest ?? [];
+  const exportSummary = exportResults?.export_summary ?? {};
+  const generateDisabled = !selectedRun || !slicerReady || selectedRun.status === "running" || busy;
+  const exportDisabled = !selectedRun || manifest.length === 0 || selectedRun.status === "running" || busy;
+  const generateLabel = busy
+    ? "Starting..."
+    : hasCandidates
+      ? "Regenerate SafeCutPoints + assembly"
+      : "Generate candidate clips";
+
+  return (
+    <section className="step-page dataset-slicer-page">
+      {error ? <p className="shell-notice shell-notice-error">{error}</p> : null}
+      {pollWarning ? <p className="shell-notice">{pollWarning}</p> : null}
+      <div className="dataset-slicer-layout">
+        <aside className="panel processing-sidebar">
+          <div className="panel-header"><div><p className="eyebrow">Dataset runs</p><h3>Slicer inputs</h3></div></div>
+          <div className="processing-run-list">
+            {runs.map((run) => <button key={run.id} type="button" aria-pressed={selectedRun?.id === run.id} onClick={() => selectSlicerDatasetRun(run.id)}><strong>{run.id}</strong><span>{run.status} · {run.stage.replace(/_/g, " ")}</span></button>)}
+            {runs.length === 0 ? <p>No dataset runs. Complete Processing first.</p> : null}
+          </div>
+        </aside>
+
+        <main className="processing-main">
+          <section className="panel processing-controls">
+            <div className="panel-header"><div><p className="eyebrow">SafeCutPoint authority</p><h3>Clip assembly controls</h3></div><span className="status-pill">{slicerReady ? "Alignment ready" : "Needs alignment"}</span></div>
+            {!selectedRun ? (
+              <p>Select a dataset run from the sidebar or use Open Slicer on a completed Processing run.</p>
+            ) : slicerReady && !hasCandidates ? (
+              <p>Alignment is ready. SafeCutPoints and candidate clips have not been generated yet.</p>
+            ) : hasCandidates ? (
+              <p>Existing candidate clips found for this run.</p>
+            ) : (
+              <p>Complete Processing through alignment QC before generating candidate clips.</p>
+            )}
+            <div className="processing-settings-grid slicer-primary-settings">
+              {MAIN_CONTROLS.map((control) => (
+                <NumericSetting
+                  key={control.key}
+                  label={control.label}
+                  value={settings[control.key]}
+                  unit={control.unit}
+                  min={control.min}
+                  max={control.max}
+                  step={control.step}
+                  title={control.title}
+                  onChange={(value) => setSettings((current) => ({ ...current, [control.key]: value }))}
+                />
+              ))}
+            </div>
+            <details className="processing-settings-section slicer-advanced-settings">
+              <summary><span>Advanced slicing parameters</span><small>Word-edge guards for fast or breathy speakers</small></summary>
+              <div className="processing-settings-grid">
+                {ADVANCED_CONTROLS.map((control) => (
+                  <NumericSetting
+                    key={control.key}
+                    label={control.label}
+                    value={settings[control.key]}
+                    unit={control.unit}
+                    min={control.min}
+                    max={control.max}
+                    step={control.step}
+                    title={control.title}
+                    onChange={(value) => setSettings((current) => ({ ...current, [control.key]: value }))}
+                  />
+                ))}
+              </div>
+            </details>
+            <p className="muted-copy processing-operator-note">
+              RMS frame/hop, noise-floor margin, and hazard guards are locked server-side.
+            </p>
+            <div className="processing-actions">
+              <button className="primary-button" type="button" disabled={generateDisabled} onClick={() => void generateOrRegenerate()}>{generateLabel}</button>
+              <button className="action-button" type="button" disabled={exportDisabled} onClick={() => void exportNative()}>Export native-rate clips</button>
+              <span>Only slicer artifacts are regenerated. ASR and MFA remain untouched.</span>
+            </div>
+          </section>
+
+          <section className="dataset-slicer-stats">
+            <article className="panel pipeline-card"><p className="eyebrow">SafeCutPoints</p><h3>{count(safe, "accepted_cutpoints")}</h3><p>{count(safe, "rejected_cutpoint_candidates")} rejected · {(count(safe, "acceptance_rate") * 100).toFixed(1)}% accepted</p></article>
+            <article className="panel pipeline-card"><p className="eyebrow">Candidate yield</p><h3>{count(clips, "candidate_review_clips")} clips</h3><p>{count(clips, "total_duration_sec").toFixed(1)} sec · {count(clips, "clips_needing_review")} review flagged</p></article>
+            <article className="panel pipeline-card"><p className="eyebrow">Rejected spans</p><h3>{count(clips, "rejected_spans")}</h3><p>Buffers or spans not assembled automatically.</p></article>
+            <article className="panel pipeline-card"><p className="eyebrow">Native export</p><h3>{count(exportSummary, "exported_clip_count")}</h3><p>{count(exportSummary, "total_duration_sec").toFixed(1)} sec · {((exportSummary.sample_rates as number[] | undefined)?.join(", ") ?? "—")} Hz</p></article>
+          </section>
+
+          <JobActivityPanel title="Slicer terminal" job={activity(selectedRun, log)} maxLogLines={500} />
+
+          <section className="panel dataset-slicer-reasons">
+            <div className="panel-header"><div><p className="eyebrow">Diagnostics</p><h3>SafeCutPoint rejection reasons</h3></div></div>
+            <div>{rejectionReasons.length ? rejectionReasons.sort((a, b) => Number(b[1]) - Number(a[1])).map(([reason, value]) => <p key={reason}><strong>{reason.replace(/_/g, " ")}</strong><span>{String(value)}</span></p>) : <p>No SafeCutPoint diagnostics yet.</p>}</div>
+          </section>
+
+          <section className="panel dataset-slicer-candidates">
+            <div className="panel-header"><div><p className="eyebrow">Candidate review clips</p><h3>Listening grid</h3></div></div>
+            {!selectedRun ? (
+              <p>Select a dataset run to inspect candidate clips.</p>
+            ) : manifest.length === 0 ? (
+              <p>No candidate clips generated yet.</p>
+            ) : (
+              <div className="processing-run-list">
+                {manifest.map((clip) => {
+                  const clipId = textValue(clip, "id");
+                  const text = textValue(clip, "training_text");
+                  const needsReview = Boolean(clip.needs_review);
+                  const durationSec = Number(clip.duration_sec ?? 0);
+                  return (
+                    <article key={clipId} className="panel">
+                      <p className="eyebrow">{clipId}</p>
+                      <p><strong>{durationSec.toFixed(2)} sec</strong>{needsReview ? " · needs review" : ""}</p>
+                      <audio controls preload="none" src={buildCandidateReviewAudioUrl(selectedRun.id, clipId)} />
+                      <p>{text || "No transcript text recorded."}</p>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="panel dataset-slicer-candidates">
+            <div className="panel-header"><div><p className="eyebrow">Native export clips</p><h3>Original-rate output</h3></div></div>
+            {!selectedRun ? (
+              <p>Select a dataset run to inspect native exports.</p>
+            ) : exportManifest.length === 0 ? (
+              <p>No native-rate clips exported yet.</p>
+            ) : (
+              <div className="processing-run-list">
+                {exportManifest.map((clip) => {
+                  const clipId = textValue(clip, "id");
+                  const text = textValue(clip, "training_text");
+                  const durationSec = Number(clip.duration_sec ?? 0);
+                  const sampleRate = Number(clip.sample_rate ?? 0);
+                  return (
+                    <article key={clipId} className="panel">
+                      <p className="eyebrow">{clipId}</p>
+                      <p><strong>{durationSec.toFixed(2)} sec</strong>{sampleRate ? ` · ${sampleRate} Hz` : ""}</p>
+                      <audio controls preload="none" src={buildNativeExportAudioUrl(selectedRun.id, clipId)} />
+                      <p>{text || "No transcript text recorded."}</p>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </main>
+
+        <aside className="panel processing-sidebar">
+          <div className="panel-header"><div><p className="eyebrow">Next stage</p><h3>QC handoff</h3></div></div>
+          <p>Candidate review clips are not final training clips. QC and native-rate export remain separate stages.</p>
+          <button className="primary-button" type="button" disabled={!selectedRun || manifest.length === 0 || selectedRun.status === "running"} onClick={onOpenQc}>Open QC</button>
+        </aside>
+      </div>
+    </section>
+  );
+}

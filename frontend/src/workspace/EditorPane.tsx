@@ -1,14 +1,25 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type WaveSurfer from "wavesurfer.js";
 import WaveformPane from "../WaveformPane";
-import { fetchClipLabWaveformPeaks } from "../api";
-import type { ClipLabItem, ClipLabItemRef, ReviewStatus, WaveformPeaks } from "../types";
+import { fetchClipLabWaveformPeaks, fetchDatasetClipLabWaveformPeaks } from "../api";
+import {
+  derivePeaksForActiveRevision,
+  derivePeaksLoadStateForRevision,
+  EMPTY_REVISION_PEAKS,
+  initialRevisionPeaksForFetch,
+  type RevisionPeaksState,
+} from "./revisionPeaksState";
+import TagComposer from "./TagComposer";
+import { isReviewerDisplayTag } from "../pages/labelPageDatasetHelpers";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatClipTimestamp,
+  formatQcScore,
   formatSeconds,
   getAlignmentSource,
   getSliceDuration,
+  getSliceSpeakerPurityScore,
+  getSliceTranscriptConfidence,
   getSliceTranscriptText,
   parseTagDraft,
 } from "./workspace-helpers";
@@ -20,6 +31,7 @@ type EditorPaneProps = {
   workspaceError: string | null;
   workspaceEmptyMessage: string | null;
   activeClip: ClipLabItem | null;
+  waveformPeaksUrl?: string | null;
   activeClipAudioUrl: string | null;
   canUndo: boolean;
   canRedo: boolean;
@@ -50,6 +62,22 @@ type EditorPaneProps = {
   onSplitClip: (clipItem: ClipLabItemRef, splitAtSeconds: number) => Promise<number>;
   onMergeClip: (clipItem: ClipLabItemRef) => Promise<number>;
   onRunClipLabModel: (clipItem: ClipLabItemRef, generatorModel: string) => Promise<ClipLabItem>;
+  onMarkReferenceClipCandidate?: (clipItem: ClipLabItemRef, transcriptText: string) => Promise<void>;
+  datasetTagComposer?: {
+    reviewStatus: ReviewStatus;
+    machineFindings: DatasetClipLabPipelineFinding[];
+    reviewerTags: string[];
+    acceptanceStale: boolean;
+    onReviewStatusChange: (status: ReviewStatus) => void | Promise<void>;
+    onAddReviewerTag: (tag: string) => void | Promise<void>;
+    onRemoveReviewerTag: (tag: string) => void | Promise<void>;
+  };
+  datasetTagReadOnly?: {
+    reviewStatus: ReviewStatus;
+    tags: Tag[];
+    message?: string;
+  };
+  datasetEditingDisabled?: boolean;
 };
 
 export default function EditorPane({
@@ -57,6 +85,7 @@ export default function EditorPane({
   workspaceError,
   workspaceEmptyMessage,
   activeClip,
+  waveformPeaksUrl = null,
   activeClipAudioUrl,
   canUndo,
   canRedo,
@@ -71,6 +100,10 @@ export default function EditorPane({
   onSplitClip,
   onMergeClip,
   onRunClipLabModel,
+  onMarkReferenceClipCandidate,
+  datasetTagComposer,
+  datasetTagReadOnly,
+  datasetEditingDisabled = false,
 }: EditorPaneProps) {
   const transcriptEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const waveSurferRef = useRef<WaveSurfer | null>(null);
@@ -92,9 +125,11 @@ export default function EditorPane({
   const [isSavingSlice, setIsSavingSlice] = useState(false);
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [isRunningModel, setIsRunningModel] = useState(false);
+  const [isMarkingReferenceCandidate, setIsMarkingReferenceCandidate] = useState(false);
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
-  const [waveformPeaks, setWaveformPeaks] = useState<WaveformPeaks | null>(null);
   const [waveformError, setWaveformError] = useState<string | null>(null);
+  const [revisionPeaks, setRevisionPeaks] = useState<RevisionPeaksState>(EMPTY_REVISION_PEAKS);
+  const activeRevisionKeyRef = useRef<string | null>(null);
 
   const activeDuration = activeClip ? getSliceDuration(activeClip) : 0;
   const activeAudioRevisionKey = activeClip
@@ -103,9 +138,38 @@ export default function EditorPane({
         active_variant_id: activeClip.active_variant?.id ?? null,
         active_commit_id: activeClip.active_commit?.id ?? null,
         edl_operations: activeClip.active_commit?.edl_operations ?? [],
+        waveform_peaks_url:
+          activeClip.item_metadata && "waveform_peaks_url" in activeClip.item_metadata
+            ? activeClip.item_metadata.waveform_peaks_url
+            : null,
+        effective_audio_revision_key:
+          activeClip.item_metadata && "effective_audio_revision_key" in activeClip.item_metadata
+            ? activeClip.item_metadata.effective_audio_revision_key
+            : null,
       })
     : null;
+  const datasetRenderStatus =
+    activeClip?.item_metadata && "render_status" in activeClip.item_metadata
+      ? (activeClip.item_metadata.render_status as string | null)
+      : null;
+  activeRevisionKeyRef.current = activeAudioRevisionKey;
+  const peaksLoadStateForActiveRevision = useMemo(
+    () =>
+      derivePeaksLoadStateForRevision(revisionPeaks, activeAudioRevisionKey, {
+        waveformPeaksUrl,
+        datasetRenderStatus,
+      }),
+    [revisionPeaks, activeAudioRevisionKey, waveformPeaksUrl, datasetRenderStatus],
+  );
+  const peaksForActiveRevision = useMemo(
+    () => derivePeaksForActiveRevision(revisionPeaks, activeAudioRevisionKey),
+    [revisionPeaks, activeAudioRevisionKey],
+  );
   const capabilities = activeClip?.capabilities;
+  const canEditTranscript = Boolean(capabilities?.can_edit_transcript) && !datasetEditingDisabled;
+  const canEditTags = Boolean(capabilities?.can_edit_tags) && !datasetEditingDisabled;
+  const canSaveClip = Boolean(capabilities?.can_save) && !datasetEditingDisabled;
+  const canSetStatus = Boolean(capabilities?.can_set_status) && !datasetEditingDisabled;
   const draftTagEntries = useMemo(() => parseTagDraft(draftTags), [draftTags]);
   const suggestedTagNames = useMemo(() => {
     const selected = new Set(draftTagEntries.map((tag) => tag.name.toLowerCase()));
@@ -116,6 +180,36 @@ export default function EditorPane({
   const normalizedSelectionStart = Math.min(selectionStart, selectionEnd);
   const normalizedSelectionEnd = Math.max(selectionStart, selectionEnd);
   const hasActiveSelection = normalizedSelectionEnd - normalizedSelectionStart > 0.01;
+  const waveformSecondTicks = useMemo(() => {
+    if (!activeClip || activeDuration <= 0) {
+      return [];
+    }
+    return Array.from({ length: Math.floor(activeDuration) + 1 }, (_, second) => second);
+  }, [activeClip?.id, activeDuration]);
+
+  const pendingPlayheadSecondsRef = useRef<number | null>(null);
+  const playheadRafRef = useRef<number | null>(null);
+
+  const handleWaveformCursorChange = useCallback((time: number) => {
+    pendingPlayheadSecondsRef.current = time;
+    if (playheadRafRef.current !== null) {
+      return;
+    }
+    playheadRafRef.current = window.requestAnimationFrame(() => {
+      playheadRafRef.current = null;
+      if (pendingPlayheadSecondsRef.current !== null) {
+        setPlayheadSeconds(pendingPlayheadSecondsRef.current);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (playheadRafRef.current !== null) {
+        window.cancelAnimationFrame(playheadRafRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!activeClip) {
@@ -143,38 +237,59 @@ export default function EditorPane({
   }, [activeClip?.id]);
 
   useEffect(() => {
-    if (!activeClip) {
-      setWaveformPeaks(null);
+    if (!activeClip || !activeAudioRevisionKey) {
+      setRevisionPeaks(EMPTY_REVISION_PEAKS);
+      setWaveformError(null);
       return;
     }
 
-    let cancelled = false;
-    setWaveformPeaks(null);
+    if (waveformPeaksUrl && datasetRenderStatus === "pending") {
+      setRevisionPeaks(initialRevisionPeaksForFetch(activeAudioRevisionKey));
+      return;
+    }
+
+    const revisionKeyAtStart = activeAudioRevisionKey;
+    setRevisionPeaks(initialRevisionPeaksForFetch(revisionKeyAtStart));
     setWaveformError(null);
 
+    let cancelled = false;
     void (async () => {
       try {
-        const nextPeaks = await fetchClipLabWaveformPeaks(activeClip.id, 960);
-        if (cancelled) {
+        const nextPeaks = waveformPeaksUrl
+          ? await fetchDatasetClipLabWaveformPeaks(waveformPeaksUrl)
+          : await fetchClipLabWaveformPeaks(activeClip.id, 960);
+        if (cancelled || activeRevisionKeyRef.current !== revisionKeyAtStart) {
           return;
         }
-        setWaveformPeaks(nextPeaks);
+        setRevisionPeaks({
+          revisionKey: revisionKeyAtStart,
+          status: "ready",
+          peaks: nextPeaks.peaks,
+        });
       } catch (error) {
-        if (cancelled) {
+        if (cancelled || activeRevisionKeyRef.current !== revisionKeyAtStart) {
           return;
         }
         const message =
           error instanceof Error ? error.message : "Waveform peaks failed to load for this slice.";
         console.error(message);
-        setWaveformError(message);
-        setWaveformPeaks(null);
+        if (waveformPeaksUrl) {
+          setWaveformError(null);
+        } else {
+          setWaveformError(message);
+        }
+        setRevisionPeaks({
+          revisionKey: revisionKeyAtStart,
+          status: "failed",
+          peaks: null,
+        });
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [activeClip?.id, activeAudioRevisionKey]);
+  }, [activeClip?.id, activeAudioRevisionKey, waveformPeaksUrl, datasetRenderStatus]);
 
   useEffect(() => {
     const editor = transcriptEditorRef.current;
@@ -245,7 +360,7 @@ export default function EditorPane({
   }
 
   async function handleSaveClip(forceStatus?: ReviewStatus): Promise<ClipLabItem | null> {
-    if (!activeClip || !capabilities?.can_save) {
+    if (!activeClip || !canSaveClip) {
       return null;
     }
 
@@ -258,7 +373,11 @@ export default function EditorPane({
       const workingClip = await onSaveClipLabItem({ id: activeClip.id }, {
         modified_text:
           draftTranscript !== getSliceTranscriptText(activeClip) ? draftTranscript : undefined,
-        tags: draftTags.trim() !== currentTagDraft.trim() ? nextTags : undefined,
+        tags: datasetTagComposer
+          ? undefined
+          : draftTags.trim() !== currentTagDraft.trim()
+            ? nextTags
+            : undefined,
         status: forceStatus && activeClip.status !== forceStatus ? forceStatus : undefined,
         message:
           forceStatus === "accepted"
@@ -280,8 +399,48 @@ export default function EditorPane({
     }
   }
 
+  async function handleMarkReferenceClipCandidate() {
+    if (!activeClip || !onMarkReferenceClipCandidate) {
+      return;
+    }
+
+    const transcriptText = draftTranscript.trim();
+    if (!transcriptText) {
+      setEditorNotice("Add transcript text before marking this clip as a reference candidate.");
+      return;
+    }
+
+    setIsMarkingReferenceCandidate(true);
+    pausePlayback();
+
+    try {
+      if (canSaveClip) {
+        const currentTagDraft = activeClip.tags.map((tag) => tag.name).join(", ");
+        const workingClip = await onSaveClipLabItem({ id: activeClip.id }, {
+          modified_text:
+            draftTranscript !== getSliceTranscriptText(activeClip) ? draftTranscript : undefined,
+          tags: datasetTagComposer
+            ? undefined
+            : draftTags.trim() !== currentTagDraft.trim()
+              ? parseTagDraft(draftTags)
+              : undefined,
+          message: "Saved before reference clip candidate export",
+          is_milestone: true,
+        });
+        setDraftTranscript(getSliceTranscriptText(workingClip));
+        setDraftTags(workingClip.tags.map((tag) => tag.name).join(", "));
+      }
+      await onMarkReferenceClipCandidate({ id: activeClip.id }, transcriptText);
+      setEditorNotice("Marked as reference clip candidate.");
+    } catch (error) {
+      setEditorNotice(error instanceof Error ? error.message : "Reference clip candidate export failed.");
+    } finally {
+      setIsMarkingReferenceCandidate(false);
+    }
+  }
+
   async function handleAcceptNextAndPlay() {
-    if (!activeClip || !capabilities?.can_set_status || isSavingSlice || isApplyingEdit) {
+    if (!activeClip || !canSetStatus || isSavingSlice || isApplyingEdit) {
       return;
     }
 
@@ -301,7 +460,7 @@ export default function EditorPane({
   }
 
   async function handleRejectNextAndPlay() {
-    if (!activeClip || !capabilities?.can_set_status || isSavingSlice || isApplyingEdit) {
+    if (!activeClip || !canSetStatus || isSavingSlice || isApplyingEdit) {
       return;
     }
 
@@ -614,15 +773,24 @@ export default function EditorPane({
                   className="primary-button"
                   type="button"
                   onClick={() => void handleSaveClip()}
-                  disabled={!activeClip || !capabilities?.can_save || isSavingSlice}
+                  disabled={!activeClip || !canSaveClip || isSavingSlice || isMarkingReferenceCandidate}
                 >
                   Save
                 </button>
+                {onMarkReferenceClipCandidate ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleMarkReferenceClipCandidate()}
+                    disabled={!activeClip || isSavingSlice || isMarkingReferenceCandidate || !draftTranscript.trim()}
+                  >
+                    {isMarkingReferenceCandidate ? "Marking..." : "Mark as reference clip candidate"}
+                  </button>
+                ) : null}
                 <button
                   className="primary-button"
                   type="button"
                   onClick={() => void handleAcceptNextAndPlay()}
-                  disabled={!activeClip || !capabilities?.can_set_status || isSavingSlice}
+                  disabled={!activeClip || !canSetStatus || isSavingSlice || isMarkingReferenceCandidate}
                 >
                   Accept & Next
                 </button>
@@ -630,7 +798,7 @@ export default function EditorPane({
                   className="primary-button"
                   type="button"
                   onClick={() => void handleRejectNextAndPlay()}
-                  disabled={!activeClip || !capabilities?.can_set_status || isSavingSlice || isApplyingEdit}
+                  disabled={!activeClip || !canSetStatus || isSavingSlice || isApplyingEdit}
                 >
                   Reject & Next
                 </button>
@@ -672,7 +840,10 @@ export default function EditorPane({
               <WaveformPane
                 audioUrl={activeClipAudioUrl ?? ""}
                 durationSeconds={activeDuration}
-                peaks={waveformPeaks?.peaks ?? null}
+                peaks={peaksForActiveRevision}
+                loadRevisionKey={activeAudioRevisionKey}
+                peaksLoadState={peaksLoadStateForActiveRevision}
+                requirePeaksBeforeLoad={Boolean(waveformPeaksUrl)}
                 desiredCursorSeconds={playheadSeconds}
                 selectionStart={selectionStart}
                 selectionEnd={selectionEnd}
@@ -680,7 +851,7 @@ export default function EditorPane({
                   setSelectionStart(start);
                   setSelectionEnd(end);
                 }}
-                onCursorChange={setPlayheadSeconds}
+                onCursorChange={handleWaveformCursorChange}
                 onHoverTimeChange={setHoverSeconds}
                 onReady={(instance) => {
                   waveSurferRef.current = instance;
@@ -690,7 +861,7 @@ export default function EditorPane({
               />
 
               <div className="waveform-second-scale" aria-hidden="true">
-                {Array.from({ length: Math.floor(activeDuration) + 1 }, (_, second) => (
+                {waveformSecondTicks.map((second) => (
                   <span
                     key={`sec-tick-${activeClip.id}-${second}`}
                     className="waveform-second-tick"
@@ -786,7 +957,7 @@ export default function EditorPane({
           value={draftTranscript}
           onChange={(event) => setDraftTranscript(event.target.value)}
           placeholder="Transcript text"
-          disabled={!capabilities?.can_edit_transcript}
+          disabled={!canEditTranscript}
         />
 
         <div className="transcript-footer">
@@ -800,90 +971,145 @@ export default function EditorPane({
 
         <div className="transcript-meta-grid">
           {activeClip ? (
-            <div className="selection-panel asr-panel">
+            <div className="selection-panel qc-scores-panel">
               <div className="selection-header">
-                <strong>ASR</strong>
-                <button type="button" disabled={!activeClip.can_run_asr}>
-                  {activeClip.can_run_asr ? "Run ASR" : "Run ASR (Soon)"}
-                </button>
+                <strong>QC Scores</strong>
               </div>
-              <p className="muted-copy">
-                Source: {activeClip.transcript_source ?? "unknown"}
-              </p>
-              <p className="muted-copy">
-                {activeClip.asr_placeholder_message ?? "ASR controls will land here."}
-              </p>
+              <div className="clip-qc-score-grid">
+                <div className="clip-qc-score-card">
+                  <span className="eyebrow">Transcript Confidence</span>
+                  <strong>{formatQcScore(getSliceTranscriptConfidence(activeClip))}</strong>
+                </div>
+                <div className="clip-qc-score-card">
+                  <span className="eyebrow">Speaker Purity</span>
+                  <strong>{formatQcScore(getSliceSpeakerPurityScore(activeClip))}</strong>
+                </div>
+              </div>
             </div>
           ) : null}
 
           <div className="selection-panel">
-            <div className="selection-header">
-              <strong>Tags</strong>
-              <button
-                className="primary-button"
-                type="button"
-                onClick={() => void handleSaveClip()}
-                disabled={!capabilities?.can_save}
-              >
-                Save
-              </button>
-            </div>
-            <p className="muted-copy">
-              Pipeline status is strict control flow. Tags are subjective QA metadata.
-            </p>
-            <div className="tag-token-list">
-              {draftTagEntries.length > 0 ? (
-                draftTagEntries.map((tag) => (
-                  <button
-                    key={`draft-${tag.name}`}
-                    type="button"
-                    className="tag-pill"
-                    style={{ backgroundColor: tag.color }}
-                    onClick={() => removeTagFromDraft(tag.name)}
-                    title="Remove tag"
-                    disabled={!capabilities?.can_edit_tags}
-                  >
-                    {tag.name} ×
-                  </button>
-                ))
-              ) : (
-                <span className="muted-copy">No tags on this slice yet.</span>
-              )}
-            </div>
-            <div className="tag-input-row">
-              <input
-                className="search-input tag-entry-input"
-                value={tagInputDraft}
-                onChange={(event) => setTagInputDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (!capabilities?.can_edit_tags) {
-                    return;
-                  }
-                  if (event.key === "Enter" || event.key === ",") {
-                    event.preventDefault();
-                    handleAddTagFromInput();
-                  }
-                }}
-                placeholder="Add tag (press Enter)"
-                disabled={!capabilities?.can_edit_tags}
+            {datasetTagReadOnly ? (
+              <div className="tag-composer-content">
+                <div className="selection-header">
+                  <strong>Custom tags</strong>
+                </div>
+                {datasetTagReadOnly.message ? (
+                  <p className="editor-notice">{datasetTagReadOnly.message}</p>
+                ) : null}
+                <div className="tag-token-list status-group">
+                  {datasetTagReadOnly.tags.length > 0 ? (
+                    datasetTagReadOnly.tags.map((tag) => (
+                      <span key={`readonly-${tag.id}`} className="status-button">
+                        {tag.name}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="muted-copy">No custom tags yet.</span>
+                  )}
+                </div>
+              </div>
+            ) : datasetTagComposer ? (
+              <TagComposer
+                reviewStatus={datasetTagComposer.reviewStatus}
+                machineFindings={datasetTagComposer.machineFindings}
+                reviewerTags={datasetTagComposer.reviewerTags}
+                suggestions={suggestedTagNames}
+                disabled={!canEditTags}
+                acceptanceStale={datasetTagComposer.acceptanceStale}
+                onReviewStatusChange={datasetTagComposer.onReviewStatusChange}
+                onAddReviewerTag={datasetTagComposer.onAddReviewerTag}
+                onRemoveReviewerTag={datasetTagComposer.onRemoveReviewerTag}
               />
-              <button type="button" onClick={handleAddTagFromInput} disabled={!capabilities?.can_edit_tags}>
-                Add
-              </button>
-            </div>
-            <div className="tag-suggestion-wrap">
-              {suggestedTagNames.map((tagName) => (
-                <button
-                  key={`suggested-tag-${tagName}`}
-                  type="button"
-                  className="tag-suggestion-pill"
-                  onClick={() => addTagToDraft(tagName)}
-                  disabled={!capabilities?.can_edit_tags}
-                >
-                  + {tagName}
-                </button>
-              ))}
-            </div>
+            ) : datasetEditingDisabled ? (
+              <div className="tag-composer-content">
+                <div className="selection-header">
+                  <strong>Custom tags</strong>
+                </div>
+                <p className="muted-copy">Clip Lab review edits are unavailable right now.</p>
+                <div className="tag-token-list status-group">
+                  {activeClip?.tags.some(isReviewerDisplayTag) ? (
+                    activeClip.tags.filter(isReviewerDisplayTag).map((tag) => (
+                      <span key={`disabled-${tag.id}`} className="status-button">
+                        {tag.name}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="muted-copy">No custom tags yet.</span>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="selection-header">
+                  <strong>Tags</strong>
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => void handleSaveClip()}
+                    disabled={!canSaveClip}
+                  >
+                    Save
+                  </button>
+                </div>
+                <p className="muted-copy">
+                  Pipeline status is strict control flow. Tags are subjective QA metadata.
+                </p>
+                <div className="tag-token-list">
+                  {draftTagEntries.length > 0 ? (
+                    draftTagEntries.map((tag) => (
+                      <button
+                        key={`draft-${tag.name}`}
+                        type="button"
+                        className="tag-pill"
+                        style={{ backgroundColor: tag.color }}
+                        onClick={() => removeTagFromDraft(tag.name)}
+                        title="Remove tag"
+                        disabled={!canEditTags}
+                      >
+                        {tag.name} ×
+                      </button>
+                    ))
+                  ) : (
+                    <span className="muted-copy">No tags on this slice yet.</span>
+                  )}
+                </div>
+                <div className="tag-input-row">
+                  <input
+                    className="search-input tag-entry-input"
+                    value={tagInputDraft}
+                    onChange={(event) => setTagInputDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (!canEditTags) {
+                        return;
+                      }
+                      if (event.key === "Enter" || event.key === ",") {
+                        event.preventDefault();
+                        handleAddTagFromInput();
+                      }
+                    }}
+                    placeholder="Add tag (press Enter)"
+                    disabled={!canEditTags}
+                  />
+                  <button type="button" onClick={handleAddTagFromInput} disabled={!canEditTags}>
+                    Add
+                  </button>
+                </div>
+                <div className="tag-suggestion-wrap">
+                  {suggestedTagNames.map((tagName) => (
+                    <button
+                      key={`suggested-tag-${tagName}`}
+                      type="button"
+                      className="tag-suggestion-pill"
+                      onClick={() => addTagToDraft(tagName)}
+                      disabled={!canEditTags}
+                    >
+                      + {tagName}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
       </section>

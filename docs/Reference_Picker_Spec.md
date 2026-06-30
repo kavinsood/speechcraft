@@ -17,20 +17,32 @@ This document also intentionally surfaces the implementation tensions that exist
 
 ## Current Repo Reality
 
-Speechcraft today is still a Phase 1 slice-review workstation.
+Speechcraft is now a staged dataset workstation, not only the original Phase 1 slice-review app.
+
+The main product path is:
+
+```text
+Ingest -> Overview -> Slicer -> QC -> Lab -> Export
+```
+
+Reference remains a separate workstation route outside that main path.
 
 What exists now:
 
-- top-level app shell in `frontend/src/App.tsx`
-- `ingest`, `label`, and a first-pass `reference` page now exist
-- `label` is built around `Slice`, `AudioVariant`, and `EditCommit`
-- source recordings now exist on both backend and frontend
-- Clip Lab behavior exists only as slice-scoped variant creation / switching
-- `ReferenceAsset` and `ReferenceVariant` now exist as real library objects
-- there is still no generic background job layer yet
-- export and artifact warmup are still synchronous
+- top-level staged app shell in `frontend/src/App.tsx`
+- project creation and `.wav` ingest
+- Overview with preparation, ASR, and alignment
+- run-centric Slicer over aligned prepared recordings
+- persisted QC runs and per-slice QC results
+- Lab with QC handoff and live human review override
+- Export page and export run surface
+- `reference` route preserved as a standalone workstation
+- `Slice`, `AudioVariant`, and `EditCommit` still anchor Lab review
+- `SourceRecording` now exists across backend and frontend
+- `ReferenceAsset` and `ReferenceVariant` exist as real library objects
+- `ProcessingJob` exists for queued worker-backed pipeline work
 
-That means the Reference Picker is not a tiny add-on.
+That means the Reference Picker is still not a tiny add-on.
 
 It is the first feature in this repo that:
 
@@ -53,7 +65,7 @@ The guiding stance for this branch is:
 
 ## Current Verdict
 
-The architecture direction is fundamentally sound, but the branch must ship a narrow Phase 1.
+The architecture direction is fundamentally sound, but Reference should stay scoped as a separate workstation while the main Ingest -> Export pipeline matures.
 
 The spine of the feature is:
 
@@ -66,7 +78,9 @@ The document should not be read as permission to build every future surface imme
 
 ## Current Implementation Status
 
-As of `2026-03-21`, the branch has crossed the first real picker threshold.
+As of `2026-04-22`, Reference is preserved as its own workstation route while the main pipeline has moved forward around Ingest, Overview, Slicer, QC, Lab, and Export.
+
+The notes below still describe the Reference Picker feature plan and implementation status; read "Phase 1" in this document as Reference Picker phase language, not the overall Speechcraft product phase.
 
 ### Completed
 

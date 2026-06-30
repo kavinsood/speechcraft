@@ -11,7 +11,7 @@ import threading
 import subprocess
 import tempfile
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,36 +19,47 @@ from uuid import uuid4
 
 import numpy as np
 from sqlalchemy import func
+from sqlalchemy import insert
+from sqlalchemy import event
 from sqlalchemy import update as sql_update
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, SQLModel, create_engine, delete, select
 
-WAVEFORM_PEAKS_CACHE_VERSION = 2
-
+from .reference_acoustic_signature import (
+    ACOUSTIC_SIGNATURE_V2_ID,
+    hdbscan_min_cluster_size_for_count,
+    acoustic_signature_v2_features,
+    cluster_risk_flag_for_label,
+    crop_mono_samples,
+    dumb_cluster_display_labels,
+    embedding_space_descriptor_v2,
+    hdbscan_cluster_labels,
+    mono_pcm16_samples_from_wav_bytes,
+    nms_candidate_indices,
+    normalize_embedding_vector,
+    zscore_rows,
+)
+from .reference_cutpoint_assembly import (
+    analysis_to_native_seconds,
+    build_source_audio_maps,
+    load_cutpoint_windows,
+)
 from .models import (
-    AudioVariant,
-    AudioVariantCreate,
-    AudioVariantRunRequest,
-    AudioVariantView,
-    ActiveVariantUpdate,
-    ClipLabCapabilitiesView,
-    ClipLabCommitView,
-    ClipLabItemView,
-    ClipLabTranscriptView,
-    ClipLabVariantView,
-    EditCommit,
     ExportRun,
     ExportPreview,
     ImportBatch,
     ImportBatchCreate,
     JobKind,
     JobStatus,
-    MediaCleanupResult,
     ProcessingJob,
     ProcessingJobView,
+    ProcessingRun,
+    ProcessingRunStatus,
+    ProjectPreparationRequest,
+    ProjectPreparationRun,
+    ProjectRecordingJobsRun,
     ProjectSummary,
     ReferenceAsset,
-    ReferenceAssetCreateFromSlice,
     ReferenceAssetCreateFromCandidate,
     ReferenceAssetDetail,
     ReferenceEmbeddingEvaluationRequest,
@@ -69,55 +80,30 @@ from .models import (
     ReferenceVariantView,
     ReviewStatus,
     ReferenceRunStatus,
-    SliceRevision,
-    SliceSaveRequest,
-    SliceDetail,
-    SliceSummary,
-    Slice,
-    SliceEdlUpdate,
-    SliceSplitRequest,
-    SliceTagLink,
-    SliceTagUpdate,
-    SliceStatusUpdate,
-    SliceTranscriptUpdate,
     SourceAlignmentRequest,
     SourceRecordingArtifact,
     SourceRecordingArtifactView,
     SourceRecordingQueueView,
-    SourceSlicingRequest,
     SourceTranscriptionRequest,
     SourceRecordingView,
-    TagPayload,
-    TagView,
     SourceRecording,
     SourceRecordingCreate,
     RecordingDerivativeCreate,
-    Tag,
-    TranscriptSummaryView,
-    TranscriptView,
-    Transcript,
-    WaveformPeaks,
     utc_now,
 )
-from .slicer_algo import SlicerConfig, plan_slices
 
 DEFAULT_PROCESSING_JOB_STALE_AFTER_SECONDS = 60.0
-LOCKED_SLICE_OVERLAP_RATIO_THRESHOLD = 0.10
-LOCKED_SLICE_DRIFT_WARNING_SECONDS = 0.08
-
 DATA_VERSION_EXTERNAL_VARIANT_REHOME = 1
-DATA_VERSION_SLICE_REVISION_HISTORY = 2
 DATA_VERSION_REFERENCE_PICKER_SCHEMA = 3
 DATA_VERSION_REFERENCE_VARIANT_RELATIVE_PATHS = 4
 DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL = 5
 LATEST_DATA_VERSION = DATA_VERSION_LEGACY_SOURCE_RECORDING_AUDIO_BACKFILL
 REFERENCE_RUN_EMBEDDING_ARTIFACT_SCHEMA_VERSION = 2
+REFERENCE_CANDIDATE_COUNT_CAP_DEFAULT = 500
+REFERENCE_CANDIDATE_COUNT_CAP_MIN = 8
+REFERENCE_CANDIDATE_COUNT_CAP_MAX = 2000
 REFERENCE_ASSET_EMBEDDING_ARTIFACT_SCHEMA_VERSION = 1
 LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE = "legacy_seed_clip_source"
-
-
-class SliceSaveValidationError(ValueError):
-    """Raised when a slice save request is syntactically valid but semantically invalid."""
 
 
 def _pcm16le_as_float64(raw: bytes) -> np.ndarray:
@@ -188,14 +174,23 @@ class SQLiteRepository:
         self.exports_root.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(
             f"sqlite:///{self.db_path}",
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
+        @event.listens_for(self.engine, "connect")
+        def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            finally:
+                cursor.close()
         SQLModel.metadata.create_all(self.engine)
+        self._migrate_dataset_run_schema()
         self._migrate_enum_storage()
-        self._migrate_editcommit_schema()
+        self._migrate_importbatch_schema()
         self._migrate_processingjob_schema()
         self._purge_legacy_review_window_schema()
-        self._migrate_slice_schema()
         self._migrate_source_recording_artifact_rows()
         self._seed_if_needed()
         self._run_data_migrations()
@@ -219,6 +214,20 @@ class SQLiteRepository:
         with self._session() as session:
             return self._project_summary(session, self._get_batch(session, project_id))
 
+    def list_project_preparation_jobs(self, project_id: str) -> list[ProcessingJobView]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            jobs = session.exec(
+                select(ProcessingJob)
+                .where(ProcessingJob.kind == JobKind.PREPROCESS)
+                .order_by(ProcessingJob.created_at.desc(), ProcessingJob.id.desc())
+            ).all()
+            return [
+                self._processing_job_view(job)
+                for job in jobs
+                if dict(job.input_payload or {}).get("project_id") == project_id
+            ]
+
     def list_source_recordings(self, project_id: str) -> list[SourceRecordingView]:
         with self._session() as session:
             self._get_batch(session, project_id)
@@ -227,7 +236,7 @@ class SQLiteRepository:
                 .where(SourceRecording.batch_id == project_id)
                 .order_by(SourceRecording.parent_recording_id.is_not(None), SourceRecording.id)
             ).all()
-            return [self._source_recording_view(recording) for recording in recordings]
+            return [self._source_recording_view(recording, self._ensure_source_recording_artifact(session, recording)) for recording in recordings]
 
     def list_reference_runs(self, project_id: str) -> list[ReferenceRunView]:
         with self._session() as session:
@@ -257,7 +266,7 @@ class SQLiteRepository:
                 if recording.batch_id != project_id:
                     raise ValueError("Reference run recordings must belong to the selected project")
 
-            run_id = self._new_id("reference-run")
+            run_id = self._new_reference_run_id(session, project_id)
             artifact_root = self._reference_run_artifact_root(run_id)
             artifact_root.mkdir(parents=True, exist_ok=True)
             config = {
@@ -267,8 +276,13 @@ class SQLiteRepository:
                     payload.target_durations,
                     payload.mode,
                 ),
-                "candidate_count_cap": max(8, min(int(payload.candidate_count_cap or 60), 200)),
+                "candidate_count_cap": self._normalize_reference_candidate_count_cap(payload.candidate_count_cap),
                 "overlap_stride_ratio": 0.5,
+                "dataset_run_id": payload.dataset_run_id,
+                "cutpoint_stride": 2,
+                "nms_overlap_threshold": 0.6,
+                "hdbscan_min_cluster_size": "dynamic:max(5, int(n*0.03))",
+                "candidate_assembly_backend": "auto",
             }
             run = ReferencePickerRun(
                 id=run_id,
@@ -312,10 +326,16 @@ class SQLiteRepository:
             artifact_root = Path(run.artifact_root)
 
         try:
-            candidates = self._build_reference_run_candidates(run_id, project_id, config)
-            embeddings = self._build_reference_run_candidate_embeddings(candidates)
+            candidates, embeddings, embedding_space = self._build_reference_run_candidate_set(
+                run_id,
+                project_id,
+                config,
+            )
             embedding_dimension = len(embeddings[0]) if embeddings else 17
-            embedding_space = self._current_reference_embedding_space_descriptor(embedding_dimension)
+            if embedding_space is None:
+                embedding_space = self._current_reference_embedding_space_descriptor(embedding_dimension)
+            else:
+                config["candidate_assembly_backend"] = "cutpoint_overlap"
             candidates = [
                 candidate.model_copy(update={"embedding_space_id": embedding_space["id"]})
                 for candidate in candidates
@@ -571,19 +591,6 @@ class SQLiteRepository:
         candidate = self._get_reference_candidate(artifact_root, candidate_id)
         return self._ensure_reference_candidate_preview(artifact_root, candidate)
 
-    def get_project_slices(self, project_id: str) -> list[SliceSummary]:
-        with self._session() as session:
-            self._get_batch(session, project_id)
-            return [self._to_slice_summary(slice_row) for slice_row in self._get_batch_slice_summaries(session, project_id)]
-
-    def get_slice_detail(self, slice_id: str) -> SliceDetail:
-        with self._session() as session:
-            return self._get_slice_detail(session, slice_id)
-
-    def get_slice_clip_lab_item(self, slice_id: str) -> ClipLabItemView:
-        with self._session() as session:
-            return self._to_clip_lab_item_from_slice(self._get_loaded_slice(session, slice_id))
-
     def get_processing_job(self, job_id: str) -> ProcessingJobView:
         with self._session() as session:
             return self._processing_job_view(self._get_processing_job(session, job_id))
@@ -606,23 +613,120 @@ class SQLiteRepository:
                 )
                 .order_by(SourceRecording.id.asc())
             ).all()
-            if not recordings:
-                return []
-
-            slice_counts = dict(
-                session.exec(
-                    select(Slice.source_recording_id, func.count(Slice.id))
-                    .where(Slice.source_recording_id.in_([recording.id for recording in recordings]))
-                    .group_by(Slice.source_recording_id)
-                ).all()
-            )
             return [
-                self._source_recording_queue_view(
-                    recording,
-                    slice_count=int(slice_counts.get(recording.id, 0) or 0),
-                )
+                self._source_recording_queue_view(recording, slice_count=0)
                 for recording in recordings
             ]
+
+
+    def run_project_preparation(
+        self,
+        project_id: str,
+        payload: ProjectPreparationRequest,
+    ) -> ProjectPreparationRun:
+        normalized_payload = self._normalize_project_preparation_payload(payload)
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            job = ProcessingJob(
+                id=self._new_id("job"),
+                kind=JobKind.PREPROCESS,
+                status=JobStatus.PENDING,
+                source_recording_id=None,
+                input_payload={
+                    "project_id": project_id,
+                    **normalized_payload,
+                },
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            return ProjectPreparationRun(job=self._processing_job_view(job), created_recordings=[])
+
+    def enqueue_project_transcription(
+        self,
+        project_id: str,
+        payload: SourceTranscriptionRequest,
+    ) -> ProjectRecordingJobsRun:
+        normalized_payload = self._normalize_source_transcription_payload(payload)
+        with self._session() as session:
+            batch = self._get_batch(session, project_id)
+            prepared_output_group_id = batch.active_prepared_output_group_id
+            if not prepared_output_group_id:
+                raise ValueError("Run preparation before launching ASR")
+            recordings = self._prepared_recordings_for_group(session, project_id, prepared_output_group_id)
+            if not recordings:
+                raise ValueError("Active prepared output group has no prepared recordings")
+            jobs: list[ProcessingJob] = []
+            for recording in recordings:
+                job = ProcessingJob(
+                    id=self._new_id("job"),
+                    kind=JobKind.SOURCE_TRANSCRIPTION,
+                    status=JobStatus.PENDING,
+                    source_recording_id=recording.id,
+                    input_payload=normalized_payload,
+                )
+                session.add(job)
+                jobs.append(job)
+            session.commit()
+            for job in jobs:
+                session.refresh(job)
+            return ProjectRecordingJobsRun(
+                project_id=project_id,
+                prepared_output_group_id=prepared_output_group_id,
+                jobs=[self._processing_job_view(job) for job in jobs],
+            )
+
+    def enqueue_project_alignment(
+        self,
+        project_id: str,
+        payload: SourceAlignmentRequest,
+    ) -> ProjectRecordingJobsRun:
+        normalized_payload = self._normalize_source_alignment_payload(payload)
+        with self._session() as session:
+            batch = self._get_batch(session, project_id)
+            prepared_output_group_id = batch.active_prepared_output_group_id
+            if not prepared_output_group_id:
+                raise ValueError("Run preparation before launching alignment")
+            recordings = self._prepared_recordings_for_group(session, project_id, prepared_output_group_id)
+            if not recordings:
+                raise ValueError("Active prepared output group has no prepared recordings")
+            active_transcription = session.exec(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.kind == JobKind.SOURCE_TRANSCRIPTION,
+                    ProcessingJob.source_recording_id.in_([recording.id for recording in recordings]),
+                    ProcessingJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+                )
+            ).first()
+            if active_transcription is not None:
+                raise ValueError("Wait for ASR to complete before launching alignment")
+            not_transcribed = [
+                recording.id
+                for recording in recordings
+                if recording.source_artifact is None
+                or recording.source_artifact.transcript_status not in {"ok", "patched"}
+            ]
+            if not_transcribed:
+                raise ValueError("Run ASR before launching alignment")
+            jobs: list[ProcessingJob] = []
+            for recording in recordings:
+                job = ProcessingJob(
+                    id=self._new_id("job"),
+                    kind=JobKind.SOURCE_ALIGNMENT,
+                    status=JobStatus.PENDING,
+                    source_recording_id=recording.id,
+                    input_payload=normalized_payload,
+                )
+                session.add(job)
+                jobs.append(job)
+            session.commit()
+            for job in jobs:
+                session.refresh(job)
+            return ProjectRecordingJobsRun(
+                project_id=project_id,
+                prepared_output_group_id=prepared_output_group_id,
+                jobs=[self._processing_job_view(job) for job in jobs],
+            )
 
     def set_source_recording_artifact_paths(
         self,
@@ -674,6 +778,7 @@ class SQLiteRepository:
         recording_id: str,
         payload: SourceTranscriptionRequest,
     ) -> ProcessingJobView:
+        normalized_payload = self._normalize_source_transcription_payload(payload)
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
             job = ProcessingJob(
@@ -681,7 +786,7 @@ class SQLiteRepository:
                 kind=JobKind.SOURCE_TRANSCRIPTION,
                 status=JobStatus.PENDING,
                 source_recording_id=recording.id,
-                input_payload=payload.model_dump(mode="json"),
+                input_payload=normalized_payload,
             )
             session.add(job)
             session.commit()
@@ -693,6 +798,7 @@ class SQLiteRepository:
         recording_id: str,
         payload: SourceAlignmentRequest,
     ) -> ProcessingJobView:
+        normalized_payload = self._normalize_source_alignment_payload(payload)
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
             job = ProcessingJob(
@@ -700,31 +806,16 @@ class SQLiteRepository:
                 kind=JobKind.SOURCE_ALIGNMENT,
                 status=JobStatus.PENDING,
                 source_recording_id=recording.id,
-                input_payload=payload.model_dump(mode="json"),
+                input_payload=normalized_payload,
             )
             session.add(job)
             session.commit()
             session.refresh(job)
             return self._processing_job_view(job)
 
-    def enqueue_source_slicing(
-        self,
-        recording_id: str,
-        payload: SourceSlicingRequest,
-    ) -> ProcessingJobView:
-        with self._session() as session:
-            recording = self._get_source_recording(session, recording_id)
-            job = ProcessingJob(
-                id=self._new_id("job"),
-                kind=JobKind.SOURCE_SLICING,
-                status=JobStatus.PENDING,
-                source_recording_id=recording.id,
-                input_payload=payload.model_dump(mode="json"),
-            )
-            session.add(job)
-            session.commit()
-            session.refresh(job)
-            return self._processing_job_view(job)
+    def enqueue_source_slicing(self, recording_id: str, payload: object) -> ProcessingJobView:
+        raise ValueError("removed")
+
 
     def list_source_recording_jobs(self, recording_id: str) -> list[ProcessingJobView]:
         with self._session() as session:
@@ -744,538 +835,36 @@ class SQLiteRepository:
             ).all()
             return [self._normalize_export_run(run) for run in runs]
 
-    def cleanup_project_media(self, project_id: str) -> MediaCleanupResult:
-        with self._session() as session:
-            self._get_batch(session, project_id)
-            deleted_slice_ids: list[str] = []
-            deleted_variant_ids: list[str] = []
-            deleted_paths: list[str] = []
-
-            superseded_slices = [
-                slice_row
-                for slice_row in self._get_all_batch_slices(session, project_id)
-                if self._slice_metadata(slice_row).get("is_superseded", False)
-            ]
-            for slice_row in superseded_slices:
-                deleted_slice_ids.append(slice_row.id)
-                deleted_variant_ids.extend(variant.id for variant in slice_row.variants)
-                deleted_paths.extend(variant.file_path for variant in slice_row.variants)
-                variant_ids = [variant.id for variant in slice_row.variants]
-                commit_ids = [commit.id for commit in slice_row.commits]
-                session.exec(delete(SliceTagLink).where(SliceTagLink.slice_id == slice_row.id))
-                if variant_ids:
-                    session.exec(delete(AudioVariant).where(AudioVariant.id.in_(variant_ids)))
-                if commit_ids:
-                    session.exec(delete(EditCommit).where(EditCommit.id.in_(commit_ids)))
-                session.exec(delete(Transcript).where(Transcript.slice_id == slice_row.id))
-                session.exec(delete(Slice).where(Slice.id == slice_row.id))
-
-            session.flush()
-
-            remaining_slices = self._get_all_batch_slices(session, project_id)
-            protected_variant_ids = self._get_revision_referenced_variant_ids(
-                session,
-                [slice_row.id for slice_row in remaining_slices],
-            )
-            for slice_row in remaining_slices:
-                for variant in list(slice_row.variants):
-                    if variant.id in protected_variant_ids:
-                        continue
-                    if variant.id == slice_row.active_variant_id or variant.is_original:
-                        continue
-                    deleted_variant_ids.append(variant.id)
-                    deleted_paths.append(variant.file_path)
-                    session.delete(variant)
-
-            session.commit()
-
-        deleted_file_count = self._delete_unreferenced_media_files(deleted_paths)
-        deleted_file_count += self._prune_derived_media_cache()
-        return MediaCleanupResult(
-            project_id=project_id,
-            deleted_slice_count=len(deleted_slice_ids),
-            deleted_variant_count=len(deleted_variant_ids),
-            deleted_file_count=deleted_file_count,
-            skipped_reference_count=0,
-            deleted_slice_ids=deleted_slice_ids,
-            deleted_variant_ids=deleted_variant_ids,
-        )
-
-    def save_slice_state(self, slice_id: str, payload: SliceSaveRequest) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            transcript = self._get_transcript(session, slice_row.id)
-            current_transcript = self._transcript_text(transcript)
-            current_tags = self._normalized_tag_payloads(self._current_tag_payloads(session, slice_row))
-            next_transcript = payload.modified_text if payload.modified_text is not None else current_transcript
-            next_tags = (
-                self._normalized_tag_payloads(payload.tags)
-                if payload.tags is not None
-                else current_tags
-            )
-            next_status = payload.status if payload.status is not None else slice_row.status
-
-            state_changed = (
-                next_transcript != current_transcript
-                or next_tags != current_tags
-                or next_status != slice_row.status
-            )
-            if not state_changed and not payload.is_milestone:
-                message_only_request = (
-                    payload.message is not None
-                    and payload.modified_text is None
-                    and payload.tags is None
-                    and payload.status is None
-                )
-                if message_only_request:
-                    raise SliceSaveValidationError("message requires milestone or state change")
-                return self._get_slice_detail(session, slice_id)
-
-            if payload.modified_text is not None:
-                transcript.modified_text = payload.modified_text
-                transcript.is_modified = payload.modified_text != transcript.original_text
-                session.add(transcript)
-                self._patch_source_transcript_for_slice(
-                    session,
-                    slice_row,
-                    payload.modified_text,
-                    remove_patch=not transcript.is_modified,
-                )
-
-            if payload.tags is not None:
-                self._replace_slice_tags(session, slice_row, payload.tags)
-
-            if payload.status is not None:
-                slice_row.status = payload.status
-
-            if state_changed:
-                slice_row.is_locked = True
-
-            self._touch_slice(slice_row)
-            session.add(slice_row)
-            session.flush()
-            self._append_slice_revision(
-                session,
-                slice_row,
-                message=payload.message,
-                is_milestone=payload.is_milestone,
-            )
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def update_slice_status(self, slice_id: str, payload: SliceStatusUpdate) -> SliceDetail:
-        return self.save_slice_state(
-            slice_id,
-            SliceSaveRequest(
-                status=payload.status,
-                message=f"Status: {payload.status.value.replace('_', ' ')}",
-            ),
-        )
-
-    def update_slice_transcript(self, slice_id: str, payload: SliceTranscriptUpdate) -> SliceDetail:
-        return self.save_slice_state(
-            slice_id,
-            SliceSaveRequest(modified_text=payload.modified_text, message="Transcript updated"),
-        )
-
-    def update_slice_tags(self, slice_id: str, payload: SliceTagUpdate) -> SliceDetail:
-        return self.save_slice_state(
-            slice_id,
-            SliceSaveRequest(tags=payload.tags, message="Tags updated"),
-        )
-
-    def append_edl_operation(self, slice_id: str, payload: SliceEdlUpdate) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            next_operations = [
-                *self._collect_edl_operations(slice_row),
-                payload.model_dump(mode="json"),
-            ]
-            slice_row.is_locked = True
-            self._touch_slice(slice_row)
-            session.add(slice_row)
-            session.flush()
-            self._append_slice_revision(
-                session,
-                slice_row,
-                edl_operations=next_operations,
-                message=self._edl_message(payload),
-            )
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def undo_slice(self, slice_id: str) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            if slice_row.active_commit_id is None:
-                raise ValueError("No earlier edit state is available")
-            active_commit = self._get_edit_commit(session, slice_row.active_commit_id)
-            if active_commit.parent_commit_id is None:
-                raise ValueError("No earlier edit state is available")
-            target_commit = self._get_edit_commit(session, active_commit.parent_commit_id)
-            self._restore_slice_from_revision(session, slice_row, target_commit)
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def redo_slice(self, slice_id: str) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            redo_target = self._get_redo_target(session, slice_row)
-            if redo_target is None:
-                raise ValueError("No newer edit state is available")
-            self._restore_slice_from_revision(session, slice_row, redo_target)
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def split_slice(self, slice_id: str, payload: SliceSplitRequest) -> list[SliceSummary]:
-        with self._session() as session:
-            source_slice = self._get_loaded_slice(session, slice_id)
-            recording = source_slice.source_recording
-            current_duration = self._slice_duration(source_slice)
-            split_at = payload.split_at_seconds
-            if split_at <= 0 or split_at >= current_duration:
-                raise ValueError("Split point must be inside the clip duration")
-
-            transcript_text = self._transcript_text(source_slice.transcript)
-            left_text, right_text = self._split_transcript_text(
-                transcript_text,
-                split_at / current_duration if current_duration > 0 else 0.5,
-            )
-            base_variant = source_slice.active_variant
-            if base_variant is None:
-                raise ValueError("Slice has no active variant to split")
-
-            now = utc_now()
-            source_metadata = self._slice_metadata(source_slice)
-            order_index = int(source_metadata.get("order_index", 0))
-            original_start = float(source_metadata.get("original_start_time", 0.0))
-            original_end = float(source_metadata.get("original_end_time", current_duration))
-            speaker_name = str(source_metadata.get("speaker_name", "speaker_a"))
-            language = str(source_metadata.get("language", "en"))
-
-            left_id = self._new_id("slice")
-            right_id = self._new_id("slice")
-            left_variant_id = self._new_id("variant")
-            right_variant_id = self._new_id("variant")
-            inherited_ops = self._collect_edl_operations(source_slice)
-
-            left_slice = Slice(
-                id=left_id,
-                source_recording_id=source_slice.source_recording_id,
-                active_variant_id=left_variant_id,
-                active_commit_id=None,
-                status=ReviewStatus.UNRESOLVED,
-                model_metadata={
-                    **source_metadata,
-                    "order_index": order_index,
-                    "working_asset_id": left_variant_id,
-                    "original_start_time": original_start,
-                    "original_end_time": round(original_start + split_at, 2),
-                    "speaker_name": speaker_name,
-                    "language": language,
-                    "is_superseded": False,
-                    "updated_at": now.isoformat(),
-                },
-                created_at=now,
-            )
-            right_slice = Slice(
-                id=right_id,
-                source_recording_id=source_slice.source_recording_id,
-                active_variant_id=right_variant_id,
-                active_commit_id=None,
-                status=ReviewStatus.UNRESOLVED,
-                model_metadata={
-                    **source_metadata,
-                    "order_index": order_index + 1,
-                    "working_asset_id": right_variant_id,
-                    "original_start_time": round(original_start + split_at, 2),
-                    "original_end_time": original_end,
-                    "speaker_name": speaker_name,
-                    "language": language,
-                    "is_superseded": False,
-                    "updated_at": now.isoformat(),
-                },
-                created_at=now,
-            )
-            left_variant = AudioVariant(
-                id=left_variant_id,
-                slice_id=left_id,
-                file_path=base_variant.file_path,
-                is_original=False,
-                generator_model="split-view",
-                sample_rate=max(base_variant.sample_rate, 1),
-                num_samples=max(base_variant.num_samples, 1),
-            )
-            right_variant = AudioVariant(
-                id=right_variant_id,
-                slice_id=right_id,
-                file_path=base_variant.file_path,
-                is_original=False,
-                generator_model="split-view",
-                sample_rate=max(base_variant.sample_rate, 1),
-                num_samples=max(base_variant.num_samples, 1),
-            )
-            left_transcript = Transcript(
-                id=self._new_id("transcript"),
-                slice_id=left_id,
-                original_text=left_text,
-                modified_text=left_text,
-                is_modified=False,
-                alignment_data=(source_slice.transcript.alignment_data if source_slice.transcript else None),
-            )
-            right_transcript = Transcript(
-                id=self._new_id("transcript"),
-                slice_id=right_id,
-                original_text=right_text,
-                modified_text=right_text,
-                is_modified=False,
-                alignment_data=(source_slice.transcript.alignment_data if source_slice.transcript else None),
-            )
-            source_metadata["is_superseded"] = True
-            source_metadata["updated_at"] = now.isoformat()
-            source_slice.model_metadata = source_metadata
-            session.add(source_slice)
-            for item in [
-                left_slice,
-                right_slice,
-                left_variant,
-                right_variant,
-                left_transcript,
-                right_transcript,
-            ]:
-                session.add(item)
-            session.flush()
-            self._replace_slice_tags(session, left_slice, [TagPayload(name=tag.name, color=tag.color) for tag in source_slice.tags])
-            self._replace_slice_tags(session, right_slice, [TagPayload(name=tag.name, color=tag.color) for tag in source_slice.tags])
-            session.flush()
-            self._append_slice_revision(
-                session,
-                left_slice,
-                edl_operations=[
-                    *inherited_ops,
-                    {
-                        "op": "crop",
-                        "range": {"start_seconds": 0.0, "end_seconds": split_at},
-                        "duration_seconds": None,
-                    },
-                ],
-                message="Split slice (left)",
-                created_at=now,
-            )
-            self._append_slice_revision(
-                session,
-                right_slice,
-                edl_operations=[
-                    *inherited_ops,
-                    {
-                        "op": "crop",
-                        "range": {"start_seconds": split_at, "end_seconds": current_duration},
-                        "duration_seconds": None,
-                    },
-                ],
-                message="Split slice (right)",
-                created_at=now,
-            )
-            self._shift_order_indices(session, recording.batch_id, order_index, 2, exclude_ids={source_slice.id})
-            session.commit()
-            session.expire_all()
-            summaries = [self._to_slice_summary(item) for item in self._get_batch_slices(session, recording.batch_id)]
-        for created_id in [left_id, right_id]:
-            self._warm_slice_artifacts_for_id(created_id)
-        return summaries
-
-    def merge_with_next_slice(self, slice_id: str) -> list[SliceSummary]:
-        with self._session() as session:
-            first_slice = self._get_loaded_slice(session, slice_id)
-            batch_id = first_slice.source_recording.batch_id
-            active_slices = self._get_batch_slices(session, batch_id)
-            next_slice = None
-            for index, candidate in enumerate(active_slices):
-                if candidate.id == slice_id and index + 1 < len(active_slices):
-                    next_slice = active_slices[index + 1]
-                    break
-            if next_slice is None:
-                raise ValueError("No next active slice is available for merge")
-            if first_slice.source_recording_id != next_slice.source_recording_id:
-                raise ValueError("Merge is currently limited to slices from the same source recording")
-            if first_slice.active_variant is None or next_slice.active_variant is None:
-                raise ValueError("Both slices must have active variants before merge")
-
-            merged_id = self._new_id("slice")
-            merged_variant_id = self._new_id("variant")
-            merged_path = self.media_root / "variants" / f"{merged_variant_id}.wav"
-            merged_path.parent.mkdir(parents=True, exist_ok=True)
-            merged_bytes = self._merge_wav_bytes(
-                self.get_clip_audio_bytes(first_slice.id),
-                self.get_clip_audio_bytes(next_slice.id),
-            )
-            merged_path.write_bytes(merged_bytes)
-            sample_rate, channels, num_samples = self._wav_metadata(merged_bytes)
-            now = utc_now()
-            first_metadata = self._slice_metadata(first_slice)
-            second_metadata = self._slice_metadata(next_slice)
-            merged_slice = Slice(
-                id=merged_id,
-                source_recording_id=first_slice.source_recording_id,
-                active_variant_id=merged_variant_id,
-                active_commit_id=None,
-                status=ReviewStatus.UNRESOLVED,
-                model_metadata={
-                    "order_index": min(int(first_metadata.get("order_index", 0)), int(second_metadata.get("order_index", 0))),
-                    "source_file_id": first_metadata.get("source_file_id", first_slice.source_recording_id),
-                    "working_asset_id": merged_variant_id,
-                    "original_start_time": min(
-                        float(first_metadata.get("original_start_time", 0.0)),
-                        float(second_metadata.get("original_start_time", 0.0)),
-                    ),
-                    "original_end_time": max(
-                        float(first_metadata.get("original_end_time", self._slice_duration(first_slice))),
-                        float(second_metadata.get("original_end_time", self._slice_duration(next_slice))),
-                    ),
-                    "speaker_name": first_metadata.get("speaker_name", "speaker_a"),
-                    "language": first_metadata.get("language", "en"),
-                    "is_superseded": False,
-                    "updated_at": now.isoformat(),
-                },
-                created_at=now,
-            )
-            variant = AudioVariant(
-                id=merged_variant_id,
-                slice_id=merged_id,
-                file_path=str(merged_path),
-                is_original=False,
-                generator_model="merge",
-                sample_rate=sample_rate,
-                num_samples=num_samples,
-            )
-            merged_text = self._merge_transcript_text(
-                self._transcript_text(first_slice.transcript),
-                self._transcript_text(next_slice.transcript),
-            )
-            transcript = Transcript(
-                id=self._new_id("transcript"),
-                slice_id=merged_id,
-                original_text=merged_text,
-                modified_text=merged_text,
-                is_modified=False,
-                alignment_data=first_slice.transcript.alignment_data if first_slice.transcript else None,
-            )
-            for source in [first_slice, next_slice]:
-                metadata = self._slice_metadata(source)
-                metadata["is_superseded"] = True
-                metadata["updated_at"] = now.isoformat()
-                source.model_metadata = metadata
-                session.add(source)
-            session.add(merged_slice)
-            session.add(variant)
-            session.add(transcript)
-            session.flush()
-            merged_tags = {tag.name.lower(): TagPayload(name=tag.name, color=tag.color) for tag in [*first_slice.tags, *next_slice.tags]}
-            self._replace_slice_tags(session, merged_slice, list(merged_tags.values()))
-            session.flush()
-            self._append_slice_revision(
-                session,
-                merged_slice,
-                edl_operations=[],
-                message="Merged slice baseline",
-                created_at=now,
-            )
-            session.commit()
-            session.expire_all()
-            summaries = [self._to_slice_summary(item) for item in self._get_batch_slices(session, batch_id)]
-        self._warm_slice_artifacts_for_id(merged_id)
-        return summaries
-
     def get_export_preview(self, project_id: str) -> ExportPreview:
         with self._session() as session:
             batch = self._get_batch(session, project_id)
-            slices = self._get_export_eligible_slices(session, batch.id)
-            lines = []
-            for slice_row in slices:
-                rendered_name = f"{slice_row.id}.wav"
-                lines.append(
-                    f"exports/{batch.id}/rendered/{rendered_name}|{self._speaker_name(slice_row)}|{self._language(slice_row)}|{self._transcript_text(slice_row.transcript)}"
-                )
             return ExportPreview(
                 project_id=batch.id,
                 manifest_path=f"exports/{batch.id}/dataset.list",
-                accepted_slice_count=len(slices),
-                lines=lines,
+                accepted_slice_count=0,
+                lines=[],
             )
+
 
     def export_project(self, project_id: str) -> ExportRun:
         with self._session() as session:
             self._get_batch(session, project_id)
             export_id = self._new_id("export")
             output_root = self.exports_root / project_id / export_id
-            rendered_root = output_root / "rendered"
             manifest_path = output_root / "dataset.list"
             export_run = ExportRun(
                 id=export_id,
                 batch_id=project_id,
-                status=JobStatus.RUNNING,
+                status=JobStatus.COMPLETED,
                 output_root=str(output_root),
                 manifest_path=str(manifest_path),
+                accepted_clip_count=0,
+                completed_at=utc_now(),
             )
             session.add(export_run)
             session.commit()
-            slices = self._get_export_eligible_slices(session, project_id)
-            try:
-                rendered_root.mkdir(parents=True, exist_ok=True)
-                manifest_lines: list[str] = []
-                for slice_row in slices:
-                    rendered_path = rendered_root / f"{slice_row.id}.wav"
-                    rendered_path.write_bytes(self.get_clip_audio_bytes(slice_row.id))
-                    manifest_lines.append(
-                        f"{rendered_path}|{self._speaker_name(slice_row)}|{self._language(slice_row)}|{self._transcript_text(slice_row.transcript)}"
-                    )
-                manifest_path.write_text("\n".join(manifest_lines))
-                export_run.status = JobStatus.COMPLETED
-                export_run.accepted_clip_count = len(slices)
-                export_run.completed_at = utc_now()
-                session.add(export_run)
-                session.commit()
-                return self._normalize_export_run(export_run)
-            except Exception:
-                export_run.status = JobStatus.FAILED
-                export_run.failed_clip_count = len(slices)
-                export_run.completed_at = utc_now()
-                session.add(export_run)
-                session.commit()
-                raise
+            return self._normalize_export_run(export_run)
 
-    def get_waveform_peaks(self, slice_id: str, bins: int = 120) -> WaveformPeaks:
-        safe_bins = max(32, min(bins, 2048))
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            cache_path = self._waveform_peaks_cache_path(slice_row, safe_bins)
-            if cache_path.exists():
-                cached = json.loads(cache_path.read_text())
-                return WaveformPeaks.model_validate(cached)
-            media_path = self._materialize_slice_media_path(session, slice_row)
-            return self._ensure_waveform_peaks_cache(slice_row, media_path, safe_bins)
-
-    def get_clip_audio_bytes(self, slice_id: str) -> bytes:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            return self._render_slice_audio_bytes(session, slice_row)
-
-    def get_slice_media_path(self, slice_id: str) -> Path:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            return self._materialize_slice_media_path(session, slice_row)
 
     def get_source_recording_window_media_path(
         self,
@@ -1286,17 +875,6 @@ class SQLiteRepository:
         with self._session() as session:
             recording = self._get_source_recording(session, recording_id)
             return self._materialize_source_window_media_path(recording, start_seconds, end_seconds)
-
-    def get_variant_media_path(self, variant_id: str) -> Path:
-        with self._session() as session:
-            variant = session.exec(
-                select(AudioVariant)
-                .where(AudioVariant.id == variant_id)
-                .options(selectinload(AudioVariant.parent_slice).selectinload(Slice.source_recording))
-            ).first()
-            if variant is None:
-                raise KeyError(variant_id)
-            return self._resolve_variant_media_path(Path(variant.file_path))
 
     def get_reference_variant_media_path(self, variant_id: str) -> Path:
         with self._session() as session:
@@ -1320,12 +898,51 @@ class SQLiteRepository:
             return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset_id))
 
     def create_import_batch(self, payload: ImportBatchCreate) -> ProjectSummary:
+        normalized_name = payload.name.strip()
+        if not normalized_name:
+            raise ValueError("Project name is required")
         with self._session() as session:
-            batch = ImportBatch(id=payload.id, name=payload.name)
+            if session.get(ImportBatch, payload.id) is not None:
+                raise ValueError("Project id already exists")
+            existing_name = session.exec(
+                select(ImportBatch).where(func.lower(ImportBatch.name) == normalized_name.lower())
+            ).first()
+            if existing_name is not None:
+                raise ValueError("Project name already exists")
+            batch = ImportBatch(id=payload.id, name=normalized_name)
             session.add(batch)
             session.commit()
             session.refresh(batch)
             return self._project_summary(session, batch)
+
+    def delete_project(self, project_id: str) -> dict[str, int | str]:
+        with self._session() as session:
+            self._get_batch(session, project_id)
+            recordings = session.exec(
+                select(SourceRecording).where(SourceRecording.batch_id == project_id)
+            ).all()
+            recording_ids = [recording.id for recording in recordings]
+            source_paths = [recording.file_path for recording in recordings]
+            if recording_ids:
+                session.exec(delete(SourceRecordingArtifact).where(SourceRecordingArtifact.source_recording_id.in_(recording_ids)))
+                session.exec(delete(ProcessingJob).where(ProcessingJob.source_recording_id.in_(recording_ids)))
+                session.exec(delete(SourceRecording).where(SourceRecording.id.in_(recording_ids)))
+            session.exec(delete(ExportRun).where(ExportRun.batch_id == project_id))
+            session.exec(delete(ImportBatch).where(ImportBatch.id == project_id))
+            session.commit()
+
+        deleted_file_count = self._delete_managed_media_paths(source_paths)
+        return {"project_id": project_id, "deleted_file_count": deleted_file_count}
+
+
+    def new_source_recording_id(self) -> str:
+        return self._new_id("source")
+
+    def managed_source_recording_path(self, recording_id: str) -> Path:
+        return self._managed_media_path("sources", recording_id)
+
+    def read_pcm_wav_header(self, path: Path) -> tuple[int, int, int, int]:
+        return self._read_pcm_wav_header(path)
 
     def create_source_recording(self, payload: SourceRecordingCreate) -> SourceRecording:
         with self._session() as session:
@@ -1359,6 +976,285 @@ class SQLiteRepository:
             session.commit()
             session.refresh(recording)
             return recording
+
+    def _normalize_project_preparation_payload(
+        self,
+        payload: ProjectPreparationRequest,
+    ) -> dict[str, Any]:
+        target_sample_rate = payload.target_sample_rate
+        if target_sample_rate is not None:
+            target_sample_rate = int(target_sample_rate)
+            if target_sample_rate <= 0:
+                raise ValueError("target_sample_rate must be positive")
+        channel_mode = payload.channel_mode
+        if channel_mode not in {"original", "mono", "left", "right"}:
+            raise ValueError("Unsupported channel_mode")
+        return {
+            "target_sample_rate": target_sample_rate,
+            "channel_mode": channel_mode,
+        }
+
+    def _normalize_source_transcription_payload(
+        self,
+        payload: SourceTranscriptionRequest,
+    ) -> dict[str, Any]:
+        batch_size = int(payload.batch_size)
+        if batch_size <= 0:
+            raise ValueError("ASR batch_size must be positive")
+        initial_prompt = payload.initial_prompt.strip() if payload.initial_prompt else None
+        return {
+            **payload.model_dump(mode="json"),
+            "model_size": payload.model_size,
+            "batch_size": batch_size,
+            "initial_prompt": initial_prompt,
+            "language_hint": "en",
+        }
+
+    def _normalize_source_alignment_payload(
+        self,
+        payload: SourceAlignmentRequest,
+    ) -> dict[str, Any]:
+        batch_size = int(payload.batch_size)
+        if batch_size <= 0:
+            raise ValueError("Alignment batch_size must be positive")
+        return {
+            **payload.model_dump(mode="json"),
+            "acoustic_model": payload.acoustic_model.strip() or "Wav2Vec2-Large-Robust-960h",
+            "text_normalization_strategy": payload.text_normalization_strategy,
+            "batch_size": batch_size,
+        }
+
+    def _preparation_recipe_payload(self, recording: SourceRecording) -> dict[str, Any] | None:
+        if not recording.processing_recipe:
+            return None
+        try:
+            payload = json.loads(recording.processing_recipe)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or payload.get("type") != "overview_preparation":
+            return None
+        return payload
+
+    def _prepared_recordings_for_group(
+        self,
+        session: Session,
+        project_id: str,
+        prepared_output_group_id: str,
+    ) -> list[SourceRecording]:
+        recordings = session.exec(
+            select(SourceRecording)
+            .where(
+                SourceRecording.batch_id == project_id,
+                SourceRecording.parent_recording_id.is_not(None),
+            )
+            .options(selectinload(SourceRecording.source_artifact))
+            .order_by(SourceRecording.id.asc())
+        ).all()
+        matching_recordings: list[SourceRecording] = []
+        for recording in recordings:
+            recipe = self._preparation_recipe_payload(recording)
+            if recipe is not None and recipe.get("output_group_id") == prepared_output_group_id:
+                matching_recordings.append(recording)
+        return matching_recordings
+
+    def _run_project_preparation_job(self, job_id: str) -> dict[str, Any]:
+        with self._session() as session:
+            job = self._get_processing_job(session, job_id)
+            payload = dict(job.input_payload or {})
+            project_id = str(payload.get("project_id") or "")
+            if not project_id:
+                raise ValueError("Preparation job is missing project_id")
+            settings = self._normalize_project_preparation_payload(
+                ProjectPreparationRequest(
+                    target_sample_rate=payload.get("target_sample_rate"),
+                    channel_mode=payload.get("channel_mode") or "original",
+                )
+            )
+        return self._materialize_project_preparation(project_id, settings, job_id=job_id)
+
+    def _materialize_project_preparation(
+        self,
+        project_id: str,
+        settings: dict[str, Any],
+        *,
+        job_id: str,
+    ) -> dict[str, Any]:
+        output_group_id = self._new_id("prep")
+        logs: list[str] = []
+        created_recording_ids: list[str] = []
+        written_paths: list[Path] = []
+        try:
+            with self._session() as session:
+                self._get_batch(session, project_id)
+                source_recordings = session.exec(
+                    select(SourceRecording)
+                    .where(
+                        SourceRecording.batch_id == project_id,
+                        SourceRecording.parent_recording_id.is_(None),
+                    )
+                    .order_by(SourceRecording.id.asc())
+                ).all()
+            if not source_recordings:
+                raise ValueError("Project has no raw source recordings to prepare")
+
+            logs.append(f"Preparing {len(source_recordings)} raw recording(s)")
+            for index, source_recording in enumerate(source_recordings, start=1):
+                source_path = self._get_source_recording_audio_path(source_recording)
+                derivative_id = self._new_id("prepared")
+                target_path = self._managed_media_path("prepared", derivative_id)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                written_paths.append(target_path)
+                sample_rate, channels, num_samples = self._write_prepared_wav(
+                    source_path,
+                    target_path,
+                    source_channels=source_recording.num_channels,
+                    target_sample_rate=settings["target_sample_rate"],
+                    channel_mode=settings["channel_mode"],
+                )
+                processing_recipe = json.dumps(
+                    {
+                        "type": "overview_preparation",
+                        "version": 1,
+                        "job_id": job_id,
+                        "output_group_id": output_group_id,
+                        "source_recording_id": source_recording.id,
+                        "settings": settings,
+                    },
+                    sort_keys=True,
+                )
+                derivative = self.create_preprocessed_recording(
+                    source_recording.id,
+                    RecordingDerivativeCreate(
+                        id=derivative_id,
+                        file_path=str(target_path),
+                        sample_rate=sample_rate,
+                        num_channels=channels,
+                        num_samples=num_samples,
+                        processing_recipe=processing_recipe,
+                    ),
+                )
+                created_recording_ids.append(derivative.id)
+                self._copy_prepared_recording_artifact(
+                    source_recording.id,
+                    derivative.id,
+                    job_id=job_id,
+                )
+                logs.append(
+                    f"[{index}/{len(source_recordings)}] Created prepared derivative {derivative.id} "
+                    f"from {source_recording.id}"
+                )
+            with self._session() as session:
+                batch = self._get_batch(session, project_id)
+                batch.active_prepared_output_group_id = output_group_id
+                batch.active_preparation_job_id = job_id
+                session.add(batch)
+                session.commit()
+        except Exception:
+            self._delete_source_recordings(created_recording_ids)
+            for path in written_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+
+        return {
+            "project_id": project_id,
+            "output_group_id": output_group_id,
+            "created_recording_ids": created_recording_ids,
+            "settings": settings,
+            "logs": logs,
+        }
+
+    def _copy_prepared_recording_artifact(
+        self,
+        source_recording_id: str,
+        derivative_recording_id: str,
+        *,
+        job_id: str,
+    ) -> None:
+        with self._session() as session:
+            source_recording = self._get_source_recording(session, source_recording_id)
+            derivative_recording = self._get_source_recording(session, derivative_recording_id)
+            source_artifact = self._ensure_source_recording_artifact(session, source_recording)
+            derivative_artifact = self._ensure_source_recording_artifact(session, derivative_recording)
+            derivative_artifact.transcript_text_path = source_artifact.transcript_text_path
+            derivative_artifact.transcript_json_path = source_artifact.transcript_json_path
+            derivative_artifact.alignment_json_path = source_artifact.alignment_json_path
+            derivative_artifact.transcript_status = source_artifact.transcript_status
+            derivative_artifact.alignment_status = source_artifact.alignment_status
+            derivative_artifact.transcript_word_count = source_artifact.transcript_word_count
+            derivative_artifact.alignment_word_count = source_artifact.alignment_word_count
+            derivative_artifact.transcript_updated_at = source_artifact.transcript_updated_at
+            derivative_artifact.aligned_at = source_artifact.aligned_at
+            derivative_artifact.alignment_backend = source_artifact.alignment_backend
+            derivative_artifact.artifact_metadata = {
+                **dict(source_artifact.artifact_metadata or {}),
+                "copied_from_source_recording_id": source_recording.id,
+                "copied_by_preparation_job_id": job_id,
+            }
+            session.add(derivative_artifact)
+            session.commit()
+
+    def _delete_source_recordings(self, recording_ids: list[str]) -> None:
+        if not recording_ids:
+            return
+        with self._session() as session:
+            recordings = session.exec(
+                select(SourceRecording).where(SourceRecording.id.in_(recording_ids))
+            ).all()
+            for recording in recordings:
+                session.delete(recording)
+            session.commit()
+
+    def _write_prepared_wav(
+        self,
+        source_path: Path,
+        target_path: Path,
+        *,
+        source_channels: int,
+        target_sample_rate: int | None,
+        channel_mode: str,
+    ) -> tuple[int, int, int]:
+        if channel_mode == "right" and source_channels < 2:
+            raise ValueError("Right channel selection requires a stereo source recording")
+        if source_channels <= 0:
+            raise ValueError("Source recording has an invalid channel count")
+
+        filters: list[str] = []
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-map_metadata",
+            "-1",
+        ]
+        if channel_mode == "mono":
+            command.extend(["-ac", "1"])
+        elif channel_mode == "left":
+            filters.append("pan=mono|c0=c0")
+        elif channel_mode == "right":
+            filters.append("pan=mono|c0=c1")
+        if target_sample_rate is not None:
+            filters.append(f"aresample={int(target_sample_rate)}:resampler=soxr")
+        if filters:
+            command.extend(["-af", ",".join(filters)])
+        command.extend(["-acodec", "pcm_s16le", str(target_path)])
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            raise ValueError(f"ffmpeg preparation failed for {source_path.name}: {stderr or result.returncode}")
+
+        channels, sample_width, sample_rate, frames = self._read_pcm_wav_header(target_path)
+        if sample_width != 2:
+            raise ValueError("Prepared WAV must be 16-bit PCM")
+        self._validate_audio_asset(target_path, sample_rate, channels, frames)
+        return sample_rate, channels, frames
 
     def _ensure_source_recording_artifact(
         self,
@@ -1465,82 +1361,6 @@ class SQLiteRepository:
         artifact.transcript_updated_at = utc_now()
         return rendered_text, token_count
 
-    def _patch_source_transcript_for_slice(
-        self,
-        session: Session,
-        slice_row: Slice,
-        modified_text: str,
-        *,
-        remove_patch: bool = False,
-    ) -> None:
-        metadata = self._slice_metadata(slice_row)
-        try:
-            start_index = int(metadata["source_word_start_index"])
-            end_index = int(metadata["source_word_end_index"])
-        except (KeyError, TypeError, ValueError):
-            return
-
-        recording = slice_row.source_recording or self._get_source_recording(session, slice_row.source_recording_id)
-        artifact = self._ensure_source_recording_artifact(session, recording)
-        artifact_metadata = self._source_artifact_metadata(artifact)
-        if not artifact_metadata.get("base_transcript_text_path") and artifact.transcript_text_path:
-            current_path = Path(str(artifact.transcript_text_path)).expanduser().resolve()
-            if current_path.exists():
-                base_path = self._source_recording_transcript_base_path(recording.id)
-                base_path.parent.mkdir(parents=True, exist_ok=True)
-                if current_path != base_path:
-                    shutil.copyfile(current_path, base_path)
-                artifact_metadata["base_transcript_text_path"] = str(base_path)
-        patches = [
-            patch
-            for patch in self._source_artifact_patches(artifact)
-            if str(patch.get("slice_id") or "") != slice_row.id
-        ]
-        if not remove_patch:
-            patches.append(
-                {
-                    "slice_id": slice_row.id,
-                    "start_word_index": start_index,
-                    "end_word_index": end_index,
-                    "text": modified_text,
-                    "updated_at": utc_now().isoformat(),
-                }
-            )
-        patches.sort(key=lambda item: (item["start_word_index"], item["end_word_index"], item["slice_id"]))
-        artifact_metadata["transcript_patches"] = patches
-        artifact_metadata["last_transcript_patch_slice_id"] = slice_row.id
-        artifact.artifact_metadata = artifact_metadata
-        self._persist_effective_source_transcript(artifact)
-        artifact.transcript_status = "patched"
-        artifact.alignment_status = "stale"
-        session.add(artifact)
-
-    def _active_recording_slices(
-        self,
-        session: Session,
-        recording_id: str,
-    ) -> list[Slice]:
-        slices = session.exec(
-            select(Slice)
-            .where(Slice.source_recording_id == recording_id)
-            .options(
-                selectinload(Slice.source_recording),
-                selectinload(Slice.transcript),
-                selectinload(Slice.tags),
-                selectinload(Slice.variants),
-                selectinload(Slice.commits),
-                selectinload(Slice.active_variant),
-                selectinload(Slice.active_commit),
-            )
-        ).all()
-        return sorted(
-            [slice_row for slice_row in slices if not self._slice_metadata(slice_row).get("is_superseded", False)],
-            key=lambda slice_row: (
-                int(self._slice_metadata(slice_row).get("order_index", 0)),
-                self._as_utc(slice_row.created_at),
-            ),
-        )
-
     def fail_stale_processing_jobs(
         self,
         stale_after_seconds: float = DEFAULT_PROCESSING_JOB_STALE_AFTER_SECONDS,
@@ -1640,194 +1460,6 @@ class SQLiteRepository:
             return self._complete_processing_job(job_id, output_payload=output_payload)
         except Exception as exc:
             return self._fail_processing_job(job_id, str(exc))
-
-    def create_audio_variant(self, slice_id: str, payload: AudioVariantCreate) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            recording = self._get_source_recording(session, slice_row.source_recording_id)
-            self._validate_audio_asset(Path(payload.file_path), payload.sample_rate, recording.num_channels, payload.num_samples)
-            variant_id = self._new_id("variant")
-            managed_variant_path = self._ingest_variant_asset(Path(payload.file_path), variant_id)
-            variant = AudioVariant(
-                id=variant_id,
-                slice_id=slice_row.id,
-                file_path=str(managed_variant_path),
-                is_original=False,
-                generator_model=payload.generator_model,
-                sample_rate=payload.sample_rate,
-                num_samples=payload.num_samples,
-            )
-            session.add(variant)
-            session.flush()
-            slice_row.active_variant_id = variant.id
-            metadata = self._slice_metadata(slice_row)
-            metadata["working_asset_id"] = variant.id
-            metadata["updated_at"] = utc_now().isoformat()
-            slice_row.model_metadata = metadata
-            session.add(slice_row)
-            session.flush()
-            self._append_slice_revision(
-                session,
-                slice_row,
-                message=f"Created variant via {payload.generator_model}",
-            )
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def run_audio_variant(self, slice_id: str, payload: AudioVariantRunRequest) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            recording = slice_row.source_recording
-            active_variant = slice_row.active_variant
-            if active_variant is None:
-                raise ValueError("Slice has no active variant to process")
-            try:
-                source_path = self._get_variant_audio_path(active_variant, recording.num_channels)
-            except FileNotFoundError as exc:
-                raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
-            variant_id = self._new_id("variant")
-            target_path = self._managed_variant_path(variant_id)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_path, target_path)
-            variant = AudioVariant(
-                id=variant_id,
-                slice_id=slice_row.id,
-                file_path=str(target_path),
-                is_original=False,
-                generator_model=payload.generator_model,
-                sample_rate=active_variant.sample_rate,
-                num_samples=active_variant.num_samples,
-            )
-            self._validate_audio_asset(target_path, active_variant.sample_rate, recording.num_channels, active_variant.num_samples)
-            session.add(variant)
-            session.flush()
-            slice_row.active_variant_id = variant.id
-            metadata = self._slice_metadata(slice_row)
-            metadata["working_asset_id"] = variant.id
-            metadata["updated_at"] = utc_now().isoformat()
-            slice_row.model_metadata = metadata
-            session.add(slice_row)
-            session.flush()
-            self._append_slice_revision(
-                session,
-                slice_row,
-                message=f"Ran {payload.generator_model}",
-            )
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def set_active_variant(self, slice_id: str, payload: ActiveVariantUpdate) -> SliceDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, slice_id)
-            matching_variant = next((variant for variant in slice_row.variants if variant.id == payload.active_variant_id), None)
-            if matching_variant is None:
-                raise KeyError(payload.active_variant_id)
-            slice_row.active_variant_id = matching_variant.id
-            metadata = self._slice_metadata(slice_row)
-            metadata["working_asset_id"] = matching_variant.id
-            metadata["updated_at"] = utc_now().isoformat()
-            slice_row.model_metadata = metadata
-            session.add(slice_row)
-            session.flush()
-            self._append_slice_revision(
-                session,
-                slice_row,
-                message=f"Activated variant {matching_variant.generator_model or matching_variant.id}",
-            )
-            session.commit()
-            session.expire_all()
-            detail = self._get_slice_detail(session, slice_id)
-        self._warm_slice_artifacts_for_id(slice_id)
-        return detail
-
-    def create_reference_asset_from_slice(
-        self,
-        payload: ReferenceAssetCreateFromSlice,
-    ) -> ReferenceAssetDetail:
-        with self._session() as session:
-            slice_row = self._get_loaded_slice(session, payload.slice_id)
-            source_variant_id = slice_row.active_variant_id
-            if source_variant_id is None:
-                raise ValueError("Slice has no active variant to save as a reference")
-
-            source_variant = next(
-                (variant for variant in slice_row.variants if variant.id == source_variant_id),
-                None,
-            )
-            if source_variant is None:
-                raise KeyError(source_variant_id)
-
-            rendered_audio_bytes = self._render_slice_audio_bytes(session, slice_row)
-            sample_rate, channels, num_samples = self._wav_metadata(rendered_audio_bytes)
-            reference_variant_id = self._new_id("reference-variant")
-            storage_key = self._reference_variant_storage_key(reference_variant_id)
-            managed_path = self._managed_reference_variant_path(reference_variant_id)
-            managed_path.parent.mkdir(parents=True, exist_ok=True)
-            managed_path.write_bytes(rendered_audio_bytes)
-            self._validate_audio_asset(managed_path, sample_rate, channels, num_samples)
-
-            transcript_text = self._transcript_text(slice_row.transcript).strip() or None
-            now = utc_now()
-            asset = ReferenceAsset(
-                id=self._new_id("reference"),
-                project_id=slice_row.source_recording.batch_id,
-                name=payload.name or self._default_reference_asset_name(slice_row),
-                status=ReferenceAssetStatus.ACTIVE,
-                transcript_text=transcript_text,
-                speaker_name=self._speaker_name(slice_row),
-                language=self._language(slice_row),
-                mood_label=payload.mood_label,
-                created_from_run_id=None,
-                created_from_candidate_id=None,
-                model_metadata={
-                    "origin": "slice-variant",
-                    "source_slice_id": slice_row.id,
-                    "source_audio_variant_id": source_variant.id,
-                    "source_edit_commit_id": slice_row.active_commit_id,
-                    "source_original_start_seconds": self._slice_metadata(slice_row).get("original_start_time"),
-                    "source_original_end_seconds": self._slice_metadata(slice_row).get("original_end_time"),
-                },
-                created_at=now,
-                updated_at=now,
-            )
-            variant = ReferenceVariant(
-                id=reference_variant_id,
-                reference_asset_id=asset.id,
-                source_kind=ReferenceSourceKind.SLICE_VARIANT,
-                source_recording_id=slice_row.source_recording_id,
-                source_slice_id=slice_row.id,
-                source_audio_variant_id=source_variant.id,
-                # Label-derived saves preserve lineage back to the upstream slice and variant,
-                # but the copied media may already reflect EDL edits or processing, so exact
-                # source span bounds are not authoritative here.
-                source_start_seconds=None,
-                source_end_seconds=None,
-                file_path=storage_key,
-                is_original=True,
-                generator_model=source_variant.generator_model,
-                sample_rate=sample_rate,
-                num_samples=num_samples,
-                model_metadata={
-                    "origin": "label-rendered-slice",
-                    "source_edit_commit_id": slice_row.active_commit_id,
-                },
-            )
-            self._validate_reference_variant_provenance(session, asset, variant)
-            session.add(asset)
-            session.add(variant)
-            session.flush()
-            asset.active_variant_id = variant.id
-            session.add(asset)
-            self._cache_reference_asset_embedding(session, asset, variant, audio_bytes=rendered_audio_bytes)
-            self._validate_reference_asset_integrity(session, asset, [variant])
-            session.commit()
-            return self._to_reference_asset_detail(session, self._get_reference_asset_row(session, asset.id))
 
     def create_reference_asset_from_candidate(
         self,
@@ -1990,14 +1622,6 @@ class SQLiteRepository:
     def _run_data_migrations(self) -> None:
         version = self._get_data_version()
         migrated_reference_picker_schema = False
-        if version < DATA_VERSION_EXTERNAL_VARIANT_REHOME:
-            self._migrate_external_variant_media()
-            self._set_data_version(DATA_VERSION_EXTERNAL_VARIANT_REHOME)
-            version = DATA_VERSION_EXTERNAL_VARIANT_REHOME
-        if version < DATA_VERSION_SLICE_REVISION_HISTORY:
-            self._migrate_legacy_slice_revision_history()
-            self._set_data_version(DATA_VERSION_SLICE_REVISION_HISTORY)
-            version = DATA_VERSION_SLICE_REVISION_HISTORY
         if version < DATA_VERSION_REFERENCE_PICKER_SCHEMA:
             self._migrate_reference_picker_schema()
             self._set_data_version(DATA_VERSION_REFERENCE_PICKER_SCHEMA)
@@ -2037,30 +1661,15 @@ class SQLiteRepository:
             for row in connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
         }
 
-    def _migrate_editcommit_schema(self) -> None:
+    def _migrate_importbatch_schema(self) -> None:
         with self.engine.begin() as connection:
-            columns = {
-                row[1]
-                for row in connection.exec_driver_sql("PRAGMA table_info(editcommit)").fetchall()
-            }
+            columns = self._table_columns(connection, "importbatch")
             if not columns:
                 return
-            if "transcript_text" not in columns:
-                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN transcript_text TEXT NOT NULL DEFAULT ''")
-            if "status" not in columns:
-                connection.exec_driver_sql(
-                    "ALTER TABLE editcommit ADD COLUMN status TEXT NOT NULL DEFAULT 'unresolved'"
-                )
-            if "tags_payload" not in columns:
-                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN tags_payload JSON")
-            if "active_variant_id_snapshot" not in columns:
-                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN active_variant_id_snapshot TEXT")
-            if "message" not in columns:
-                connection.exec_driver_sql("ALTER TABLE editcommit ADD COLUMN message TEXT")
-            if "is_milestone" not in columns:
-                connection.exec_driver_sql(
-                    "ALTER TABLE editcommit ADD COLUMN is_milestone INTEGER NOT NULL DEFAULT 0"
-                )
+            if "active_prepared_output_group_id" not in columns:
+                connection.exec_driver_sql("ALTER TABLE importbatch ADD COLUMN active_prepared_output_group_id TEXT")
+            if "active_preparation_job_id" not in columns:
+                connection.exec_driver_sql("ALTER TABLE importbatch ADD COLUMN active_preparation_job_id TEXT")
 
     def _migrate_processingjob_schema(self) -> None:
         with self.engine.begin() as connection:
@@ -2074,6 +1683,60 @@ class SQLiteRepository:
                 connection.exec_driver_sql("ALTER TABLE processingjob ADD COLUMN claimed_by TEXT")
             if "heartbeat_at" not in columns:
                 connection.exec_driver_sql("ALTER TABLE processingjob ADD COLUMN heartbeat_at TIMESTAMP")
+
+    def _migrate_dataset_run_schema(self) -> None:
+        """Keep existing dev databases compatible with the dataset-run artifact spine."""
+
+        with self.engine.begin() as connection:
+            processing_columns = self._table_columns(connection, "processingrun")
+            if processing_columns:
+                if "pipeline_version" not in processing_columns:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE processingrun ADD COLUMN pipeline_version TEXT NOT NULL DEFAULT 'pretraining_rfc_v1'"
+                    )
+                if "artifact_root" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN artifact_root TEXT")
+                if "config_hash" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN config_hash TEXT")
+                if "input_summary" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN input_summary JSON DEFAULT '{}'")
+                if "output_summary" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN output_summary JSON DEFAULT '{}'")
+                if "reason_codes" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN reason_codes JSON DEFAULT '[]'")
+                if "started_at" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN started_at TIMESTAMP")
+                if "completed_at" not in processing_columns:
+                    connection.exec_driver_sql("ALTER TABLE processingrun ADD COLUMN completed_at TIMESTAMP")
+
+            artifact_columns = self._table_columns(connection, "runartifact")
+            if artifact_columns:
+                if "project_id" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN project_id TEXT")
+                if "source_audio_id" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN source_audio_id TEXT")
+                if "source_recording_id" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN source_recording_id TEXT")
+                if "schema_version" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
+                if "byte_size" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN byte_size INTEGER")
+                if "content_hash" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN content_hash TEXT")
+                if "config_hash" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN config_hash TEXT")
+                if "input_artifact_hashes" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN input_artifact_hashes JSON DEFAULT '{}'")
+                if "backend" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN backend TEXT")
+                if "backend_version" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN backend_version TEXT")
+                if "summary" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN summary JSON DEFAULT '{}'")
+                if "reason_codes" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN reason_codes JSON DEFAULT '[]'")
+                if "created_at" not in artifact_columns:
+                    connection.exec_driver_sql("ALTER TABLE runartifact ADD COLUMN created_at TIMESTAMP")
 
     def _purge_legacy_review_window_schema(self) -> None:
         with self.engine.begin() as connection:
@@ -2142,19 +1805,6 @@ class SQLiteRepository:
             if "reviewwindow" in table_names:
                 connection.exec_driver_sql("DROP TABLE reviewwindow")
 
-    def _migrate_slice_schema(self) -> None:
-        with self.engine.begin() as connection:
-            columns = {
-                row[1]
-                for row in connection.exec_driver_sql("PRAGMA table_info(slice)").fetchall()
-            }
-            if not columns:
-                return
-            if "is_locked" not in columns:
-                connection.exec_driver_sql(
-                    "ALTER TABLE slice ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0"
-                )
-
     def _migrate_source_recording_artifact_rows(self) -> None:
         with self.engine.begin() as connection:
             table_names = {
@@ -2194,8 +1844,6 @@ class SQLiteRepository:
 
     def _migrate_enum_storage(self) -> None:
         replacements = {
-            "slice": {"status": {status.name: status.value for status in ReviewStatus}},
-            "editcommit": {"status": {status.name: status.value for status in ReviewStatus}},
             "exportrun": {"status": {status.name: status.value for status in JobStatus}},
             "processingjob": {
                 "status": {status.name: status.value for status in JobStatus},
@@ -2225,64 +1873,6 @@ class SQLiteRepository:
                             (normalized_value, legacy_value),
                         )
 
-    def _migrate_legacy_slice_revision_history(self) -> None:
-        with self._session() as session:
-            slices = session.exec(
-                select(Slice).options(
-                    selectinload(Slice.source_recording),
-                    selectinload(Slice.transcript),
-                    selectinload(Slice.tags),
-                    selectinload(Slice.variants),
-                    selectinload(Slice.commits),
-                    selectinload(Slice.active_variant),
-                    selectinload(Slice.active_commit),
-                )
-            ).all()
-            changed = False
-            for slice_row in slices:
-                current_tags = [tag.model_dump(mode="json") for tag in self._current_tag_payloads(session, slice_row)]
-                current_transcript = self._transcript_text(slice_row.transcript)
-                baseline_message = "Imported slice baseline"
-                for commit in slice_row.commits:
-                    commit_changed = False
-                    legacy_snapshot_commit = (
-                        commit.active_variant_id_snapshot is None and commit.message is None
-                    )
-                    if legacy_snapshot_commit and commit.transcript_text == "":
-                        commit.transcript_text = current_transcript
-                        commit_changed = True
-                    if legacy_snapshot_commit and not commit.tags_payload:
-                        commit.tags_payload = list(current_tags)
-                        commit_changed = True
-                    if commit.active_variant_id_snapshot is None:
-                        commit.active_variant_id_snapshot = slice_row.active_variant_id
-                        commit_changed = True
-                    if commit.message is None:
-                        commit.message = baseline_message
-                        commit_changed = True
-                    if commit_changed:
-                        if legacy_snapshot_commit:
-                            commit.status = slice_row.status
-                        session.add(commit)
-                        changed = True
-                if slice_row.active_commit_id is None:
-                    self._append_slice_revision(
-                        session,
-                        slice_row,
-                        edl_operations=[],
-                        message=baseline_message,
-                        created_at=self._clip_updated_at(slice_row),
-                        parent_commit_id=None,
-                    )
-                    changed = True
-                elif slice_row.active_commit is None and slice_row.commits:
-                    latest_commit = sorted(slice_row.commits, key=lambda commit: commit.created_at)[-1]
-                    slice_row.active_commit_id = latest_commit.id
-                    session.add(slice_row)
-                    changed = True
-            if changed:
-                session.commit()
-
     def _migrate_reference_picker_schema(self) -> None:
         with self.engine.begin() as connection:
             columns = self._table_columns(connection, "referenceasset")
@@ -2303,114 +1893,20 @@ class SQLiteRepository:
                     "SELECT id, name, audio_variant_id, created_at FROM referenceasset_legacy"
                 ).fetchall()
             ]
-
-        with self._session() as session:
-            for row in legacy_rows:
-                asset_id = str(row["id"])
-                if session.get(ReferenceAsset, asset_id) is not None:
-                    continue
-
-                legacy_variant_id = str(row["audio_variant_id"])
-                source_variant = session.get(AudioVariant, legacy_variant_id)
-                if source_variant is None:
-                    unresolved_rows.append(
-                        {
-                            "legacy_asset_id": asset_id,
-                            "name": str(row["name"]),
-                            "audio_variant_id": legacy_variant_id,
-                            "reason": "missing_audio_variant",
-                        }
-                    )
-                    continue
-
-                try:
-                    slice_row = self._get_loaded_slice(session, source_variant.slice_id)
-                except KeyError:
-                    unresolved_rows.append(
-                        {
-                            "legacy_asset_id": asset_id,
-                            "name": str(row["name"]),
-                            "audio_variant_id": legacy_variant_id,
-                            "reason": "missing_slice",
-                            "source_slice_id": source_variant.slice_id,
-                        }
-                    )
-                    continue
-
-                created_at = self._coerce_datetime(row["created_at"])
-                now = created_at
-                asset = ReferenceAsset(
-                    id=asset_id,
-                    project_id=slice_row.source_recording.batch_id,
-                    name=str(row["name"]),
-                    status=ReferenceAssetStatus.ACTIVE,
-                    transcript_text=self._transcript_text(slice_row.transcript).strip() or None,
-                    speaker_name=self._speaker_name(slice_row),
-                    language=self._language(slice_row),
-                    model_metadata={
-                        "origin": "legacy-referenceasset",
-                        "legacy_audio_variant_id": legacy_variant_id,
-                    },
-                    created_at=created_at,
-                    updated_at=now,
-                )
-                session.add(asset)
-                session.flush()
-
-                try:
-                    source_path = self._get_variant_audio_path(
-                        source_variant,
-                        slice_row.source_recording.num_channels if slice_row.source_recording is not None else None,
-                    )
-                except (FileNotFoundError, ValueError):
-                    asset.status = ReferenceAssetStatus.ARCHIVED
-                    asset.model_metadata = {
-                        **(asset.model_metadata or {}),
-                        "migration_warning": "source_variant_media_missing",
-                    }
-                    session.add(asset)
-                    continue
-
-                reference_variant_id = self._new_id("reference-variant")
-                storage_key = self._reference_variant_storage_key(reference_variant_id)
-                managed_path = self._managed_reference_variant_path(reference_variant_id)
-                managed_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source_path, managed_path)
-                channels, _sample_width, sample_rate, num_samples = self._read_pcm_wav_header(managed_path)
-                self._validate_audio_asset(managed_path, sample_rate, channels, num_samples)
-                variant = ReferenceVariant(
-                    id=reference_variant_id,
-                    reference_asset_id=asset.id,
-                    source_kind=ReferenceSourceKind.SLICE_VARIANT,
-                    source_recording_id=slice_row.source_recording_id,
-                    source_slice_id=slice_row.id,
-                    source_audio_variant_id=source_variant.id,
-                    source_start_seconds=None,
-                    source_end_seconds=None,
-                    file_path=storage_key,
-                    is_original=True,
-                    generator_model=source_variant.generator_model,
-                    sample_rate=sample_rate,
-                    num_samples=num_samples,
-                    created_at=created_at,
-                    model_metadata={
-                        "origin": "legacy-referenceasset",
-                        "legacy_audio_variant_id": legacy_variant_id,
-                    },
-                )
-                self._validate_reference_variant_provenance(session, asset, variant)
-                session.add(variant)
-                session.flush()
-                asset.active_variant_id = variant.id
-                session.add(asset)
-                self._validate_reference_asset_integrity(session, asset, [variant])
-
-            session.commit()
-
+        for row in legacy_rows:
+            unresolved_rows.append(
+                {
+                    "legacy_asset_id": str(row["id"]),
+                    "name": str(row["name"]),
+                    "audio_variant_id": str(row["audio_variant_id"]),
+                    "reason": "legacy_slice_reference_removed",
+                }
+            )
         report_path = self._write_reference_asset_migration_report(unresolved_rows) if unresolved_rows else None
         if report_path is None:
             with self.engine.begin() as connection:
                 connection.exec_driver_sql("DROP TABLE IF EXISTS referenceasset_legacy")
+
 
     def _migrate_reference_variant_storage_keys(self) -> None:
         with self._session() as session:
@@ -2499,78 +1995,6 @@ class SQLiteRepository:
                 source_recordings[source_key] = source_recording
 
             session.flush()
-            for clip_payload in active_clips:
-                variant_id = f"variant-{clip_payload['id']}"
-                transcript_id = f"transcript-{clip_payload['id']}"
-                recording_id = f"source-{batch.id}-{clip_payload['source_file_id']}"
-                variant_path = self._managed_variant_path(variant_id)
-                variant_path.parent.mkdir(parents=True, exist_ok=True)
-                raw_audio_path = Path(clip_payload["audio_path"]).expanduser() if clip_payload.get("audio_path") else None
-                if raw_audio_path is not None and raw_audio_path.exists():
-                    resolved_audio_path = raw_audio_path.resolve()
-                    if resolved_audio_path != variant_path:
-                        shutil.copyfile(resolved_audio_path, variant_path)
-                elif not variant_path.exists():
-                    variant_path.write_bytes(
-                        self._render_synthetic_wave_bytes(
-                            clip_payload["sample_rate"],
-                            clip_payload["channels"],
-                            max(clip_payload["duration_seconds"], 0.2),
-                            clip_payload["id"],
-                        )
-                    )
-                slice_row = Slice(
-                    id=clip_payload["id"],
-                    source_recording_id=recording_id,
-                    active_variant_id=variant_id,
-                    active_commit_id=None,
-                    status=self._legacy_status_to_storage(clip_payload["review_status"]),
-                    model_metadata={
-                        "order_index": clip_payload["order_index"],
-                        "source_file_id": clip_payload["source_file_id"],
-                        "working_asset_id": clip_payload["working_asset_id"],
-                        "original_start_time": clip_payload["original_start_time"],
-                        "original_end_time": clip_payload["original_end_time"],
-                        "speaker_name": clip_payload["speaker_name"],
-                        "language": clip_payload["language"],
-                        "is_superseded": clip_payload["is_superseded"],
-                        "updated_at": clip_payload["updated_at"],
-                    },
-                    created_at=datetime.fromisoformat(clip_payload["created_at"].replace("Z", "+00:00")),
-                )
-                variant = AudioVariant(
-                    id=variant_id,
-                    slice_id=slice_row.id,
-                    file_path=str(variant_path),
-                    is_original=True,
-                    generator_model="slicer",
-                    sample_rate=clip_payload["sample_rate"],
-                    num_samples=max(int(clip_payload["duration_seconds"] * clip_payload["sample_rate"]), 1),
-                )
-                transcript = Transcript(
-                    id=transcript_id,
-                    slice_id=slice_row.id,
-                    original_text=clip_payload["transcript"]["text_initial"],
-                    modified_text=clip_payload["transcript"]["text_current"],
-                    is_modified=clip_payload["transcript"]["text_current"] != clip_payload["transcript"]["text_initial"],
-                    alignment_data={
-                        "source": clip_payload["transcript"].get("source", "manual"),
-                        "confidence": clip_payload["transcript"].get("confidence"),
-                    },
-                )
-                session.add(slice_row)
-                session.add(variant)
-                session.add(transcript)
-                session.flush()
-                self._replace_slice_tags(session, slice_row, [TagPayload(**tag) for tag in clip_payload["tags"]])
-                session.flush()
-                self._append_slice_revision(
-                    session,
-                    slice_row,
-                    edl_operations=list(clip_payload["clip_edl"]),
-                    message="Imported legacy slice",
-                    created_at=datetime.fromisoformat(clip_payload["updated_at"].replace("Z", "+00:00")),
-                )
             for export_payload in exports_by_project.get(batch.id, []):
                 session.add(
                     ExportRun(
@@ -2605,52 +2029,13 @@ class SQLiteRepository:
             num_samples=960000,
         )
         session.add(recording)
-        session.commit()
-        with self._session() as seed_session:
-            seeded_recording = self._get_source_recording(seed_session, recording.id)
-            self._create_slice_from_source_span(
-                seed_session,
-                seeded_recording,
-                slice_id="clip-001",
-                start_seconds=12.4,
-                end_seconds=15.68,
-                transcript_text="The workstation should make this painless.",
-                order_index=10,
-            )
-            seed_session.commit()
+
 
     def _get_batch(self, session: Session, batch_id: str) -> ImportBatch:
         batch = session.get(ImportBatch, batch_id)
         if batch is None:
             raise KeyError(batch_id)
         return batch
-
-    def _get_slice(self, session: Session, slice_id: str) -> Slice:
-        slice_row = session.exec(
-            select(Slice)
-            .where(Slice.id == slice_id)
-            .options(
-                selectinload(Slice.source_recording),
-                selectinload(Slice.transcript),
-                selectinload(Slice.tags),
-                selectinload(Slice.variants),
-                selectinload(Slice.commits),
-                selectinload(Slice.active_variant),
-                selectinload(Slice.active_commit),
-            )
-        ).first()
-        if slice_row is None:
-            raise KeyError(slice_id)
-        return slice_row
-
-    def _get_loaded_slice(self, session: Session, slice_id: str) -> Slice:
-        return self._get_slice(session, slice_id)
-
-    def _get_edit_commit(self, session: Session, commit_id: str) -> EditCommit:
-        commit = session.get(EditCommit, commit_id)
-        if commit is None:
-            raise KeyError(commit_id)
-        return commit
 
     def _get_source_recording(self, session: Session, recording_id: str) -> SourceRecording:
         recording = session.get(SourceRecording, recording_id)
@@ -2664,12 +2049,6 @@ class SQLiteRepository:
             raise KeyError(job_id)
         return job
 
-    def _get_transcript(self, session: Session, slice_id: str) -> Transcript:
-        transcript = session.exec(select(Transcript).where(Transcript.slice_id == slice_id)).first()
-        if transcript is None:
-            raise KeyError(slice_id)
-        return transcript
-
     def _validate_source_window_bounds(
         self,
         recording: SourceRecording,
@@ -2682,260 +2061,6 @@ class SQLiteRepository:
             raise ValueError("Source span end must be greater than the start")
         if end_seconds > recording.duration_s:
             raise ValueError("Source span end exceeds the source recording duration")
-
-    def _create_slice_from_source_span(
-        self,
-        session: Session,
-        recording: SourceRecording,
-        *,
-        slice_id: str,
-        start_seconds: float,
-        end_seconds: float,
-        transcript_text: str,
-        order_index: int,
-        speaker_name: str = "speaker_a",
-        language: str = "en",
-        alignment_data: dict[str, Any] | None = None,
-        extra_metadata: dict[str, Any] | None = None,
-        created_at: datetime | None = None,
-    ) -> Slice:
-        self._validate_source_window_bounds(recording, start_seconds, end_seconds)
-        variant_id = self._new_id("variant")
-        variant_path = self._managed_variant_path(variant_id)
-        variant_path.parent.mkdir(parents=True, exist_ok=True)
-        variant_bytes = self._extract_source_window_wav_bytes(recording, start_seconds, end_seconds)
-        variant_path.write_bytes(variant_bytes)
-        sample_rate, _channels, num_samples = self._wav_metadata(variant_bytes)
-        now = created_at or utc_now()
-        slice_row = Slice(
-            id=slice_id,
-            source_recording_id=recording.id,
-            active_variant_id=variant_id,
-            active_commit_id=None,
-            status=ReviewStatus.UNRESOLVED,
-            model_metadata={
-                "order_index": order_index,
-                "source_file_id": recording.id,
-                "working_asset_id": variant_id,
-                "original_start_time": start_seconds,
-                "original_end_time": end_seconds,
-                "speaker_name": speaker_name,
-                "language": language,
-                "is_superseded": False,
-                "updated_at": now.isoformat(),
-                **dict(extra_metadata or {}),
-            },
-            created_at=now,
-        )
-        variant = AudioVariant(
-            id=variant_id,
-            slice_id=slice_row.id,
-            file_path=str(variant_path),
-            is_original=True,
-            generator_model="slicer",
-            sample_rate=sample_rate,
-            num_samples=num_samples,
-        )
-        transcript = Transcript(
-            id=self._new_id("transcript"),
-            slice_id=slice_row.id,
-            original_text=transcript_text,
-            alignment_data=alignment_data,
-        )
-        session.add(slice_row)
-        session.add(variant)
-        session.add(transcript)
-        session.flush()
-        self._append_slice_revision(
-            session,
-            slice_row,
-            edl_operations=[],
-            message="Imported slice baseline",
-            created_at=now,
-        )
-        return slice_row
-
-    def _get_batch_slices(self, session: Session, batch_id: str) -> list[Slice]:
-        return [
-            item
-            for item in self._get_all_batch_slices(session, batch_id)
-            if not self._slice_metadata(item).get("is_superseded", False)
-        ]
-
-    def _get_batch_slice_summaries(self, session: Session, batch_id: str) -> list[Slice]:
-        recording_ids = session.exec(
-            select(SourceRecording.id).where(SourceRecording.batch_id == batch_id)
-        ).all()
-        if not recording_ids:
-            return []
-        slices = session.exec(
-            select(Slice)
-            .where(Slice.source_recording_id.in_(recording_ids))
-            .options(
-                selectinload(Slice.source_recording),
-                selectinload(Slice.transcript),
-                selectinload(Slice.tags),
-                selectinload(Slice.active_variant),
-                selectinload(Slice.active_commit),
-            )
-        ).all()
-        return sorted(
-            [
-                item
-                for item in slices
-                if not self._slice_metadata(item).get("is_superseded", False)
-            ],
-            key=lambda slice_row: (
-                int(self._slice_metadata(slice_row).get("order_index", 0)),
-                self._as_utc(slice_row.created_at),
-            ),
-        )
-
-    def _get_all_batch_slices(self, session: Session, batch_id: str) -> list[Slice]:
-        recording_ids = session.exec(
-            select(SourceRecording.id).where(SourceRecording.batch_id == batch_id)
-        ).all()
-        if not recording_ids:
-            return []
-        slices = session.exec(
-            select(Slice)
-            .where(Slice.source_recording_id.in_(recording_ids))
-            .options(
-                selectinload(Slice.source_recording),
-                selectinload(Slice.transcript),
-                selectinload(Slice.tags),
-                selectinload(Slice.variants),
-                selectinload(Slice.commits),
-                selectinload(Slice.active_variant),
-                selectinload(Slice.active_commit),
-            )
-        ).all()
-        return sorted(
-            list(slices),
-            key=lambda slice_row: (
-                int(self._slice_metadata(slice_row).get("order_index", 0)),
-                self._as_utc(slice_row.created_at),
-            ),
-        )
-
-    def _slice_metadata(self, slice_row: Slice) -> dict[str, Any]:
-        return dict(slice_row.model_metadata or {})
-
-    def _get_redo_target(self, session: Session, slice_row: Slice) -> EditCommit | None:
-        if slice_row.active_commit_id is None:
-            return session.exec(
-                select(EditCommit)
-                .where(EditCommit.slice_id == slice_row.id, EditCommit.parent_commit_id.is_(None))
-                .order_by(EditCommit.created_at.desc())
-            ).first()
-        return session.exec(
-            select(EditCommit)
-            .where(EditCommit.parent_commit_id == slice_row.active_commit_id)
-            .order_by(EditCommit.created_at.desc())
-        ).first()
-
-    def _collect_edl_operations(self, slice_row: Slice) -> list[dict[str, Any]]:
-        if slice_row.active_commit is None:
-            return []
-        return list(slice_row.active_commit.edl_operations or [])
-
-    def _get_slice_tags(self, session: Session, slice_id: str) -> list[Tag]:
-        statement = (
-            select(Tag)
-            .join(SliceTagLink, SliceTagLink.tag_id == Tag.id)
-            .where(SliceTagLink.slice_id == slice_id)
-            .order_by(Tag.name)
-        )
-        return session.exec(statement).all()
-
-    def _replace_slice_tags(self, session: Session, slice_row: Slice, tags: list[TagPayload]) -> None:
-        existing_links = session.exec(
-            select(SliceTagLink).where(SliceTagLink.slice_id == slice_row.id)
-        ).all()
-        for link in existing_links:
-            session.delete(link)
-        for tag_payload in tags:
-            tag = session.exec(select(Tag).where(Tag.name == tag_payload.name)).first()
-            if tag is None:
-                tag = Tag(id=self._new_id("tag"), name=tag_payload.name, color=tag_payload.color)
-                session.add(tag)
-                session.flush()
-            elif tag.color != tag_payload.color:
-                tag.color = tag_payload.color
-                session.add(tag)
-            session.add(SliceTagLink(slice_id=slice_row.id, tag_id=tag.id))
-
-    def _current_tag_payloads(self, session: Session, slice_row: Slice) -> list[TagPayload]:
-        return [
-            TagPayload(name=tag.name, color=tag.color)
-            for tag in self._get_slice_tags(session, slice_row.id)
-        ]
-
-    def _normalized_tag_payloads(self, tags: list[TagPayload] | None) -> list[dict[str, str]]:
-        return [
-            {"name": tag.name, "color": tag.color}
-            for tag in sorted(tags or [], key=lambda item: (item.name.lower(), item.color))
-        ]
-
-    def _append_slice_revision(
-        self,
-        session: Session,
-        slice_row: Slice,
-        *,
-        edl_operations: list[dict[str, Any]] | None = None,
-        message: str | None = None,
-        is_milestone: bool = False,
-        created_at: datetime | None = None,
-        parent_commit_id: str | None | object = ...,
-    ) -> EditCommit:
-        transcript = slice_row.transcript or self._get_transcript(session, slice_row.id)
-        revision = EditCommit(
-            id=self._new_id("edit"),
-            slice_id=slice_row.id,
-            parent_commit_id=slice_row.active_commit_id if parent_commit_id is ... else parent_commit_id,
-            edl_operations=list(edl_operations if edl_operations is not None else self._collect_edl_operations(slice_row)),
-            transcript_text=self._transcript_text(transcript),
-            status=slice_row.status,
-            tags_payload=[tag.model_dump(mode="json") for tag in self._current_tag_payloads(session, slice_row)],
-            active_variant_id_snapshot=slice_row.active_variant_id,
-            message=message,
-            is_milestone=is_milestone,
-            created_at=created_at or utc_now(),
-        )
-        session.add(revision)
-        session.flush()
-        slice_row.active_commit_id = revision.id
-        session.add(slice_row)
-        return revision
-
-    def _restore_slice_from_revision(self, session: Session, slice_row: Slice, revision: EditCommit) -> None:
-        transcript = slice_row.transcript or self._get_transcript(session, slice_row.id)
-        slice_row.active_variant_id = revision.active_variant_id_snapshot
-        slice_row.active_commit_id = revision.id
-        slice_row.status = revision.status
-        transcript.modified_text = (
-            None if revision.transcript_text == transcript.original_text else revision.transcript_text
-        )
-        transcript.is_modified = transcript.modified_text != transcript.original_text
-        self._replace_slice_tags(
-            session,
-            slice_row,
-            [TagPayload.model_validate(tag) for tag in revision.tags_payload or []],
-        )
-        self._touch_slice(slice_row)
-        session.add(transcript)
-        session.add(slice_row)
-
-    def _edl_message(self, payload: SliceEdlUpdate) -> str:
-        if payload.op == "delete_range" and payload.range is not None:
-            return f"Deleted {payload.range.end_seconds - payload.range.start_seconds:.2f}s"
-        if payload.op == "insert_silence":
-            return f"Inserted {float(payload.duration_seconds or 0.0):.2f}s silence"
-        if payload.op == "crop" and payload.range is not None:
-            return (
-                f"Cropped to {payload.range.start_seconds:.2f}s-{payload.range.end_seconds:.2f}s"
-            )
-        return f"Applied {payload.op}"
 
     def _as_utc(self, value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -2955,14 +2080,6 @@ class SQLiteRepository:
     def _project_summary(self, session: Session, batch: ImportBatch) -> ProjectSummary:
         created_at = self._as_utc(batch.created_at)
         updated_at = created_at
-        recording_ids = session.exec(
-            select(SourceRecording.id).where(SourceRecording.batch_id == batch.id)
-        ).all()
-        if recording_ids:
-            for slice_row in session.exec(
-                select(Slice).where(Slice.source_recording_id.in_(recording_ids))
-            ).all():
-                updated_at = max(updated_at, self._clip_updated_at(slice_row))
         latest_export = session.exec(
             select(ExportRun).where(ExportRun.batch_id == batch.id).order_by(ExportRun.created_at.desc())
         ).first()
@@ -2979,7 +2096,10 @@ class SQLiteRepository:
             created_at=created_at,
             updated_at=updated_at,
             export_status=export_status,
+            active_prepared_output_group_id=batch.active_prepared_output_group_id,
+            active_preparation_job_id=batch.active_preparation_job_id,
         )
+
 
     def _normalize_export_run(self, run: ExportRun) -> ExportRun:
         run.created_at = self._as_utc(run.created_at)
@@ -2987,66 +2107,21 @@ class SQLiteRepository:
             run.completed_at = self._as_utc(run.completed_at)
         return run
 
-    def _get_slice_detail(self, session: Session, slice_id: str) -> SliceDetail:
-        return self._to_slice_detail(self._get_slice(session, slice_id))
 
-    def _tag_view(self, tag: Tag) -> TagView:
-        return TagView(id=tag.id, name=tag.name, color=tag.color)
 
-    def _transcript_view(self, transcript: Transcript | None) -> TranscriptView | None:
-        if transcript is None:
-            return None
-        return TranscriptView(
-            id=transcript.id,
-            slice_id=transcript.slice_id,
-            original_text=transcript.original_text,
-            modified_text=transcript.modified_text,
-            is_modified=transcript.is_modified,
-            alignment_data=transcript.alignment_data,
-        )
-
-    def _clip_lab_transcript_from_transcript(self, transcript: Transcript | None) -> ClipLabTranscriptView | None:
-        if transcript is None:
-            return None
-        return ClipLabTranscriptView(
-            id=transcript.id,
-            original_text=transcript.original_text,
-            modified_text=transcript.modified_text,
-            is_modified=transcript.is_modified,
-            draft_text=None,
-            draft_source=None,
-            alignment_data=transcript.alignment_data,
-        )
-
-    def _transcript_summary_view(self, transcript: Transcript | None) -> TranscriptSummaryView | None:
-        if transcript is None:
-            return None
-        return TranscriptSummaryView(
-            id=transcript.id,
-            slice_id=transcript.slice_id,
-            original_text=transcript.original_text,
-            modified_text=transcript.modified_text,
-            is_modified=transcript.is_modified,
-        )
-
-    def _audio_variant_view(self, variant: AudioVariant | None) -> AudioVariantView | None:
-        if variant is None:
-            return None
-        return AudioVariantView(
-            id=variant.id,
-            slice_id=variant.slice_id,
-            is_original=variant.is_original,
-            generator_model=variant.generator_model,
-            sample_rate=variant.sample_rate,
-            num_samples=variant.num_samples,
-        )
-
-    def _source_recording_view(self, recording: SourceRecording | None) -> SourceRecordingView:
+    def _source_recording_view(
+        self,
+        recording: SourceRecording | None,
+        artifact: SourceRecordingArtifact | None = None,
+    ) -> SourceRecordingView:
         if recording is None:
             raise ValueError("Slice is missing its source recording")
+        metadata = dict(artifact.artifact_metadata or {}) if artifact is not None else {}
+        display_name = str(metadata.get("original_filename") or "").strip() or Path(recording.file_path).name or recording.id
         return SourceRecordingView(
             id=recording.id,
             batch_id=recording.batch_id,
+            display_name=display_name,
             parent_recording_id=recording.parent_recording_id,
             sample_rate=recording.sample_rate,
             num_channels=recording.num_channels,
@@ -3115,7 +2190,7 @@ class SQLiteRepository:
         source_jobs = [
             job
             for job in jobs
-            if job.kind in {JobKind.SOURCE_TRANSCRIPTION, JobKind.SOURCE_ALIGNMENT, JobKind.SOURCE_SLICING}
+            if job.kind in {JobKind.SOURCE_TRANSCRIPTION, JobKind.SOURCE_ALIGNMENT}
             and job.status in {JobStatus.PENDING, JobStatus.RUNNING}
         ]
         source_jobs.sort(key=lambda job: (self._as_utc(job.created_at), job.id), reverse=True)
@@ -3128,7 +2203,7 @@ class SQLiteRepository:
         source_jobs = [
             job
             for job in jobs
-            if job.kind in {JobKind.SOURCE_TRANSCRIPTION, JobKind.SOURCE_ALIGNMENT, JobKind.SOURCE_SLICING}
+            if job.kind in {JobKind.SOURCE_TRANSCRIPTION, JobKind.SOURCE_ALIGNMENT}
         ]
         source_jobs.sort(key=lambda job: (self._as_utc(job.created_at), job.id), reverse=True)
         return source_jobs[0] if source_jobs else None
@@ -3141,13 +2216,12 @@ class SQLiteRepository:
         latest_source_job: ProcessingJob | None,
         slice_count: int,
     ) -> tuple[str, str | None]:
+        _ = slice_count
         if active_job is not None:
             if active_job.kind == JobKind.SOURCE_TRANSCRIPTION:
                 return ("transcribing", "Transcribing audio...")
             if active_job.kind == JobKind.SOURCE_ALIGNMENT:
                 return ("aligning", "Aligning transcript...")
-            if active_job.kind == JobKind.SOURCE_SLICING:
-                return ("slicing", "Generating slices...")
         if latest_source_job is not None and latest_source_job.status == JobStatus.FAILED:
             return (
                 "failed",
@@ -3155,14 +2229,13 @@ class SQLiteRepository:
                 or f"{latest_source_job.kind.value.replace('_', ' ').title()} failed.",
             )
         if artifact is not None and artifact.alignment_status == "stale":
-            return ("alignment_stale", "Transcript changed. Re-run alignment before reslicing.")
-        if slice_count > 0:
-            return ("sliced", f"{slice_count} slice{'s' if slice_count != 1 else ''} ready for review.")
+            return ("alignment_stale", "Transcript changed. Re-run alignment.")
         if artifact is not None and artifact.alignment_status == "ok":
-            return ("aligned", "Alignment is ready. Run slicing to generate review clips.")
+            return ("aligned", "Alignment is ready.")
         if artifact is not None and artifact.transcript_status in {"ok", "patched"}:
             return ("transcribed", "Transcript is ready. Run alignment next.")
         return ("idle", "Recording is ready for transcription.")
+
 
     def _processing_job_view(self, job: ProcessingJob) -> ProcessingJobView:
         return ProcessingJobView(
@@ -3188,8 +2261,6 @@ class SQLiteRepository:
             reference_asset_id=variant.reference_asset_id,
             source_kind=variant.source_kind,
             source_recording_id=variant.source_recording_id,
-            source_slice_id=variant.source_slice_id,
-            source_audio_variant_id=variant.source_audio_variant_id,
             source_reference_variant_id=variant.source_reference_variant_id,
             source_start_seconds=variant.source_start_seconds,
             source_end_seconds=variant.source_end_seconds,
@@ -3229,8 +2300,6 @@ class SQLiteRepository:
             if any(
                 value is not None
                 for value in [
-                    variant.source_slice_id,
-                    variant.source_audio_variant_id,
                     variant.source_reference_variant_id,
                 ]
             ):
@@ -3238,24 +2307,6 @@ class SQLiteRepository:
             recording = self._get_source_recording(session, variant.source_recording_id)
             if recording.batch_id != asset.project_id:
                 raise ValueError("Reference variant source recording does not belong to the asset project")
-        elif variant.source_kind == ReferenceSourceKind.SLICE_VARIANT:
-            if variant.source_slice_id is None or variant.source_audio_variant_id is None:
-                raise ValueError("Slice-derived reference variants require slice and audio variant ids")
-            if variant.source_reference_variant_id is not None:
-                raise ValueError("Slice-derived reference variants cannot also reference a reference variant")
-            source_slice = self._get_loaded_slice(session, variant.source_slice_id)
-            source_variant = session.get(AudioVariant, variant.source_audio_variant_id)
-            if source_variant is None:
-                raise KeyError(variant.source_audio_variant_id)
-            if source_variant.slice_id != source_slice.id:
-                raise ValueError("Source audio variant does not belong to the referenced slice")
-            if source_slice.source_recording.batch_id != asset.project_id:
-                raise ValueError("Reference variant slice does not belong to the asset project")
-            if (
-                variant.source_recording_id is not None
-                and variant.source_recording_id != source_slice.source_recording_id
-            ):
-                raise ValueError("Reference variant source recording does not match the referenced slice")
         elif variant.source_kind == ReferenceSourceKind.REFERENCE_VARIANT:
             if variant.source_reference_variant_id is None:
                 raise ValueError("Reference-derived variants require source_reference_variant_id")
@@ -3263,8 +2314,6 @@ class SQLiteRepository:
                 value is not None
                 for value in [
                     variant.source_recording_id,
-                    variant.source_slice_id,
-                    variant.source_audio_variant_id,
                 ]
             ):
                 raise ValueError("Reference-derived variants must not mix other source kinds")
@@ -3382,6 +2431,12 @@ class SQLiteRepository:
         if normalized not in {"zero_shot", "finetune", "both"}:
             return "both"
         return normalized
+
+    def _normalize_reference_candidate_count_cap(self, raw_cap: int | None) -> int:
+        return max(
+            REFERENCE_CANDIDATE_COUNT_CAP_MIN,
+            min(int(raw_cap or REFERENCE_CANDIDATE_COUNT_CAP_DEFAULT), REFERENCE_CANDIDATE_COUNT_CAP_MAX),
+        )
 
     def _normalize_reference_target_durations(
         self,
@@ -3531,6 +2586,255 @@ class SQLiteRepository:
                 return candidate
         raise KeyError(candidate_id)
 
+    def _build_reference_run_candidate_set(
+        self,
+        run_id: str,
+        project_id: str,
+        config: dict[str, Any],
+    ) -> tuple[list[ReferenceCandidateSummary], list[list[float]], dict[str, Any] | None]:
+        recording_ids = self._normalize_reference_run_recording_ids(list(config.get("recording_ids") or []))
+        backend = str(config.get("candidate_assembly_backend") or "auto")
+        dataset_run_root = self._resolve_reference_dataset_run_root(
+            project_id,
+            recording_ids,
+            config.get("dataset_run_id"),
+        )
+        if backend in {"auto", "cutpoint_overlap"} and dataset_run_root is not None:
+            candidates, embeddings = self._build_reference_run_candidates_from_cutpoints(
+                run_id,
+                project_id,
+                config,
+                recording_ids,
+                dataset_run_root,
+            )
+            dimension = len(embeddings[0]) if embeddings else 25
+            return candidates, embeddings, embedding_space_descriptor_v2(dimension)
+        candidates = self._build_reference_run_candidates_from_vad_windows(run_id, project_id, config)
+        embeddings = self._build_reference_run_candidate_embeddings(candidates)
+        return candidates, embeddings, None
+
+    def _resolve_reference_dataset_run_root(
+        self,
+        project_id: str,
+        recording_ids: list[str],
+        dataset_run_id: str | None,
+    ) -> Path | None:
+        with self._session() as session:
+            selected = set(recording_ids)
+            if dataset_run_id:
+                run = session.get(ProcessingRun, dataset_run_id)
+                if run is None:
+                    raise KeyError(f"Dataset run not found: {dataset_run_id}")
+                if run.project_id != project_id:
+                    raise ValueError("Dataset run must belong to the same project as the reference run")
+                run_root = (self.media_root / run.artifact_root).resolve()
+                if not (run_root / "artifacts" / "safe_cutpoints.jsonl").exists():
+                    raise ValueError("Dataset run is missing artifacts/safe_cutpoints.jsonl")
+                return run_root
+
+            runs = session.exec(
+                select(ProcessingRun)
+                .where(ProcessingRun.project_id == project_id)
+                .where(ProcessingRun.status == ProcessingRunStatus.COMPLETED)
+                .order_by(ProcessingRun.created_at.desc())
+            ).all()
+            for run in runs:
+                run_recording_ids = set(run.input_summary.get("source_recording_ids") or [])
+                if not selected.issubset(run_recording_ids):
+                    continue
+                run_root = (self.media_root / run.artifact_root).resolve()
+                if (run_root / "artifacts" / "safe_cutpoints.jsonl").exists():
+                    return run_root
+        return None
+
+    def _dataset_run_recording_path_map(self, recording_ids: list[str]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        with self._session() as session:
+            for recording_id in recording_ids:
+                recording = self._get_source_recording(session, recording_id)
+                mapping[str(self._get_source_recording_audio_path(recording))] = recording_id
+        return mapping
+
+    def _load_native_recording_samples(self, recording: SourceRecording) -> tuple[np.ndarray, int]:
+        audio_path = self._get_source_recording_audio_path(recording)
+        samples, sample_rate = mono_pcm16_samples_from_wav_bytes(audio_path.read_bytes())
+        return samples, sample_rate
+
+    def _build_reference_run_candidates_from_cutpoints(
+        self,
+        run_id: str,
+        project_id: str,
+        config: dict[str, Any],
+        recording_ids: list[str],
+        dataset_run_root: Path,
+    ) -> tuple[list[ReferenceCandidateSummary], list[list[float]]]:
+        durations = self._normalize_reference_target_durations(
+            config.get("target_durations"),
+            str(config.get("mode") or "both"),
+        )
+        candidate_count_cap = self._normalize_reference_candidate_count_cap(config.get("candidate_count_cap"))
+        stride_cutpoints = max(int(config.get("cutpoint_stride") or 2), 1)
+        overlap_threshold = float(config.get("nms_overlap_threshold") or 0.6)
+        overlap_threshold = max(0.3, min(overlap_threshold, 0.95))
+        selected_recording_ids = set(recording_ids)
+
+        path_map = self._dataset_run_recording_path_map(recording_ids)
+        source_maps = build_source_audio_maps(dataset_run_root, path_map)
+        variant_manifest = json.loads(
+            (dataset_run_root / "artifacts" / "audio_variants_manifest.json").read_text(encoding="utf-8")
+        )
+        variants = {
+            str(row["source_audio_id"]): row
+            for row in variant_manifest.get("variants", [])
+            if str(row.get("kind")) == "analysis_audio"
+        }
+        windows = load_cutpoint_windows(
+            dataset_run_root,
+            target_durations=durations,
+            stride_cutpoints=stride_cutpoints,
+        )
+
+        with self._session() as session:
+            recordings = {
+                recording_id: self._get_source_recording(session, recording_id)
+                for recording_id in recording_ids
+            }
+
+        native_samples_by_recording: dict[str, tuple[np.ndarray, int]] = {}
+        raw_candidates: list[ReferenceCandidateSummary] = []
+        raw_embeddings: list[list[float]] = []
+        raw_feature_vectors: list[list[float]] = []
+        raw_scores: list[float] = []
+        raw_starts: list[float] = []
+        raw_ends: list[float] = []
+        raw_recording_ids: list[str] = []
+
+        for window in windows:
+            source_map = source_maps.get(window.source_audio_id)
+            variant = variants.get(window.source_audio_id)
+            if source_map is None or variant is None:
+                continue
+            if source_map.recording_id not in selected_recording_ids:
+                continue
+            recording = recordings[source_map.recording_id]
+            start_seconds = round(analysis_to_native_seconds(window.analysis_start_sample, variant), 3)
+            end_seconds = round(analysis_to_native_seconds(window.analysis_end_sample, variant), 3)
+            if end_seconds - start_seconds < 1.0:
+                continue
+            if source_map.recording_id not in native_samples_by_recording:
+                native_samples_by_recording[source_map.recording_id] = self._load_native_recording_samples(recording)
+            samples, sample_rate = native_samples_by_recording[source_map.recording_id]
+            clip_samples = crop_mono_samples(samples, sample_rate, start_seconds, end_seconds)
+            feature_vector = acoustic_signature_v2_features(clip_samples, sample_rate)
+            embedding = normalize_embedding_vector(feature_vector)
+            risk_flags = self._reference_candidate_risk_flags(
+                recording.duration_s,
+                start_seconds,
+                end_seconds,
+                window.transcript_text,
+            )
+            default_scores = self._reference_candidate_default_scores(
+                recording.duration_s,
+                start_seconds,
+                end_seconds,
+                window.transcript_text,
+                risk_flags,
+            )
+            candidate = ReferenceCandidateSummary(
+                candidate_id=self._reference_candidate_id(
+                    recording.id,
+                    start_seconds,
+                    end_seconds,
+                    f"{window.start_cutpoint_id}:{window.end_cutpoint_id}",
+                ),
+                run_id=run_id,
+                source_media_kind=ReferenceSourceKind.SOURCE_RECORDING,
+                source_recording_id=recording.id,
+                source_variant_id=None,
+                source_start_seconds=start_seconds,
+                source_end_seconds=end_seconds,
+                duration_seconds=round(end_seconds - start_seconds, 3),
+                transcript_text=window.transcript_text,
+                speaker_name=None,
+                language=None,
+                risk_flags=risk_flags,
+                default_scores=default_scores,
+                embedding_space_id=ACOUSTIC_SIGNATURE_V2_ID,
+            )
+            raw_candidates.append(candidate)
+            raw_embeddings.append(embedding)
+            raw_feature_vectors.append(feature_vector)
+            raw_scores.append(float(default_scores.get("both", 0.0)))
+            raw_starts.append(start_seconds)
+            raw_ends.append(end_seconds)
+            raw_recording_ids.append(recording.id)
+
+        if not raw_candidates:
+            raise ValueError("No overlapping SafeCutPoint reference candidates were generated for this dataset run")
+
+        zscored = zscore_rows(raw_embeddings)
+        centroid = np.mean(np.asarray(zscored, dtype=np.float64), axis=0)
+        adjusted_scores: list[float] = []
+        for index, embedding in enumerate(zscored):
+            distance = float(np.linalg.norm(np.asarray(embedding, dtype=np.float64) - centroid))
+            adjusted_scores.append(raw_scores[index] + max(0.0, 0.15 - distance * 0.03))
+
+        kept_indices: list[int] = []
+        for recording_id in sorted(selected_recording_ids):
+            indices = [index for index, value in enumerate(raw_recording_ids) if value == recording_id]
+            if not indices:
+                continue
+            local_kept = nms_candidate_indices(
+                [raw_starts[index] for index in indices],
+                [raw_ends[index] for index in indices],
+                [adjusted_scores[index] for index in indices],
+                overlap_threshold=overlap_threshold,
+            )
+            kept_indices.extend(indices[index] for index in local_kept)
+
+        surviving_candidates = [raw_candidates[index] for index in kept_indices]
+        surviving_embeddings = [raw_embeddings[index] for index in kept_indices]
+        hdbscan_min_cluster_size = hdbscan_min_cluster_size_for_count(len(surviving_embeddings))
+        config["hdbscan_min_cluster_size"] = hdbscan_min_cluster_size
+        cluster_labels = hdbscan_cluster_labels(
+            surviving_embeddings,
+            min_cluster_size=hdbscan_min_cluster_size,
+        )
+        cluster_display_by_id = dumb_cluster_display_labels(cluster_labels)
+        enriched_candidates: list[ReferenceCandidateSummary] = []
+        for index, candidate in enumerate(surviving_candidates):
+            hdbscan_cluster_id = cluster_labels[index]
+            display_label = cluster_display_by_id.get(hdbscan_cluster_id, "unknown")
+            enriched_scores = dict(candidate.default_scores)
+            enriched_scores["mood_cluster"] = float(hdbscan_cluster_id)
+            mood_flags = list(candidate.risk_flags)
+            cluster_flag = cluster_risk_flag_for_label(display_label)
+            if cluster_flag not in mood_flags:
+                mood_flags.append(cluster_flag)
+            enriched_candidates.append(
+                candidate.model_copy(
+                    update={
+                        "default_scores": enriched_scores,
+                        "risk_flags": mood_flags,
+                    }
+                )
+            )
+
+        ranked_indices = sorted(
+            range(len(enriched_candidates)),
+            key=lambda index: (
+                -adjusted_scores[kept_indices[index]],
+                enriched_candidates[index].source_recording_id or "",
+                enriched_candidates[index].source_start_seconds,
+            ),
+        )[:candidate_count_cap]
+        final_candidates = [
+            enriched_candidates[index].model_copy(update={"embedding_index": position})
+            for position, index in enumerate(ranked_indices)
+        ]
+        final_embeddings = [normalize_embedding_vector(surviving_embeddings[index]) for index in ranked_indices]
+        return final_candidates, final_embeddings
+
     def _build_reference_run_candidate_embeddings(
         self,
         candidates: list[ReferenceCandidateSummary],
@@ -3564,7 +2868,7 @@ class SQLiteRepository:
             embeddings.append(self._embed_audio_bytes_for_reference_space(audio_bytes))
         return embeddings
 
-    def _build_reference_run_candidates(
+    def _build_reference_run_candidates_from_vad_windows(
         self,
         run_id: str,
         project_id: str,
@@ -3575,22 +2879,19 @@ class SQLiteRepository:
             config.get("target_durations"),
             str(config.get("mode") or "both"),
         )
-        candidate_count_cap = max(8, min(int(config.get("candidate_count_cap") or 60), 200))
+        candidate_count_cap = self._normalize_reference_candidate_count_cap(config.get("candidate_count_cap"))
         stride_ratio = float(config.get("overlap_stride_ratio") or 0.5)
         stride_ratio = max(0.2, min(stride_ratio, 0.9))
 
         with self._session() as session:
             recordings = [self._get_source_recording(session, recording_id) for recording_id in recording_ids]
-            recording_slices: dict[str, list[Slice]] = {}
             for recording in recordings:
                 if recording.batch_id != project_id:
                     raise ValueError("Reference run recordings must belong to the selected project")
-                recording_slices[recording.id] = self._get_recording_slices(session, recording.id)
 
         raw_candidates: list[ReferenceCandidateSummary] = []
         for recording in recordings:
             total_duration = recording.duration_s
-            overlapping_slices = recording_slices.get(recording.id, [])
             speech_regions = self._reference_candidate_regions(recording)
             for window_seconds in durations:
                 for start_seconds, end_seconds in self._candidate_time_windows(
@@ -3600,11 +2901,7 @@ class SQLiteRepository:
                 ):
                     if end_seconds - start_seconds < 1.0:
                         continue
-                    transcript_text, speaker_name, language = self._candidate_context_from_slices(
-                        overlapping_slices,
-                        start_seconds,
-                        end_seconds,
-                    )
+                    transcript_text, speaker_name, language = None, None, None
                     risk_flags = self._reference_candidate_risk_flags(
                         total_duration,
                         start_seconds,
@@ -3653,24 +2950,6 @@ class SQLiteRepository:
         return [
             candidate.model_copy(update={"embedding_index": index})
             for index, candidate in enumerate(ranked)
-        ]
-
-    def _get_recording_slices(self, session: Session, recording_id: str) -> list[Slice]:
-        slices = session.exec(
-            select(Slice)
-            .where(Slice.source_recording_id == recording_id)
-            .options(
-                selectinload(Slice.source_recording),
-                selectinload(Slice.transcript),
-                selectinload(Slice.tags),
-                selectinload(Slice.active_variant),
-                selectinload(Slice.active_commit),
-            )
-        ).all()
-        return [
-            slice_row
-            for slice_row in slices
-            if not self._slice_metadata(slice_row).get("is_superseded", False)
         ]
 
     def _reference_candidate_regions(self, recording: SourceRecording) -> list[tuple[float, float]]:
@@ -4133,32 +3412,6 @@ class SQLiteRepository:
             raise ValueError("Embedding dimensions do not match")
         return float(sum(left * right for left, right in zip(first, second)))
 
-    def _candidate_context_from_slices(
-        self,
-        slices: list[Slice],
-        start_seconds: float,
-        end_seconds: float,
-    ) -> tuple[str | None, str | None, str | None]:
-        overlapping: list[tuple[float, Slice]] = []
-        for slice_row in slices:
-            metadata = self._slice_metadata(slice_row)
-            slice_start = float(metadata.get("original_start_time", 0.0))
-            slice_end = float(metadata.get("original_end_time", slice_start + self._slice_duration(slice_row)))
-            overlap = min(end_seconds, slice_end) - max(start_seconds, slice_start)
-            if overlap > 0:
-                overlapping.append((overlap, slice_row))
-        if not overlapping:
-            return None, None, None
-        overlapping.sort(key=lambda item: (-item[0], item[1].id))
-        transcript_parts: list[str] = []
-        for _overlap, slice_row in overlapping[:2]:
-            text = self._transcript_text(slice_row.transcript).strip()
-            if text and text not in transcript_parts:
-                transcript_parts.append(text)
-        primary = overlapping[0][1]
-        transcript_text = " ".join(transcript_parts).strip() or None
-        return transcript_text, self._speaker_name(primary), self._language(primary)
-
     def _reference_candidate_risk_flags(
         self,
         total_duration: float,
@@ -4295,255 +3548,6 @@ class SQLiteRepository:
         speaker = (candidate.speaker_name or "reference").strip() or "reference"
         return f"{speaker} {candidate.source_start_seconds:.2f}-{candidate.source_end_seconds:.2f}s"
 
-    def _revision_view(self, commit: EditCommit) -> SliceRevision:
-        return SliceRevision(
-            id=commit.id,
-            slice_id=commit.slice_id,
-            parent_commit_id=commit.parent_commit_id,
-            edl_operations=list(commit.edl_operations or []),
-            transcript_text=commit.transcript_text,
-            status=commit.status,
-            tags=[
-                TagPayload.model_validate(tag)
-                for tag in sorted(commit.tags_payload or [], key=lambda item: str(item.get("name", "")).lower())
-            ],
-            active_variant_id=commit.active_variant_id_snapshot,
-            message=commit.message,
-            is_milestone=commit.is_milestone,
-            created_at=self._as_utc(commit.created_at),
-        )
-
-    def _to_slice_summary(self, slice_row: Slice) -> SliceSummary:
-        active_commit = slice_row.active_commit
-        return SliceSummary.model_validate(
-            {
-                "id": slice_row.id,
-                "source_recording_id": slice_row.source_recording_id,
-                "active_variant_id": slice_row.active_variant_id,
-                "active_commit_id": slice_row.active_commit_id,
-                "status": slice_row.status,
-                "is_locked": slice_row.is_locked,
-                "duration_seconds": self._slice_duration(slice_row),
-                "model_metadata": self._slice_metadata(slice_row),
-                "created_at": self._as_utc(slice_row.created_at),
-                "transcript": self._transcript_summary_view(slice_row.transcript),
-                "tags": [self._tag_view(tag) for tag in sorted(slice_row.tags, key=lambda tag: tag.name.lower())],
-                "active_variant_generator_model": (
-                    slice_row.active_variant.generator_model if slice_row.active_variant is not None else None
-                ),
-                "can_undo": active_commit.parent_commit_id is not None if active_commit is not None else False,
-                "can_redo": False,
-            }
-        )
-
-    def _to_slice_detail(self, slice_row: Slice) -> SliceDetail:
-        active_commit = slice_row.active_commit
-        commits = list(sorted(slice_row.commits, key=lambda commit: commit.created_at))
-        return SliceDetail.model_validate(
-            {
-                **self._to_slice_summary(slice_row).model_dump(mode="json"),
-                "transcript": self._transcript_view(slice_row.transcript),
-                "source_recording": self._source_recording_view(slice_row.source_recording),
-                "variants": [
-                    self._audio_variant_view(variant)
-                    for variant in sorted(slice_row.variants, key=lambda variant: (not variant.is_original, variant.id))
-                ],
-                "commits": [self._revision_view(commit) for commit in commits],
-                "active_variant": self._audio_variant_view(slice_row.active_variant),
-                "active_commit": self._revision_view(active_commit) if active_commit is not None else None,
-                "can_undo": active_commit.parent_commit_id is not None if active_commit is not None else False,
-                "can_redo": any(commit.parent_commit_id == slice_row.active_commit_id for commit in commits),
-            }
-        )
-
-    def _slice_clip_lab_capabilities(self) -> ClipLabCapabilitiesView:
-        return ClipLabCapabilitiesView(
-            can_edit_transcript=True,
-            can_edit_tags=True,
-            can_set_status=True,
-            can_save=True,
-            can_split=False,
-            can_merge=False,
-            can_edit_waveform=True,
-            can_run_processing=True,
-            can_switch_variants=True,
-            can_export=False,
-            can_finalize=False,
-        )
-
-    def _slice_audio_url(self, slice_row: Slice) -> str:
-        active_commit_id = slice_row.active_commit_id or "base"
-        active_variant_id = slice_row.active_variant_id or "source"
-        return f"/media/slices/{slice_row.id}.wav?rev={active_variant_id}:{active_commit_id}"
-
-    def _to_clip_lab_item_from_slice(self, slice_row: Slice) -> ClipLabItemView:
-        detail = self._to_slice_detail(slice_row)
-        return ClipLabItemView(
-            id=detail.id,
-            kind="slice",
-            source_recording_id=detail.source_recording_id,
-            source_recording=detail.source_recording,
-            start_seconds=float((detail.model_metadata or {}).get("original_start_time", 0.0)),
-            end_seconds=float((detail.model_metadata or {}).get("original_end_time", detail.duration_seconds)),
-            duration_seconds=detail.duration_seconds,
-            status=detail.status,
-            is_locked=slice_row.is_locked,
-            created_at=detail.created_at,
-            transcript=self._clip_lab_transcript_from_transcript(slice_row.transcript),
-            tags=detail.tags,
-            speaker_name=str((detail.model_metadata or {}).get("speaker_name", "speaker_a")),
-            language=str((detail.model_metadata or {}).get("language", "en")),
-            audio_url=self._slice_audio_url(slice_row),
-            item_metadata=detail.model_metadata,
-            transcript_source="manual" if detail.transcript and detail.transcript.is_modified else "slice_seed",
-            can_run_asr=False,
-            asr_placeholder_message="ASR execution is not wired in Clip Lab yet.",
-            asr_draft_transcript=None,
-            last_asr_job_id=None,
-            last_asr_at=None,
-            asr_model_name=None,
-            asr_model_version=None,
-            asr_language=None,
-            active_variant_generator_model=detail.active_variant_generator_model,
-            can_undo=detail.can_undo,
-            can_redo=detail.can_redo,
-            capabilities=self._slice_clip_lab_capabilities(),
-            variants=detail.variants,
-            commits=detail.commits,
-            active_variant=detail.active_variant,
-            active_commit=detail.active_commit,
-        )
-
-    def _touch_slice(self, slice_row: Slice, when: datetime | None = None) -> None:
-        metadata = self._slice_metadata(slice_row)
-        metadata["updated_at"] = self._as_utc(when or utc_now()).isoformat()
-        slice_row.model_metadata = metadata
-
-    def _transcript_text(self, transcript: Transcript | None) -> str:
-        if transcript is None:
-            return ""
-        return transcript.modified_text if transcript.modified_text is not None else transcript.original_text
-
-    def _speaker_name(self, slice_row: Slice) -> str:
-        return str(self._slice_metadata(slice_row).get("speaker_name", "speaker_a"))
-
-    def _language(self, slice_row: Slice) -> str:
-        return str(self._slice_metadata(slice_row).get("language", "en"))
-
-    def _slice_duration(self, slice_row: Slice) -> float:
-        if slice_row.active_variant is not None:
-            base_duration = slice_row.active_variant.duration_s
-        else:
-            base_duration = slice_row.source_recording.duration_s if slice_row.source_recording is not None else 0.0
-        return round(self._apply_edl_to_duration(base_duration, self._collect_edl_operations(slice_row)), 2)
-
-    def _legacy_status_to_storage(self, status: str) -> ReviewStatus:
-        mapping = {
-            "accepted": ReviewStatus.ACCEPTED,
-            "rejected": ReviewStatus.REJECTED,
-            "needs_attention": ReviewStatus.QUARANTINED,
-        }
-        return mapping.get(status, ReviewStatus.UNRESOLVED)
-
-    def _get_export_eligible_slices(self, session: Session, batch_id: str) -> list[Slice]:
-        return [
-            slice_row
-            for slice_row in self._get_batch_slices(session, batch_id)
-            if slice_row.status == ReviewStatus.ACCEPTED and self._transcript_text(slice_row.transcript).strip()
-        ]
-
-    def _commit_extends_parent(self, commit: EditCommit, parent_commit: EditCommit) -> bool:
-        parent_ops = list(parent_commit.edl_operations or [])
-        commit_ops = list(commit.edl_operations or [])
-        if len(commit_ops) < len(parent_ops):
-            return False
-        return commit_ops[: len(parent_ops)] == parent_ops
-
-    def _clip_updated_at(self, slice_row: Slice) -> datetime:
-        metadata = self._slice_metadata(slice_row)
-        raw = metadata.get("updated_at")
-        if isinstance(raw, str):
-            try:
-                return self._as_utc(datetime.fromisoformat(raw))
-            except ValueError:
-                return self._as_utc(slice_row.created_at)
-        return self._as_utc(slice_row.created_at)
-
-    def _apply_edl_to_duration(self, duration: float, operations: list[dict[str, Any]]) -> float:
-        current = max(duration, 0.0)
-        for operation in operations:
-            op = operation.get("op")
-            range_payload = operation.get("range") or {}
-            if op == "delete_range":
-                removed = max(float(range_payload.get("end_seconds", 0.0)) - float(range_payload.get("start_seconds", 0.0)), 0.0)
-                current = max(current - removed, 0.1)
-            elif op == "insert_silence":
-                current = max(current + max(float(operation.get("duration_seconds") or 0.0), 0.0), 0.1)
-            elif op == "crop":
-                current = max(float(range_payload.get("end_seconds", current)) - float(range_payload.get("start_seconds", 0.0)), 0.1)
-        return current
-
-    def _split_transcript_text(self, text: str, split_ratio: float) -> tuple[str, str]:
-        words = text.split()
-        if len(words) <= 1:
-            midpoint = max(min(int(round(len(text) * split_ratio)), len(text) - 1), 1)
-            return text[:midpoint].strip() or text.strip(), text[midpoint:].strip() or text.strip()
-        split_index = max(1, min(len(words) - 1, round(len(words) * split_ratio)))
-        return " ".join(words[:split_index]).strip(), " ".join(words[split_index:]).strip()
-
-    def _merge_transcript_text(self, first: str, second: str) -> str:
-        return " ".join(part.strip() for part in [first, second] if part.strip())
-
-    def _apply_edl_to_wav_bytes(self, audio_bytes: bytes, operations: list[dict[str, Any]]) -> bytes:
-        if not operations:
-            return audio_bytes
-        channels, sample_width, sample_rate, _frame_count, raw = self._read_pcm_wav(audio_bytes)
-        bytes_per_frame = max(channels * sample_width, 1)
-        working_raw = raw
-        for operation in operations:
-            op = operation.get("op")
-            range_payload = operation.get("range") or {}
-            if op == "delete_range":
-                start_frame = max(int(float(range_payload.get("start_seconds", 0.0)) * sample_rate), 0)
-                end_frame = max(int(float(range_payload.get("end_seconds", 0.0)) * sample_rate), start_frame)
-                working_raw = working_raw[: start_frame * bytes_per_frame] + working_raw[end_frame * bytes_per_frame :]
-            elif op == "insert_silence":
-                insert_frame = max(int(float(range_payload.get("start_seconds", 0.0)) * sample_rate), 0)
-                silence_frames = max(int(float(operation.get("duration_seconds") or 0.0) * sample_rate), 1)
-                silence = b"\x00" * (silence_frames * bytes_per_frame)
-                offset = insert_frame * bytes_per_frame
-                working_raw = working_raw[:offset] + silence + working_raw[offset:]
-            elif op == "crop":
-                start_frame = max(int(float(range_payload.get("start_seconds", 0.0)) * sample_rate), 0)
-                end_frame = max(int(float(range_payload.get("end_seconds", 0.0)) * sample_rate), start_frame + 1)
-                working_raw = working_raw[start_frame * bytes_per_frame : end_frame * bytes_per_frame]
-        output = io.BytesIO()
-        with wave.open(output, "wb") as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(sample_width)
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(working_raw or (b"\x00" * bytes_per_frame))
-        return output.getvalue()
-
-    def _extract_waveform_peaks_from_bytes(self, audio_bytes: bytes, bins: int) -> list[float]:
-        channels, sample_width, _sample_rate, frame_count, raw = self._read_pcm_wav(audio_bytes)
-        if frame_count <= 0 or channels <= 0 or sample_width != 2:
-            return [0.0] * bins
-        samples_per_bin = max(frame_count // bins, 1)
-        peaks: list[float] = []
-        for bin_index in range(bins):
-            start_frame = bin_index * samples_per_bin
-            end_frame = min((bin_index + 1) * samples_per_bin, frame_count)
-            max_abs = 0
-            for frame_index in range(start_frame, end_frame):
-                frame_peak = 0
-                for channel_index in range(channels):
-                    offset = (frame_index * channels + channel_index) * sample_width
-                    sample = int.from_bytes(raw[offset : offset + sample_width], "little", signed=True)
-                    frame_peak = max(frame_peak, abs(sample))
-                max_abs = max(max_abs, frame_peak)
-            peaks.append(round(max_abs / 32767.0, 4))
-        return peaks
 
     def _render_synthetic_wave_bytes(
         self,
@@ -4637,6 +3641,16 @@ class SQLiteRepository:
     def _new_id(self, prefix: str) -> str:
         return f"{prefix}-{uuid4().hex}"
 
+    def _new_reference_run_id(self, session: Session, project_id: str) -> str:
+        safe_project_id = self._validate_managed_media_id(project_id)
+        base = self._validate_managed_media_id(f"reference-run-{safe_project_id}")
+        run_id = base
+        suffix = 2
+        while session.get(ReferencePickerRun, run_id) is not None:
+            run_id = self._validate_managed_media_id(f"{base}-{suffix}")
+            suffix += 1
+        return run_id
+
     def _validate_audio_asset(
         self,
         path: Path,
@@ -4681,19 +3695,7 @@ class SQLiteRepository:
         end_seconds = min(float(end_seconds), duration_seconds)
         if end_seconds <= start_seconds:
             raise ValueError("Candidate bounds must have positive duration")
-        source_path = self._get_source_recording_audio_path(recording)
-        return self._apply_edl_to_wav_bytes(
-            source_path.read_bytes(),
-            [
-                {
-                    "op": "crop",
-                    "range": {
-                        "start_seconds": start_seconds,
-                        "end_seconds": end_seconds,
-                    },
-                }
-            ],
-        )
+        return self._extract_source_window_wav_bytes(recording, start_seconds, end_seconds)
 
     def _resolve_reference_candidate_promotion_bounds(
         self,
@@ -4742,73 +3744,6 @@ class SQLiteRepository:
                 raise ValueError("Trim bounds must stay inside the candidate's canonical bounds")
         return start_seconds, end_seconds
 
-    def _render_slice_audio_bytes(self, session: Session, slice_row: Slice) -> bytes:
-        active_variant = slice_row.active_variant
-        if active_variant is None:
-            if slice_row.active_variant_id is not None:
-                raise ValueError(
-                    f"Active variant {slice_row.active_variant_id} is missing for slice {slice_row.id}"
-                )
-            return self._render_synthetic_wave_bytes(48000, 1, 2.0, slice_row.id)
-        try:
-            audio_path = self._get_variant_audio_path(
-                active_variant,
-                slice_row.source_recording.num_channels if slice_row.source_recording is not None else None,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(f"Active variant media is missing on disk: {exc}") from exc
-        return self._apply_edl_to_wav_bytes(audio_path.read_bytes(), self._collect_edl_operations(slice_row))
-
-    def _materialize_slice_media_path(self, session: Session, slice_row: Slice) -> Path:
-        target_path = self._slice_render_cache_path(slice_row)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if not target_path.exists():
-            target_path.write_bytes(self._render_slice_audio_bytes(session, slice_row))
-        return target_path
-
-    def _slice_audio_cache_identifier(self, slice_row: Slice) -> str:
-        state_key = json.dumps(
-            {
-                "slice_id": slice_row.id,
-                "active_variant_id": slice_row.active_variant_id,
-                "edl_operations": self._collect_edl_operations(slice_row),
-            },
-            sort_keys=True,
-        )
-        fingerprint = hashlib.sha1(state_key.encode("utf-8")).hexdigest()[:12]
-        return f"{slice_row.id}-{fingerprint}"
-
-    def _slice_render_cache_path(self, slice_row: Slice) -> Path:
-        return self._managed_media_path("slices", self._slice_audio_cache_identifier(slice_row))
-
-    def _waveform_peaks_cache_path(self, slice_row: Slice, bins: int) -> Path:
-        identifier = self._validate_managed_media_id(
-            f"{self._slice_audio_cache_identifier(slice_row)}-peaks-v{WAVEFORM_PEAKS_CACHE_VERSION}-bins-{bins}"
-        )
-        return (self.media_root / "peaks" / f"{identifier}.json").resolve()
-
-    def _ensure_waveform_peaks_cache(self, slice_row: Slice, media_path: Path, bins: int) -> WaveformPeaks:
-        cache_path = self._waveform_peaks_cache_path(slice_row, bins)
-        if cache_path.exists():
-            return WaveformPeaks.model_validate(json.loads(cache_path.read_text()))
-        peaks = self._extract_waveform_peaks_from_bytes(media_path.read_bytes(), bins)
-        payload = WaveformPeaks(clip_id=slice_row.id, bins=bins, peaks=peaks)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(payload.model_dump_json())
-        return payload
-
-    def _warm_slice_artifacts_for_id(self, slice_id: str, bins_values: tuple[int, ...] = (960,)) -> None:
-        try:
-            with self._session() as session:
-                slice_row = self._get_loaded_slice(session, slice_id)
-                media_path = self._materialize_slice_media_path(session, slice_row)
-                for bins in bins_values:
-                    self._ensure_waveform_peaks_cache(slice_row, media_path, bins)
-        except (FileNotFoundError, ValueError):
-            # Imported projects can temporarily point at offline media; cache warming should
-            # never block transcript/status/tag persistence in that state.
-            return
-
     def _validate_managed_media_id(self, identifier: str) -> str:
         normalized = identifier.strip()
         if not normalized:
@@ -4820,9 +3755,6 @@ class SQLiteRepository:
     def _managed_media_path(self, category: str, identifier: str) -> Path:
         safe_identifier = self._validate_managed_media_id(identifier)
         return (self.media_root / category / f"{safe_identifier}.wav").resolve()
-
-    def _managed_variant_path(self, variant_id: str) -> Path:
-        return self._managed_media_path("variants", variant_id)
 
     def _reference_variant_storage_key(self, variant_id: str) -> str:
         safe_identifier = self._validate_managed_media_id(variant_id)
@@ -4875,19 +3807,6 @@ class SQLiteRepository:
         report_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
         return report_path
 
-    def _default_reference_asset_name(self, slice_row: Slice) -> str:
-        transcript_text = self._transcript_text(slice_row.transcript).strip()
-        if transcript_text:
-            words = transcript_text.split()
-            preview = " ".join(words[:6]).strip()
-            if len(words) > 6:
-                preview = f"{preview}..."
-            return preview
-        speaker = self._speaker_name(slice_row)
-        start = float(self._slice_metadata(slice_row).get("original_start_time", 0.0))
-        end = float(self._slice_metadata(slice_row).get("original_end_time", self._slice_duration(slice_row)))
-        return f"{speaker} {start:.2f}-{end:.2f}s"
-
     def _source_window_cache_path(
         self,
         recording_id: str,
@@ -4920,63 +3839,17 @@ class SQLiteRepository:
         return target_path
 
     def _prune_derived_media_cache(self) -> int:
-        with self._session() as session:
-            slices = session.exec(select(Slice)).all()
-            keep_cache_ids = {self._slice_audio_cache_identifier(slice_row) for slice_row in slices}
         deleted_count = 0
-        slices_root = self.media_root / "slices"
-        peaks_root = self.media_root / "peaks"
-        legacy_roots = [
-            self.media_root / "review-window-renders",
-            self.media_root / "review-window-variants",
-            self.media_root / "review-windows",
-        ]
-        for path in slices_root.glob("*.wav"):
-            cache_id = path.stem
-            if cache_id in keep_cache_ids:
-                continue
-            path.unlink()
-            deleted_count += 1
-        for path in peaks_root.glob("*.json"):
-            cache_id, _separator, _bins = path.stem.rpartition("-bins-")
-            if cache_id in keep_cache_ids:
-                continue
-            path.unlink()
-            deleted_count += 1
-        for root in legacy_roots:
+        for root_name in ("slices", "peaks", "variants", "review-window-renders", "review-window-variants", "review-windows"):
+            root = self.media_root / root_name
             if not root.exists():
                 continue
-            for path in root.glob("*.wav"):
-                path.unlink()
-                deleted_count += 1
+            for path in root.rglob("*"):
+                if path.is_file():
+                    path.unlink()
+                    deleted_count += 1
         return deleted_count
 
-    def _ingest_variant_asset(self, path: Path, variant_id: str) -> Path:
-        source_path = path.expanduser().resolve()
-        if not source_path.exists():
-            raise ValueError(f"Audio asset not found: {source_path}")
-        target_path = self._managed_variant_path(variant_id)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if source_path != target_path:
-            shutil.copyfile(source_path, target_path)
-        return target_path
-
-    def _get_variant_audio_path(self, variant: AudioVariant, expected_channels: int | None) -> Path:
-        raw_path = Path(variant.file_path).expanduser().resolve(strict=False)
-        try:
-            return self._resolve_variant_media_path(raw_path)
-        except ValueError:
-            if not raw_path.exists():
-                raise FileNotFoundError(raw_path)
-            if expected_channels is None:
-                channels, _sample_width, sample_rate, frames = self._read_pcm_wav_header(raw_path)
-                if sample_rate != variant.sample_rate or frames != variant.num_samples:
-                    raise ValueError("Variant media metadata does not match the stored database record")
-                if channels <= 0:
-                    raise ValueError("Variant media has invalid channel metadata")
-            else:
-                self._validate_audio_asset(raw_path, variant.sample_rate, expected_channels, variant.num_samples)
-            return raw_path
 
     def _legacy_seed_source_audio_overrides(
         self,
@@ -5015,69 +3888,22 @@ class SQLiteRepository:
         channels, _sample_width, sample_rate, num_samples = self._read_pcm_wav_header(target_path)
         return sample_rate, channels, num_samples
 
-    def _migrate_external_variant_media(self) -> None:
-        with self._session() as session:
-            variants = session.exec(
-                select(AudioVariant).options(selectinload(AudioVariant.parent_slice).selectinload(Slice.source_recording))
-            ).all()
-            updated = False
-            for variant in variants:
-                raw_path = Path(variant.file_path).expanduser().resolve(strict=False)
-                try:
-                    self._resolve_variant_media_path(raw_path)
-                    continue
-                except ValueError:
-                    if not raw_path.exists():
-                        continue
-                expected_channels = (
-                    variant.parent_slice.source_recording.num_channels
-                    if variant.parent_slice is not None and variant.parent_slice.source_recording is not None
-                    else None
-                )
-                self._get_variant_audio_path(variant, expected_channels)
-                managed_path = self._managed_variant_path(variant.id)
-                managed_path.parent.mkdir(parents=True, exist_ok=True)
-                if raw_path != managed_path and not managed_path.exists():
-                    shutil.copyfile(raw_path, managed_path)
-                if variant.file_path != str(managed_path):
-                    variant.file_path = str(managed_path)
-                    session.add(variant)
-                    updated = True
-            if updated:
-                session.commit()
-
     def _migrate_legacy_seed_source_recording_media(self) -> None:
         if not self.legacy_seed_path.exists():
             return
         legacy = json.loads(self.legacy_seed_path.read_text())
         source_audio_overrides = self._legacy_seed_source_audio_overrides(legacy.get("clips_by_project", {}))
         with self._session() as session:
-            recordings = session.exec(
-                select(SourceRecording).options(
-                    selectinload(SourceRecording.slices).selectinload(Slice.variants),
-                    selectinload(SourceRecording.slices).selectinload(Slice.active_variant),
-                )
-            ).all()
+            recordings = session.exec(select(SourceRecording)).all()
             updated = False
             for recording in recordings:
-                if len(recording.slices) != 1:
+                if recording.processing_recipe == LEGACY_SEED_SOURCE_RECORDING_PROCESSING_RECIPE:
                     continue
-                slice_row = recording.slices[0]
-                metadata = slice_row.model_metadata or {}
-                source_file_id = str(metadata.get("source_file_id") or "").strip()
-                if not source_file_id:
-                    continue
+                source_prefix = f"source-{recording.batch_id}-"
+                source_file_id = recording.id[len(source_prefix) :] if recording.id.startswith(source_prefix) else ""
                 source_audio_path = source_audio_overrides.get((recording.batch_id, source_file_id))
                 if source_audio_path is None:
-                    original_variant = next((variant for variant in slice_row.variants if variant.is_original), None)
-                    fallback_variant = original_variant or slice_row.active_variant
-                    if fallback_variant is None:
-                        continue
-                    expected_channels = recording.num_channels if recording.num_channels > 0 else None
-                    try:
-                        source_audio_path = self._get_variant_audio_path(fallback_variant, expected_channels)
-                    except (FileNotFoundError, ValueError):
-                        continue
+                    continue
                 target_path = self._managed_media_path("sources", recording.id)
                 sample_rate, channels, num_samples = self._materialize_legacy_seed_source_recording_audio(
                     target_path,
@@ -5100,6 +3926,7 @@ class SQLiteRepository:
             if updated:
                 session.commit()
 
+
     def _resolve_variant_media_path(self, path: Path) -> Path:
         resolved = path.expanduser().resolve(strict=False)
         media_root = self.media_root.resolve()
@@ -5119,9 +3946,9 @@ class SQLiteRepository:
 
         with self._session() as session:
             retained_paths = set()
-            for raw_path in session.exec(select(AudioVariant.file_path)).all():
+            for raw_path in session.exec(select(ReferenceVariant.file_path)).all():
                 try:
-                    retained_paths.add(self._resolve_variant_media_path(Path(raw_path)))
+                    retained_paths.add(self._resolve_reference_variant_media_path(raw_path))
                 except (FileNotFoundError, ValueError):
                     continue
 
@@ -5133,19 +3960,20 @@ class SQLiteRepository:
             deleted_count += 1
         return deleted_count
 
-    def _get_revision_referenced_variant_ids(self, session: Session, slice_ids: list[str]) -> set[str]:
-        if not slice_ids:
-            return set()
-        return {
-            variant_id
-            for variant_id in session.exec(
-                select(EditCommit.active_variant_id_snapshot).where(
-                    EditCommit.slice_id.in_(slice_ids),
-                    EditCommit.active_variant_id_snapshot.is_not(None),
-                )
-            ).all()
-            if variant_id is not None
-        }
+
+    def _delete_managed_media_paths(self, paths: list[str]) -> int:
+        media_root = self.media_root.resolve()
+        deleted_count = 0
+        for raw_path in sorted(set(paths)):
+            try:
+                path = Path(raw_path).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            if not path.is_relative_to(media_root) or not path.exists() or not path.is_file():
+                continue
+            path.unlink()
+            deleted_count += 1
+        return deleted_count
 
     def _read_pcm_wav_header(self, path: Path) -> tuple[int, int, int, int]:
         try:
@@ -5180,29 +4008,12 @@ class SQLiteRepository:
             raise ValueError("Invalid WAV metadata")
         return channels, sample_width, sample_rate, frame_count, raw
 
-    def _shift_order_indices(
-        self,
-        session: Session,
-        project_id: str,
-        from_index: int,
-        amount: int,
-        exclude_ids: set[str] | None = None,
-    ) -> None:
-        exclude_ids = exclude_ids or set()
-        for slice_row in self._get_batch_slices(session, project_id):
-            if slice_row.id in exclude_ids:
-                continue
-            metadata = self._slice_metadata(slice_row)
-            order_index = int(metadata.get("order_index", 0))
-            if order_index > from_index:
-                metadata["order_index"] = order_index + amount
-                slice_row.model_metadata = metadata
-                session.add(slice_row)
-
     def _dispatch_processing_job(self, job_id: str) -> dict[str, Any] | None:
         with self._session() as session:
             job = self._get_processing_job(session, job_id)
             job_kind = job.kind
+        if job_kind == JobKind.PREPROCESS:
+            return self._run_project_preparation_job(job_id)
         if job_kind == JobKind.SOURCE_TRANSCRIPTION:
             return self._run_source_transcription_job(job_id)
         if job_kind == JobKind.SOURCE_ALIGNMENT:
@@ -5220,7 +4031,6 @@ class SQLiteRepository:
             payload = dict(job.input_payload or {})
             adapter_config = self._source_asr_backend_config(payload)
             language_hint = payload.get("language_hint")
-            completed_at = utc_now()
             backend_client = self._create_source_asr_backend_client(adapter_config)
             draft_result = self._run_source_recording_asr_adapter(
                 recording,
@@ -5228,6 +4038,7 @@ class SQLiteRepository:
                 backend_client=backend_client,
                 language_hint=str(language_hint) if language_hint is not None else None,
             )
+            completed_at = utc_now()
 
             artifact_dir = self._source_recording_artifact_dir(recording.id)
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -5261,6 +4072,8 @@ class SQLiteRepository:
             metadata["base_transcript_text_path"] = str(transcript_base_path)
             metadata["transcript_patches"] = []
             metadata["last_transcription_job_id"] = job.id
+            metadata["transcription_backend"] = draft_result["backend"]
+            metadata["transcription_model_name"] = draft_result["model_name"]
             metadata["language"] = draft_result["language"]
             artifact.artifact_metadata = metadata
             session.add(artifact)
@@ -5312,9 +4125,11 @@ class SQLiteRepository:
 
             alignment_backend = str(
                 payload.get("alignment_backend")
+                or payload.get("acoustic_model")
                 or artifact.alignment_backend
                 or "torchaudio_forced_align_worker"
             ).strip() or "torchaudio_forced_align_worker"
+            text_normalization_strategy = str(payload.get("text_normalization_strategy") or "loose")
 
             if transcript_json_payload is not None:
                 alignment_units, summary = self._run_segmented_source_alignment(recording, transcript_json_payload)
@@ -5323,6 +4138,8 @@ class SQLiteRepository:
                 transcript_text = transcript_text_path.read_text(encoding="utf-8").strip()
                 if not transcript_text:
                     raise ValueError("Source alignment transcript artifact is empty")
+                if transcript_text.startswith("stub asr source recording "):
+                    raise ValueError("Refusing to align stub ASR transcript. Run real ASR before alignment.")
                 alignment_units = self._run_forced_align_worker_on_file(Path(recording.file_path), transcript_text)
                 summary = {
                     "segment_count": 1,
@@ -5341,6 +4158,8 @@ class SQLiteRepository:
                 "status": "ok",
                 "alignment_backend": alignment_backend,
                 "alignment_mode": alignment_mode,
+                "text_normalization_strategy": text_normalization_strategy,
+                "batch_size": int(payload.get("batch_size") or 8),
                 "alignment_word_count": len(alignment_units),
                 **summary,
             }
@@ -5355,6 +4174,8 @@ class SQLiteRepository:
             metadata["alignment_summary_path"] = str(summary_path)
             metadata["last_alignment_job_id"] = job.id
             metadata["alignment_mode"] = alignment_mode
+            metadata["text_normalization_strategy"] = text_normalization_strategy
+            metadata["alignment_batch_size"] = int(payload.get("batch_size") or 8)
             artifact.artifact_metadata = metadata
             session.add(artifact)
             session.commit()
@@ -5367,88 +4188,8 @@ class SQLiteRepository:
             "alignment_word_count": len(alignment_units),
             "alignment_backend": alignment_backend,
             "alignment_mode": alignment_mode,
-        }
-
-    def _run_source_slicing_job(self, job_id: str) -> dict[str, Any]:
-        with self._session() as session:
-            job = self._get_processing_job(session, job_id)
-            if job.source_recording_id is None:
-                raise ValueError("Source slicing job is missing its source recording")
-            recording = self._get_source_recording(session, job.source_recording_id)
-            artifact = self._ensure_source_recording_artifact(session, recording)
-            payload = dict(job.input_payload or {})
-            if artifact.alignment_status != "ok":
-                raise ValueError("Source slicing requires an up-to-date alignment artifact")
-            if not artifact.alignment_json_path:
-                raise ValueError("Source slicing requires an alignment_json_path artifact")
-            alignment_path = Path(str(artifact.alignment_json_path)).expanduser().resolve()
-            if not alignment_path.exists():
-                raise ValueError(f"Source alignment artifact not found: {alignment_path}")
-            alignment_units = json.loads(alignment_path.read_text(encoding="utf-8"))
-            if not isinstance(alignment_units, list) or not alignment_units:
-                raise ValueError("Source slicing requires non-empty alignment data")
-
-            config_overrides = payload.get("config_overrides") or {}
-            if not isinstance(config_overrides, dict):
-                raise ValueError("config_overrides must be an object")
-            config = SlicerConfig(**config_overrides)
-            full_audio_bytes = self._extract_source_window_wav_bytes(recording, 0.0, recording.duration_s)
-            audio_samples, sample_rate = self._wav_bytes_to_mono_samples(full_audio_bytes)
-            slicer_result = plan_slices(alignment_units, audio_samples, sample_rate, config)
-            generated_slices = list(slicer_result["slices"])
-
-            active_slices = self._active_recording_slices(session, recording.id)
-            locked_slices = [slice_row for slice_row in active_slices if slice_row.is_locked] if payload.get("preserve_locked_slices", True) else []
-            replaced_slices = [slice_row for slice_row in active_slices if slice_row not in locked_slices]
-
-            if payload.get("replace_unlocked_slices", True):
-                for slice_row in replaced_slices:
-                    metadata = self._slice_metadata(slice_row)
-                    metadata["is_superseded"] = True
-                    metadata["superseded_by_job_id"] = job.id
-                    metadata["updated_at"] = utc_now().isoformat()
-                    slice_row.model_metadata = metadata
-                    session.add(slice_row)
-
-            kept_locked_ids = {slice_row.id for slice_row in locked_slices}
-            dropped_overlap_count = 0
-            created_slice_rows: list[Slice] = []
-            language = str(self._source_artifact_metadata(artifact).get("language") or "en")
-            for slice_payload in generated_slices:
-                if self._candidate_overlaps_locked_slice(slice_payload, locked_slices):
-                    dropped_overlap_count += 1
-                    continue
-                created_slice_rows.append(
-                    self._create_generated_source_slice(
-                        session,
-                        recording,
-                        slice_payload=slice_payload,
-                        source_alignment_backend=artifact.alignment_backend,
-                        language=language,
-                    )
-                )
-
-            final_active_slices = [*locked_slices, *created_slice_rows]
-            self._reindex_recording_slice_block(
-                session,
-                recording=recording,
-                previous_active_slices=active_slices,
-                final_active_slices=final_active_slices,
-            )
-            for locked_slice in locked_slices:
-                self._update_locked_slice_alignment_drift(locked_slice, alignment_units, job_id=job.id)
-                session.add(locked_slice)
-            session.commit()
-
-        return {
-            "target_kind": "source_recording",
-            "source_recording_id": recording.id,
-            "created_slice_count": len(created_slice_rows),
-            "preserved_locked_slice_count": len(kept_locked_ids),
-            "dropped_overlap_count": dropped_overlap_count,
-            "replace_unlocked_slices": bool(payload.get("replace_unlocked_slices", True)),
-            "preserve_locked_slices": bool(payload.get("preserve_locked_slices", True)),
-            "slicer_stats": slicer_result["stats"],
+            "text_normalization_strategy": text_normalization_strategy,
+            "batch_size": int(payload.get("batch_size") or 8),
         }
 
     def _run_segmented_source_alignment(
@@ -5493,163 +4234,6 @@ class SQLiteRepository:
             "skipped_segments": skipped_segments,
         }
 
-    def _create_generated_source_slice(
-        self,
-        session: Session,
-        recording: SourceRecording,
-        *,
-        slice_payload: dict[str, Any],
-        source_alignment_backend: str | None,
-        language: str = "en",
-    ) -> Slice:
-        extra_metadata = {
-            "generation_mode": "source_slicer_v2",
-            "raw_start": float(slice_payload["raw_start"]),
-            "raw_end": float(slice_payload["raw_end"]),
-            "snapped_start": float(slice_payload["snapped_start"]),
-            "snapped_end": float(slice_payload["snapped_end"]),
-            "training_start": float(slice_payload["training_start"]),
-            "training_end": float(slice_payload["training_end"]),
-            "source_word_start_index": int(slice_payload["start_word_index"]),
-            "source_word_end_index": int(slice_payload["end_word_index"]),
-            "boundary_type": str(slice_payload["boundary_type"]),
-            "boundary_gap_s": float(slice_payload["boundary_gap_s"]),
-            "avg_alignment_confidence": float(slice_payload["avg_alignment_confidence"]),
-            "relative_word_offsets_from": str(slice_payload["relative_word_offsets_from"]),
-            "is_flagged": bool(slice_payload["is_flagged"]),
-            "flag_reason": str(slice_payload["flag_reason"] or ""),
-            "flag_reasons": list(slice_payload["flag_reasons"] or []),
-            "breath_at_start": bool(slice_payload["breath_at_start"]),
-            "breath_at_end": bool(slice_payload["breath_at_end"]),
-            "edge_start_energy": float(slice_payload["edge_start_energy"]),
-            "edge_end_energy": float(slice_payload["edge_end_energy"]),
-            "forced_cut": bool(slice_payload["forced_cut"]),
-            "source_alignment_backend": source_alignment_backend,
-        }
-        transcript_alignment_data = {
-            "kind": "source_slicer_alignment",
-            "relative_word_offsets_from": str(slice_payload["relative_word_offsets_from"]),
-            "words": list(slice_payload["words"]),
-            "source_word_start_index": int(slice_payload["start_word_index"]),
-            "source_word_end_index": int(slice_payload["end_word_index"]),
-            "raw_start": float(slice_payload["raw_start"]),
-            "raw_end": float(slice_payload["raw_end"]),
-            "snapped_start": float(slice_payload["snapped_start"]),
-            "snapped_end": float(slice_payload["snapped_end"]),
-            "training_start": float(slice_payload["training_start"]),
-            "training_end": float(slice_payload["training_end"]),
-            "flag_reasons": list(slice_payload["flag_reasons"] or []),
-        }
-        return self._create_slice_from_source_span(
-            session,
-            recording,
-            slice_id=self._new_id("slice"),
-            start_seconds=float(slice_payload["training_start"]),
-            end_seconds=float(slice_payload["training_end"]),
-            transcript_text=str(slice_payload["transcript"]),
-            order_index=0,
-            language=language,
-            alignment_data=transcript_alignment_data,
-            extra_metadata=extra_metadata,
-        )
-
-    def _slice_training_interval(self, slice_row: Slice) -> tuple[float, float]:
-        metadata = self._slice_metadata(slice_row)
-        start = float(metadata.get("training_start", metadata.get("original_start_time", 0.0)))
-        end = float(metadata.get("training_end", metadata.get("original_end_time", start)))
-        return start, end
-
-    def _candidate_overlaps_locked_slice(
-        self,
-        candidate_slice: dict[str, Any],
-        locked_slices: list[Slice],
-    ) -> bool:
-        candidate_start = float(candidate_slice["training_start"])
-        candidate_end = float(candidate_slice["training_end"])
-        candidate_duration = max(candidate_end - candidate_start, 1e-6)
-        for locked_slice in locked_slices:
-            locked_start, locked_end = self._slice_training_interval(locked_slice)
-            overlap = max(0.0, min(candidate_end, locked_end) - max(candidate_start, locked_start))
-            if overlap <= 0:
-                continue
-            locked_duration = max(locked_end - locked_start, 1e-6)
-            overlap_ratio = overlap / min(candidate_duration, locked_duration)
-            if overlap_ratio >= LOCKED_SLICE_OVERLAP_RATIO_THRESHOLD:
-                return True
-        return False
-
-    def _reindex_recording_slice_block(
-        self,
-        session: Session,
-        *,
-        recording: SourceRecording,
-        previous_active_slices: list[Slice],
-        final_active_slices: list[Slice],
-    ) -> None:
-        batch_slices = self._get_batch_slices(session, recording.batch_id)
-        previous_orders = [
-            int(self._slice_metadata(slice_row).get("order_index", 0))
-            for slice_row in previous_active_slices
-        ]
-        base_order = min(previous_orders) if previous_orders else (
-            max((int(self._slice_metadata(slice_row).get("order_index", 0)) for slice_row in batch_slices), default=-1) + 1
-        )
-        old_count = len(previous_active_slices)
-        new_count = len(final_active_slices)
-        tail_start = base_order + old_count
-        delta = new_count - old_count
-        if delta != 0:
-            for slice_row in batch_slices:
-                if slice_row.source_recording_id == recording.id:
-                    continue
-                metadata = self._slice_metadata(slice_row)
-                order_index = int(metadata.get("order_index", 0))
-                if order_index < tail_start:
-                    continue
-                metadata["order_index"] = order_index + delta
-                slice_row.model_metadata = metadata
-                session.add(slice_row)
-
-        final_active_slices.sort(key=lambda slice_row: self._slice_training_interval(slice_row))
-        for index, slice_row in enumerate(final_active_slices):
-            metadata = self._slice_metadata(slice_row)
-            metadata["order_index"] = base_order + index
-            slice_row.model_metadata = metadata
-            session.add(slice_row)
-
-    def _update_locked_slice_alignment_drift(
-        self,
-        slice_row: Slice,
-        alignment_units: list[dict[str, Any]],
-        *,
-        job_id: str,
-    ) -> None:
-        metadata = self._slice_metadata(slice_row)
-        try:
-            start_index = int(metadata["source_word_start_index"])
-            end_index = int(metadata["source_word_end_index"])
-        except (KeyError, TypeError, ValueError):
-            return
-        if start_index < 0 or end_index >= len(alignment_units) or end_index < start_index:
-            return
-        old_start = float(metadata.get("raw_start", metadata.get("original_start_time", 0.0)))
-        old_end = float(metadata.get("raw_end", metadata.get("original_end_time", old_start)))
-        new_start = float(alignment_units[start_index]["start"])
-        new_end = float(alignment_units[end_index]["end"])
-        drift_seconds = max(abs(new_start - old_start), abs(new_end - old_end))
-        if drift_seconds >= LOCKED_SLICE_DRIFT_WARNING_SECONDS:
-            metadata["alignment_drift_warning"] = {
-                "drift_seconds": round(drift_seconds, 4),
-                "checked_by_job_id": job_id,
-                "previous_raw_start": round(old_start, 4),
-                "previous_raw_end": round(old_end, 4),
-                "current_raw_start": round(new_start, 4),
-                "current_raw_end": round(new_end, 4),
-            }
-        else:
-            metadata.pop("alignment_drift_warning", None)
-        slice_row.model_metadata = metadata
-
     def _run_source_recording_asr_adapter(
         self,
         recording: SourceRecording,
@@ -5672,6 +4256,8 @@ class SQLiteRepository:
                 model=backend_client,
                 model_name=adapter_config["model_name"],
                 model_version=adapter_config["model_version"],
+                batch_size=max(1, int(adapter_config.get("batch_size") or 8)),
+                initial_prompt=adapter_config.get("initial_prompt") or None,
                 language_hint=language_hint,
             )
         raise ValueError(f"Unsupported ASR backend: {backend}")
@@ -5690,29 +4276,45 @@ class SQLiteRepository:
 
     def _source_asr_backend_config(self, payload: dict[str, Any]) -> dict[str, str]:
         # Dev/local smoke path:
-        # ASR_BACKEND=faster_whisper ASR_MODEL_PATH=/abs/path/to/local/model
+        # ASR_BACKEND=faster_whisper ASR_MODEL_PATH=/abs/path/to/local/model-or-model-name
         # ASR_DEVICE=cpu|cuda ASR_COMPUTE_TYPE=int8|float16 uv run --directory backend python -m app.worker --once
-        backend = str(os.getenv("ASR_BACKEND", "stub")).strip().lower() or "stub"
+        backend = str(os.getenv("ASR_BACKEND", "faster_whisper")).strip().lower() or "faster_whisper"
+        model_size = str(payload.get("model_size") or "turbo").strip()
+        batch_size = max(1, int(payload.get("batch_size") or 8))
+        initial_prompt = str(payload.get("initial_prompt") or "").strip()
         requested_model_name = str(payload.get("model_name") or "").strip()
         requested_model_version = str(payload.get("model_version") or "").strip()
         if backend == "stub":
+            if os.getenv("SPEECHCRAFT_ALLOW_STUB_ASR") != "1":
+                raise ValueError(
+                    "Stub ASR is disabled. Set ASR_BACKEND=faster_whisper for real transcription "
+                    "or SPEECHCRAFT_ALLOW_STUB_ASR=1 for tests only."
+                )
             return {
                 "backend": "stub",
-                "model_name": requested_model_name or "stub-source-recording-asr",
+                "model_size": model_size,
+                "batch_size": str(batch_size),
+                "initial_prompt": initial_prompt,
+                "model_name": requested_model_name or f"stub-source-recording-asr-{model_size}",
                 "model_version": requested_model_version or "stub-v1",
             }
         if backend == "faster_whisper":
             model_path = str(os.getenv("ASR_MODEL_PATH", "")).strip()
-            if not model_path:
-                raise ValueError("ASR_MODEL_PATH is required when ASR_BACKEND=faster_whisper")
-            model_path_obj = Path(model_path)
-            if not model_path_obj.exists():
+            model_aliases = {
+                "turbo": "large-v3-turbo",
+            }
+            model_ref = model_path or model_aliases.get(model_size, model_size)
+            model_path_obj = Path(model_ref)
+            if model_path and not model_path_obj.exists():
                 raise ValueError(f"ASR_MODEL_PATH does not exist: {model_path_obj}")
             return {
                 "backend": "faster_whisper",
-                "model_path": str(model_path_obj),
-                "model_name": requested_model_name or model_path_obj.name,
-                "model_version": requested_model_version or "local",
+                "model_path": str(model_path_obj if model_path else model_ref),
+                "model_size": model_size,
+                "batch_size": str(batch_size),
+                "initial_prompt": initial_prompt,
+                "model_name": requested_model_name or model_size or model_path_obj.name,
+                "model_version": requested_model_version or ("local" if model_path else "faster-whisper"),
                 "device": str(os.getenv("ASR_DEVICE", "cpu")).strip() or "cpu",
                 "compute_type": str(os.getenv("ASR_COMPUTE_TYPE", "int8")).strip() or "int8",
             }
@@ -5750,12 +4352,27 @@ class SQLiteRepository:
         model: Any,
         model_name: str,
         model_version: str,
+        batch_size: int,
+        initial_prompt: str | None,
         language_hint: str | None,
     ) -> dict[str, Any]:
-        segments_iter, info = model.transcribe(
+        transcriber = model
+        transcribe_kwargs: dict[str, Any] = {}
+        if batch_size > 1:
+            try:
+                from faster_whisper import BatchedInferencePipeline
+
+                transcriber = BatchedInferencePipeline(model=model)
+                transcribe_kwargs["batch_size"] = batch_size
+            except ImportError:
+                transcriber = model
+
+        segments_iter, info = transcriber.transcribe(
             str(Path(recording.file_path)),
             language=language_hint or None,
             condition_on_previous_text=False,
+            initial_prompt=initial_prompt or None,
+            **transcribe_kwargs,
         )
         segments = [
             {
