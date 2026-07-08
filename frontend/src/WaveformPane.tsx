@@ -55,6 +55,8 @@ export default function WaveformPane({
   const loadGenerationRef = useRef(0);
   const peaksRef = useRef(peaks);
   const desiredCursorRef = useRef(desiredCursorSeconds);
+  const userSeekSecondsRef = useRef<number | null>(null);
+  const syncingRegionFromPropsRef = useRef(false);
   const [audioState, setAudioState] = useState<"loading" | "ready" | "error">("loading");
   const [audioError, setAudioError] = useState<string | null>(null);
 
@@ -90,9 +92,24 @@ export default function WaveformPane({
     peaksRef.current = peaks;
   }, [peaks]);
 
-  useEffect(() => {
-    lastLoadedRevisionRef.current = null;
-  }, [loadRevisionKey, audioUrl]);
+  function rememberUserSeek(time: number) {
+    userSeekSecondsRef.current = roundTime(time);
+  }
+
+  function seekWaveSurferToSeconds(time: number) {
+    const waveSurfer = waveSurferRef.current;
+    if (!waveSurfer) {
+      return;
+    }
+    const duration = waveSurfer.getDuration();
+    if (duration <= 0) {
+      return;
+    }
+    const clamped = Math.max(0, Math.min(time, duration));
+    waveSurfer.seekTo(clamped / duration);
+    rememberUserSeek(clamped);
+    cursorChangeRef.current(clamped);
+  }
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -178,12 +195,14 @@ export default function WaveformPane({
       if (draggedThisGestureRef.current) {
         return;
       }
+      rememberUserSeek(waveSurfer.getCurrentTime());
       cursorChangeRef.current(roundTime(waveSurfer.getCurrentTime()));
     };
     const handleSeeking = (time: number) => {
       if (draggedThisGestureRef.current) {
         return;
       }
+      rememberUserSeek(time);
       cursorChangeRef.current(roundTime(time));
     };
     const handleClick = () => {
@@ -191,6 +210,7 @@ export default function WaveformPane({
         return;
       }
       const time = roundTime(waveSurfer.getCurrentTime());
+      rememberUserSeek(time);
       cursorChangeRef.current(time);
       selectionChangeRef.current(time, time);
     };
@@ -223,6 +243,9 @@ export default function WaveformPane({
     });
 
     regions.on("region-created", (region: any) => {
+      if (syncingRegionFromPropsRef.current) {
+        return;
+      }
       for (const candidate of regions.getRegions()) {
         if (candidate.id !== region.id) {
           candidate.remove();
@@ -235,6 +258,9 @@ export default function WaveformPane({
     });
 
     regions.on("region-updated", (region: any) => {
+      if (syncingRegionFromPropsRef.current) {
+        return;
+      }
       selectionChangeRef.current(
         roundTime(region.start),
         roundTime(region.end),
@@ -283,6 +309,12 @@ export default function WaveformPane({
       }
 
       draggedThisGestureRef.current = false;
+
+      // DAW-style click: move playhead to click point and keep it there.
+      if (endTime !== null) {
+        seekWaveSurferToSeconds(endTime);
+        selectionChangeRef.current(endTime, endTime);
+      }
     };
 
     const handleWheel = (event: WheelEvent) => {
@@ -333,6 +365,12 @@ export default function WaveformPane({
     }
 
     const revisionKey = loadRevisionKey ?? audioUrl;
+
+    // Already decoded this revision — ignore peaks-state churn and user playhead moves.
+    if (lastLoadedRevisionRef.current === revisionKey) {
+      return;
+    }
+
     const waitForPeaks =
       requirePeaksBeforeLoad
       && peaksLoadState !== "ready"
@@ -344,21 +382,30 @@ export default function WaveformPane({
       return;
     }
 
-    if (lastLoadedRevisionRef.current === revisionKey) {
-      return;
-    }
-
     const isClipChange = lastAudioUrlRef.current !== audioUrl;
     lastAudioUrlRef.current = audioUrl;
     const targetTime = isClipChange
       ? 0
-      : Math.max(0, Math.min(desiredCursorRef.current, durationSeconds));
+      : Math.max(
+          0,
+          Math.min(
+            userSeekSecondsRef.current ?? desiredCursorRef.current,
+            durationSeconds,
+          ),
+        );
+    const seekGeneration = ++loadGenerationRef.current;
     const seekOnReady = () => {
+      if (seekGeneration !== loadGenerationRef.current) {
+        return;
+      }
       const duration = waveSurfer.getDuration();
       if (duration > 0) {
         waveSurfer.seekTo(Math.max(0, Math.min(targetTime / duration, 1)));
       }
-      cursorChangeRef.current(roundTime(targetTime));
+      if (isClipChange) {
+        userSeekSecondsRef.current = null;
+        cursorChangeRef.current(roundTime(targetTime));
+      }
     };
     waveSurfer.once("ready", seekOnReady);
     setAudioState("loading");
@@ -370,7 +417,7 @@ export default function WaveformPane({
         ? [currentPeaks]
         : undefined;
 
-    const generation = ++loadGenerationRef.current;
+    const generation = seekGeneration;
     const revisionKeyAtStart = revisionKey;
 
     void waveSurfer
@@ -408,29 +455,36 @@ export default function WaveformPane({
     const end = Math.max(selectionStart, selectionEnd);
     const currentRegion = regions.getRegions()[0];
 
-    if (end <= start + 0.01) {
-      if (currentRegion) {
-        currentRegion.remove();
+    syncingRegionFromPropsRef.current = true;
+    try {
+      if (end <= start + 0.01) {
+        if (currentRegion) {
+          currentRegion.remove();
+        }
+        return;
       }
-      return;
-    }
 
-    if (!currentRegion) {
-      regions.addRegion({
-        start,
-        end,
-        color: "rgba(247, 203, 104, 0.2)",
-        drag: true,
-        resize: true,
+      if (!currentRegion) {
+        regions.addRegion({
+          start,
+          end,
+          color: "rgba(247, 203, 104, 0.2)",
+          drag: true,
+          resize: true,
+        });
+        return;
+      }
+
+      if (
+        Math.abs(currentRegion.start - start) > 0.02 ||
+        Math.abs(currentRegion.end - end) > 0.02
+      ) {
+        currentRegion.setOptions({ start, end });
+      }
+    } finally {
+      queueMicrotask(() => {
+        syncingRegionFromPropsRef.current = false;
       });
-      return;
-    }
-
-    if (
-      Math.abs(currentRegion.start - start) > 0.02 ||
-      Math.abs(currentRegion.end - end) > 0.02
-    ) {
-      currentRegion.setOptions({ start, end });
     }
   }, [selectionStart, selectionEnd]);
 

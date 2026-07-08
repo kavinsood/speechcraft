@@ -132,22 +132,24 @@ export default function EditorPane({
   const activeRevisionKeyRef = useRef<string | null>(null);
 
   const activeDuration = activeClip ? getSliceDuration(activeClip) : 0;
-  const activeAudioRevisionKey = activeClip
-    ? JSON.stringify({
-        audio_url: activeClip.audio_url,
-        active_variant_id: activeClip.active_variant?.id ?? null,
-        active_commit_id: activeClip.active_commit?.id ?? null,
-        edl_operations: activeClip.active_commit?.edl_operations ?? [],
-        waveform_peaks_url:
-          activeClip.item_metadata && "waveform_peaks_url" in activeClip.item_metadata
-            ? activeClip.item_metadata.waveform_peaks_url
-            : null,
-        effective_audio_revision_key:
-          activeClip.item_metadata && "effective_audio_revision_key" in activeClip.item_metadata
-            ? activeClip.item_metadata.effective_audio_revision_key
-            : null,
-      })
-    : null;
+  const activeAudioRevisionKey = useMemo(() => {
+    if (!activeClip) {
+      return null;
+    }
+    const metadata = activeClip.item_metadata;
+    return JSON.stringify({
+      audio_url: activeClip.audio_url,
+      active_variant_id: activeClip.active_variant?.id ?? null,
+      active_commit_id: activeClip.active_commit?.id ?? null,
+      edl_operations: activeClip.active_commit?.edl_operations ?? [],
+      waveform_peaks_url:
+        metadata && "waveform_peaks_url" in metadata ? metadata.waveform_peaks_url : null,
+      effective_audio_revision_key:
+        metadata && "effective_audio_revision_key" in metadata
+          ? metadata.effective_audio_revision_key
+          : null,
+    });
+  }, [activeClip]);
   const datasetRenderStatus =
     activeClip?.item_metadata && "render_status" in activeClip.item_metadata
       ? (activeClip.item_metadata.render_status as string | null)
@@ -187,28 +189,8 @@ export default function EditorPane({
     return Array.from({ length: Math.floor(activeDuration) + 1 }, (_, second) => second);
   }, [activeClip?.id, activeDuration]);
 
-  const pendingPlayheadSecondsRef = useRef<number | null>(null);
-  const playheadRafRef = useRef<number | null>(null);
-
   const handleWaveformCursorChange = useCallback((time: number) => {
-    pendingPlayheadSecondsRef.current = time;
-    if (playheadRafRef.current !== null) {
-      return;
-    }
-    playheadRafRef.current = window.requestAnimationFrame(() => {
-      playheadRafRef.current = null;
-      if (pendingPlayheadSecondsRef.current !== null) {
-        setPlayheadSeconds(pendingPlayheadSecondsRef.current);
-      }
-    });
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (playheadRafRef.current !== null) {
-        window.cancelAnimationFrame(playheadRafRef.current);
-      }
-    };
+    setPlayheadSeconds(time);
   }, []);
 
   useEffect(() => {
@@ -245,6 +227,13 @@ export default function EditorPane({
 
     if (waveformPeaksUrl && datasetRenderStatus === "pending") {
       setRevisionPeaks(initialRevisionPeaksForFetch(activeAudioRevisionKey));
+      return;
+    }
+
+    if (
+      revisionPeaks.revisionKey === activeAudioRevisionKey
+      && revisionPeaks.status === "ready"
+    ) {
       return;
     }
 
@@ -289,7 +278,7 @@ export default function EditorPane({
     return () => {
       cancelled = true;
     };
-  }, [activeClip?.id, activeAudioRevisionKey, waveformPeaksUrl, datasetRenderStatus]);
+  }, [activeClip?.id, activeAudioRevisionKey, waveformPeaksUrl, datasetRenderStatus, revisionPeaks.revisionKey, revisionPeaks.status]);
 
   useEffect(() => {
     const editor = transcriptEditorRef.current;

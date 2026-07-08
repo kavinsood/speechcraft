@@ -7,17 +7,22 @@ type DeferredLoad = {
 };
 
 const deferredLoads: DeferredLoad[] = [];
+const readyOnceHandlers: Array<() => void> = [];
 const waveSurferLoad = vi.fn(() =>
   new Promise<void>((resolve, reject) => {
     deferredLoads.push({
-      resolve: () => resolve(),
+      resolve: () => {
+        for (const handler of readyOnceHandlers.splice(0, readyOnceHandlers.length)) {
+          handler();
+        }
+        resolve();
+      },
       reject,
     });
   }),
 );
 const waveSurferDestroy = vi.fn();
 const waveSurferOn = vi.fn();
-const waveSurferOnce = vi.fn();
 const waveSurferSeekTo = vi.fn();
 const waveSurferGetDuration = vi.fn(() => 2);
 const waveSurferGetCurrentTime = vi.fn(() => 0);
@@ -32,7 +37,11 @@ vi.mock("wavesurfer.js", () => ({
       load: waveSurferLoad,
       destroy: waveSurferDestroy,
       on: waveSurferOn,
-      once: waveSurferOnce,
+      once: vi.fn((event: string, handler: () => void) => {
+        if (event === "ready") {
+          readyOnceHandlers.push(handler);
+        }
+      }),
       seekTo: waveSurferSeekTo,
       getDuration: waveSurferGetDuration,
       getCurrentTime: waveSurferGetCurrentTime,
@@ -71,8 +80,9 @@ async function resolveAllPendingLoads() {
 describe("WaveformPane", () => {
   beforeEach(() => {
     deferredLoads.length = 0;
+    readyOnceHandlers.length = 0;
     waveSurferLoad.mockClear();
-    waveSurferOnce.mockClear();
+    waveSurferSeekTo.mockClear();
     enableDragSelection.mockClear();
   });
 
@@ -344,6 +354,74 @@ describe("WaveformPane", () => {
     });
 
     expect(waveSurferLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reload or re-seek when peaks flicker after the revision is loaded", async () => {
+    const revisionKey = "rev-a";
+    const peaks = [0.5, 0.4];
+
+    const { rerender } = render(
+      <WaveformPane
+        audioUrl="http://127.0.0.1:8010/media/a.wav"
+        durationSeconds={2}
+        peaks={peaks}
+        loadRevisionKey={revisionKey}
+        peaksLoadState="ready"
+        requirePeaksBeforeLoad
+        selectionStart={0}
+        selectionEnd={0}
+        onSelectionChange={() => {}}
+        onCursorChange={() => {}}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(waveSurferLoad).toHaveBeenCalledTimes(1);
+    });
+    await resolveAllPendingLoads();
+    expect(waveSurferSeekTo).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <WaveformPane
+        audioUrl="http://127.0.0.1:8010/media/a.wav"
+        durationSeconds={2}
+        peaks={null}
+        loadRevisionKey={revisionKey}
+        peaksLoadState="loading"
+        requirePeaksBeforeLoad
+        selectionStart={0}
+        selectionEnd={0}
+        onSelectionChange={() => {}}
+        onCursorChange={() => {}}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    rerender(
+      <WaveformPane
+        audioUrl="http://127.0.0.1:8010/media/a.wav"
+        durationSeconds={2}
+        peaks={peaks}
+        loadRevisionKey={revisionKey}
+        peaksLoadState="ready"
+        requirePeaksBeforeLoad
+        desiredCursorSeconds={1.25}
+        selectionStart={0}
+        selectionEnd={0}
+        onSelectionChange={() => {}}
+        onCursorChange={() => {}}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(waveSurferLoad).toHaveBeenCalledTimes(1);
+    expect(waveSurferSeekTo).toHaveBeenCalledTimes(1);
   });
 
   it("ignores stale load completion when an older revision resolves late", async () => {
