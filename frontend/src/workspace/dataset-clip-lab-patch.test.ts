@@ -159,7 +159,10 @@ describe("createClipLabPatchCoordinator", () => {
 
     await Promise.resolve();
     view = makeView("run-b", [makeClipRow("clip-1", 0)]);
-    resolvePatch?.(makeClipRow("clip-1", 1, ["run-a-only"]));
+    const finishRunA = resolvePatch as ((row: DatasetClipLabClipRow) => void) | null;
+    if (finishRunA) {
+      finishRunA(makeClipRow("clip-1", 1, ["run-a-only"]));
+    }
     await pending;
 
     expect(view.run_id).toBe("run-b");
@@ -191,7 +194,10 @@ describe("createClipLabPatchCoordinator", () => {
 
     await Promise.resolve();
     coordinator.resetQueues();
-    resolvePatch?.(makeClipRow("clip-1", 1, ["stale-queued"]));
+    const finishStaleQueued = resolvePatch as ((row: DatasetClipLabClipRow) => void) | null;
+    if (finishStaleQueued) {
+      finishStaleQueued(makeClipRow("clip-1", 1, ["stale-queued"]));
+    }
 
     await expect(pending).resolves.toMatchObject({ reviewer_tags: ["stale-queued"] });
     expect(view.clips[0]?.reviewer_tags).toEqual([]);
@@ -233,7 +239,10 @@ describe("createClipLabPatchCoordinator", () => {
 
     await Promise.resolve();
     coordinator.resetQueues();
-    unblockFirst?.();
+    const releaseFirst = unblockFirst as (() => void) | null;
+    if (releaseFirst) {
+      releaseFirst();
+    }
     await first;
     await expect(second).rejects.toThrow(/cancelled/i);
   });

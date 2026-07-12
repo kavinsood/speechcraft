@@ -12,14 +12,29 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from app.clip_lab_audio import MAX_INSERT_SILENCE_SEC
-from app.clip_lab_state import ClipLabStateError, compute_content_hash, compute_manifest_sha256
+from app.clip_lab_state import (
+    ClipLabStateError,
+    compute_content_hash,
+    compute_manifest_sha256,
+    save_clip_lab_state,
+)
 from app.dataset_runs import create_dataset_run
-from app.main import app, patch_dataset_clip_lab_route, read_dataset_clip_lab
+from app.main import (
+    app,
+    patch_dataset_clip_lab_route,
+    post_dataset_clip_audio_operation_route,
+    post_canonical_export,
+    read_canonical_exports,
+    read_canonical_export_preview,
+    read_dataset_clip_lab,
+)
 from app.models import (
+    DatasetClipLabAudioOperationRequest,
     DatasetClipLabClipView,
     DatasetClipLabPatchRequest,
     DatasetClipLabPipelineFindingView,
@@ -177,6 +192,405 @@ class ClipLabRouteHttpTests(unittest.TestCase):
         self.assertFalse(payload["invalid_state"])
         self.assertTrue(payload["qc_available"])
         self.assertEqual(len(payload["clips"]), 4)
+
+    def test_canonical_export_preview_allows_zero_accepted(self) -> None:
+        with self.repo():
+            response = read_canonical_export_preview(self.run.id)
+
+        self.assertEqual(response.accepted_clip_count, 0)
+        self.assertEqual(response.blocked_clip_count, 0)
+
+    def test_create_canonical_export_rejects_zero_accepted(self) -> None:
+        with self.repo():
+            with self.assertRaises(HTTPException) as exc_info:
+                post_canonical_export(self.run.id)
+        self.assertEqual(exc_info.exception.status_code, 409)
+
+    def test_create_canonical_export_writes_manifest_snapshot(self) -> None:
+        with self.repo():
+            accept_response = patch_dataset_clip_lab_route(
+                self.run.id,
+                "candidate_review_clip_000001",
+                DatasetClipLabPatchRequest(
+                    expected_manifest_sha256=self.manifest_sha,
+                    expected_clip_version=0,
+                    review_status="accepted",
+                    transcript_override="Final transcript.",
+                    reviewer_tags=["good energy"],
+                ),
+            )
+            self.assertEqual(accept_response.review_status, "accepted")
+
+            export_response = post_canonical_export(self.run.id)
+
+        export_dir = Path(export_response.snapshot_dir)
+        self.assertTrue((export_dir / "speechcraft_dataset.jsonl").is_file())
+        self.assertTrue((export_dir / "speechcraft_export.json").is_file())
+        self.assertTrue((export_dir / "export_report.json").is_file())
+
+        rows = [
+            json.loads(line)
+            for line in (export_dir / "speechcraft_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["schema_version"], 1)
+        self.assertEqual(row["clip_id"], "candidate_review_clip_000001")
+        self.assertEqual(row["transcript"], "Final transcript.")
+        self.assertEqual(row["lineage"]["source_clip_id"], "candidate_review_clip_000001")
+        self.assertEqual(row["lineage"]["parent_clip_ids"], [])
+        self.assertEqual(row["review"]["status"], "accepted")
+        self.assertEqual(row["review"]["reviewer_tags"], ["good energy"])
+        self.assertEqual(row["audio"]["kind"], "candidate_original")
+        self.assertEqual(row["audio"]["source_audio_sha256"], row["audio"]["sha256"])
+        self.assertIn("candidate_review_clips/candidate_review_clip_000001.wav", row["audio"]["path"])
+        metadata = json.loads((export_dir / "speechcraft_export.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["path_mode"], "snapshot_relative")
+        self.assertEqual(metadata["audio_storage_mode"], "project_artifact_reference")
+        self.assertFalse(metadata["portable"])
+        self.assertEqual(export_dir.parent, self.run_root / "artifacts" / "canonical_exports")
+
+    def test_create_canonical_export_uses_rendered_revision_for_accepted_audio_edit(self) -> None:
+        with self.repo():
+            edited = post_dataset_clip_audio_operation_route(
+                self.run.id,
+                "candidate_review_clip_000001",
+                DatasetClipLabAudioOperationRequest(
+                    expected_manifest_sha256=self.manifest_sha,
+                    expected_clip_version=0,
+                    operation={
+                        "kind": "insert_silence",
+                        "at_sample": 10,
+                        "duration_samples": 16,
+                    },
+                ),
+            )
+            self.assertEqual(edited.effective_audio_kind, "rendered_revision")
+            accepted = patch_dataset_clip_lab_route(
+                self.run.id,
+                "candidate_review_clip_000001",
+                DatasetClipLabPatchRequest(
+                    expected_manifest_sha256=self.manifest_sha,
+                    expected_clip_version=edited.clip_version,
+                    review_status="accepted",
+                ),
+            )
+            self.assertEqual(accepted.review_status, "accepted")
+
+            export_response = post_canonical_export(self.run.id)
+
+        rows = [
+            json.loads(line)
+            for line in (Path(export_response.snapshot_dir) / "speechcraft_dataset.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        row = rows[0]
+        self.assertEqual(row["audio"]["kind"], "rendered_revision")
+        self.assertIn("clip_lab_renders", row["audio"]["path"])
+        self.assertIsInstance(row["audio"]["audio_revision_hash"], str)
+
+    def test_canonical_export_preview_blocks_pending_rendered_audio(self) -> None:
+        manifest = json.loads((self.run_root / "artifacts" / "candidate_review_manifest.json").read_text(encoding="utf-8"))
+        clip_row = next(row for row in manifest if row["id"] == "candidate_review_clip_000001")
+        source_sha = str(clip_row["audio_sha256"])
+        audio_revision_hash = "ab" * 32
+        accepted_hash = compute_content_hash(
+            manifest_transcript=str(clip_row["training_text"]),
+            transcript_override=None,
+            audio_revision_hash=audio_revision_hash,
+            base_audio_hash=source_sha,
+        )
+        save_clip_lab_state(
+            self.run_root,
+            {
+                "schema_version": 1,
+                "stage": "clip_lab_state",
+                "candidate_manifest_sha256": self.manifest_sha,
+                "updated_at": "2026-07-08T00:00:00Z",
+                "clips": {
+                    "candidate_review_clip_000001": {
+                        "clip_version": 1,
+                        "review_status": "accepted",
+                        "accepted_content_hash": accepted_hash,
+                        "accepted_at": "2026-07-08T00:00:00Z",
+                        "reviewer_tags": [],
+                        "updated_at": "2026-07-08T00:00:00Z",
+                        "audio_edit": {
+                            "schema_version": 1,
+                            "source_audio_sha256": source_sha,
+                            "source_sample_rate_hz": SAMPLE_RATE,
+                            "ops": [{"kind": "insert_silence", "at_sample": 10, "duration_samples": 16}],
+                            "redo_ops": [],
+                            "audio_revision_hash": audio_revision_hash,
+                            "rendered_audio_sha256": None,
+                            "render_status": "pending",
+                        },
+                    }
+                },
+            },
+        )
+
+        with self.repo():
+            preview = read_canonical_export_preview(self.run.id)
+
+        self.assertEqual(preview.accepted_clip_count, 1)
+        self.assertEqual(preview.blocked_clip_count, 1)
+        self.assertIn("rendered_audio_not_ready", preview.blocked_reasons[0].reasons)
+
+    def test_canonical_export_preview_blocks_failed_rendered_audio(self) -> None:
+        manifest = json.loads((self.run_root / "artifacts" / "candidate_review_manifest.json").read_text(encoding="utf-8"))
+        clip_row = next(row for row in manifest if row["id"] == "candidate_review_clip_000001")
+        source_sha = str(clip_row["audio_sha256"])
+        audio_revision_hash = "cd" * 32
+        accepted_hash = compute_content_hash(
+            manifest_transcript=str(clip_row["training_text"]),
+            transcript_override=None,
+            audio_revision_hash=audio_revision_hash,
+            base_audio_hash=source_sha,
+        )
+        save_clip_lab_state(
+            self.run_root,
+            {
+                "schema_version": 1,
+                "stage": "clip_lab_state",
+                "candidate_manifest_sha256": self.manifest_sha,
+                "updated_at": "2026-07-08T00:00:00Z",
+                "clips": {
+                    "candidate_review_clip_000001": {
+                        "clip_version": 1,
+                        "review_status": "accepted",
+                        "accepted_content_hash": accepted_hash,
+                        "accepted_at": "2026-07-08T00:00:00Z",
+                        "reviewer_tags": [],
+                        "updated_at": "2026-07-08T00:00:00Z",
+                        "audio_edit": {
+                            "schema_version": 1,
+                            "source_audio_sha256": source_sha,
+                            "source_sample_rate_hz": SAMPLE_RATE,
+                            "ops": [{"kind": "insert_silence", "at_sample": 10, "duration_samples": 16}],
+                            "redo_ops": [],
+                            "audio_revision_hash": audio_revision_hash,
+                            "rendered_audio_sha256": None,
+                            "render_status": "failed",
+                        },
+                    }
+                },
+            },
+        )
+
+        with self.repo():
+            preview = read_canonical_export_preview(self.run.id)
+
+        self.assertEqual(preview.accepted_clip_count, 1)
+        self.assertEqual(preview.blocked_clip_count, 1)
+        self.assertIn("rendered_audio_not_ready", preview.blocked_reasons[0].reasons)
+
+    def test_canonical_export_preview_blocks_missing_rendered_wav(self) -> None:
+        manifest = json.loads((self.run_root / "artifacts" / "candidate_review_manifest.json").read_text(encoding="utf-8"))
+        clip_row = next(row for row in manifest if row["id"] == "candidate_review_clip_000001")
+        source_sha = str(clip_row["audio_sha256"])
+        audio_revision_hash = "ef" * 32
+        rendered_sha = "11" * 32
+        accepted_hash = compute_content_hash(
+            manifest_transcript=str(clip_row["training_text"]),
+            transcript_override=None,
+            audio_revision_hash=audio_revision_hash,
+            base_audio_hash=source_sha,
+        )
+        save_clip_lab_state(
+            self.run_root,
+            {
+                "schema_version": 1,
+                "stage": "clip_lab_state",
+                "candidate_manifest_sha256": self.manifest_sha,
+                "updated_at": "2026-07-08T00:00:00Z",
+                "clips": {
+                    "candidate_review_clip_000001": {
+                        "clip_version": 1,
+                        "review_status": "accepted",
+                        "accepted_content_hash": accepted_hash,
+                        "accepted_at": "2026-07-08T00:00:00Z",
+                        "reviewer_tags": [],
+                        "updated_at": "2026-07-08T00:00:00Z",
+                        "audio_edit": {
+                            "schema_version": 1,
+                            "source_audio_sha256": source_sha,
+                            "source_sample_rate_hz": SAMPLE_RATE,
+                            "ops": [{"kind": "insert_silence", "at_sample": 10, "duration_samples": 16}],
+                            "redo_ops": [],
+                            "audio_revision_hash": audio_revision_hash,
+                            "rendered_audio_sha256": rendered_sha,
+                            "render_status": "ready",
+                        },
+                    }
+                },
+            },
+        )
+
+        with self.repo():
+            preview = read_canonical_export_preview(self.run.id)
+
+        self.assertEqual(preview.blocked_clip_count, 1)
+        self.assertIn("rendered_audio_missing", preview.blocked_reasons[0].reasons)
+
+    def test_canonical_export_preview_blocks_rendered_hash_mismatch(self) -> None:
+        manifest = json.loads((self.run_root / "artifacts" / "candidate_review_manifest.json").read_text(encoding="utf-8"))
+        clip_row = next(row for row in manifest if row["id"] == "candidate_review_clip_000001")
+        source_sha = str(clip_row["audio_sha256"])
+        audio_revision_hash = "12" * 32
+        accepted_hash = compute_content_hash(
+            manifest_transcript=str(clip_row["training_text"]),
+            transcript_override=None,
+            audio_revision_hash=audio_revision_hash,
+            base_audio_hash=source_sha,
+        )
+        render_path = self.run_root / "artifacts" / "clip_lab_renders" / "candidate_review_clip_000001" / f"{audio_revision_hash}.wav"
+        render_path.parent.mkdir(parents=True, exist_ok=True)
+        render_path.write_bytes(b"not-the-expected-hash")
+        save_clip_lab_state(
+            self.run_root,
+            {
+                "schema_version": 1,
+                "stage": "clip_lab_state",
+                "candidate_manifest_sha256": self.manifest_sha,
+                "updated_at": "2026-07-08T00:00:00Z",
+                "clips": {
+                    "candidate_review_clip_000001": {
+                        "clip_version": 1,
+                        "review_status": "accepted",
+                        "accepted_content_hash": accepted_hash,
+                        "accepted_at": "2026-07-08T00:00:00Z",
+                        "reviewer_tags": [],
+                        "updated_at": "2026-07-08T00:00:00Z",
+                        "audio_edit": {
+                            "schema_version": 1,
+                            "source_audio_sha256": source_sha,
+                            "source_sample_rate_hz": SAMPLE_RATE,
+                            "ops": [{"kind": "insert_silence", "at_sample": 10, "duration_samples": 16}],
+                            "redo_ops": [],
+                            "audio_revision_hash": audio_revision_hash,
+                            "rendered_audio_sha256": "22" * 32,
+                            "render_status": "ready",
+                        },
+                    }
+                },
+            },
+        )
+
+        with self.repo():
+            preview = read_canonical_export_preview(self.run.id)
+
+        self.assertEqual(preview.blocked_clip_count, 1)
+        self.assertIn("rendered_audio_hash_mismatch", preview.blocked_reasons[0].reasons)
+
+    def test_canonical_export_preview_blocks_candidate_hash_mismatch(self) -> None:
+        with self.repo():
+            accepted = patch_dataset_clip_lab_route(
+                self.run.id,
+                "candidate_review_clip_000001",
+                DatasetClipLabPatchRequest(
+                    expected_manifest_sha256=self.manifest_sha,
+                    expected_clip_version=0,
+                    review_status="accepted",
+                ),
+            )
+            self.assertEqual(accepted.review_status, "accepted")
+
+        candidate_wav = self.run_root / "artifacts" / "candidate_review_clips" / "candidate_review_clip_000001.wav"
+        candidate_wav.write_bytes(b"mutated-audio")
+
+        with self.repo():
+            preview = read_canonical_export_preview(self.run.id)
+
+        self.assertEqual(preview.accepted_clip_count, 1)
+        self.assertEqual(preview.blocked_clip_count, 1)
+        self.assertIn("candidate_audio_hash_mismatch", preview.blocked_reasons[0].reasons)
+
+    def test_canonical_export_preview_rejects_stale_state(self) -> None:
+        save_clip_lab_state(
+            self.run_root,
+            {
+                "schema_version": 1,
+                "stage": "clip_lab_state",
+                "candidate_manifest_sha256": "stale-manifest-sha",
+                "updated_at": "2026-07-08T00:00:00Z",
+                "clips": {},
+            },
+        )
+
+        with self.repo():
+            with self.assertRaises(HTTPException) as exc_info:
+                read_canonical_export_preview(self.run.id)
+        self.assertEqual(exc_info.exception.status_code, 409)
+
+    def test_canonical_export_create_rejects_invalid_state(self) -> None:
+        save_clip_lab_state(
+            self.run_root,
+            {
+                "schema_version": 1,
+                "stage": "clip_lab_state",
+                "candidate_manifest_sha256": self.manifest_sha,
+                "updated_at": "2026-07-08T00:00:00Z",
+                "clips": {
+                    "candidate_review_clip_000001": {
+                        "clip_version": 1,
+                        "review_status": "accepted",
+                        "reviewer_tags": ["Accepted"],
+                    }
+                },
+            },
+        )
+
+        with self.repo():
+            with self.assertRaises(HTTPException) as exc_info:
+                post_canonical_export(self.run.id)
+        self.assertEqual(exc_info.exception.status_code, 409)
+
+    def test_list_canonical_exports_returns_newest_first_and_skips_corrupt_dirs(self) -> None:
+        exports_root = self.run_root / "artifacts" / "canonical_exports"
+        older = exports_root / "canonical_export_2026-07-08_010101_aaaaaaaa"
+        newer = exports_root / "canonical_export_2026-07-08_020202_bbbbbbbb"
+        corrupt = exports_root / "canonical_export_corrupt"
+        older.mkdir(parents=True, exist_ok=True)
+        newer.mkdir(parents=True, exist_ok=True)
+        corrupt.mkdir(parents=True, exist_ok=True)
+        (older / "speechcraft_export.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "export_id": older.name,
+                    "run_id": self.run.id,
+                    "project_id": "project-1",
+                    "created_at": "2026-07-08T01:01:01Z",
+                    "accepted_clip_count": 2,
+                    "total_duration_sec": 12.5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (newer / "speechcraft_export.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "export_id": newer.name,
+                    "run_id": self.run.id,
+                    "project_id": "project-1",
+                    "created_at": "2026-07-08T02:02:02Z",
+                    "accepted_clip_count": 3,
+                    "total_duration_sec": 18.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (corrupt / "speechcraft_export.json").write_text("{bad json", encoding="utf-8")
+
+        with self.repo():
+            exports = read_canonical_exports(self.run.id)
+
+        self.assertEqual([item.export_id for item in exports], [newer.name, older.name])
 
     def test_patch_transcript_override_then_get(self) -> None:
         with self.repo():

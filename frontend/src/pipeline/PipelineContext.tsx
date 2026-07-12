@@ -1,6 +1,6 @@
 import { createContext, useContext, type ReactNode } from "react";
 
-export type PipelineStage = "ingest" | "overview" | "speakers" | "processing" | "slicer" | "qc" | "lab" | "export";
+export type PipelineStage = "ingest" | "overview" | "speakers" | "processing" | "slicer" | "qc" | "lab";
 
 export type PipelineSelectionState = {
   selectedSpeakersRunId: string | null;

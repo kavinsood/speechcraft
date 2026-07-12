@@ -761,6 +761,26 @@ button:disabled.is-busy {
   justify-content: flex-end;
 }
 
+.inspector-header-actions {
+  display: grid;
+  justify-items: end;
+  gap: 0.35rem;
+}
+
+.inspector-inline-feedback {
+  margin: 0;
+  font-size: 0.82rem;
+  text-align: right;
+}
+
+.inspector-inline-feedback.success {
+  color: #226355;
+}
+
+.inspector-inline-feedback.error {
+  color: #8d3c38;
+}
+
 .editor-notice {
   margin: 0 0 0.9rem;
   padding: 0.7rem 0.85rem;
@@ -1722,11 +1742,6 @@ button:disabled.is-busy {
 .commit-time {
   font-size: 0.76rem;
   color: #66757c;
-}
-
-.export-preview {
-  display: grid;
-  gap: 0.55rem;
 }
 
 .manifest-path {

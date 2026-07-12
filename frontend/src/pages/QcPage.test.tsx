@@ -34,7 +34,6 @@ const project = {
   name: "Project",
   created_at: "",
   updated_at: "",
-  export_status: null,
 };
 
 const run = {

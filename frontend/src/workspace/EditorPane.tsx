@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type WaveSurfer from "wavesurfer.js";
+import type {
+  ClipLabItem,
+  ClipLabItemRef,
+  DatasetClipLabPipelineFinding,
+  ReviewStatus,
+  Tag,
+} from "../types";
 import WaveformPane from "../WaveformPane";
 import { fetchClipLabWaveformPeaks, fetchDatasetClipLabWaveformPeaks } from "../api";
 import {

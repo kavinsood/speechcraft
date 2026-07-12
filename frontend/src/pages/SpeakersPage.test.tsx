@@ -73,7 +73,7 @@ const diarizationRun = {
 function renderPage(onOpenProcessing = vi.fn(), onOpenProcessingWithRun = vi.fn()) {
   return render(
     <SpeakersPage
-      activeProject={{ id: "project-1", name: "Project 1", created_at: "", updated_at: "", export_status: null }}
+      activeProject={{ id: "project-1", name: "Project 1", created_at: "", updated_at: "" }}
       projectLoadStatus="ready"
       projectLoadError={null}
       onRetryProjects={() => {}}

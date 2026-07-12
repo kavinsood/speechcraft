@@ -1,5 +1,11 @@
 import { useEffect, useState, type FormEvent } from "react";
-import type { ClipLabItem, DatasetRun, ExportRun, ReferenceAssetSummary, ReviewStatus } from "../types";
+import type {
+  CanonicalExportPreview,
+  ClipLabItem,
+  DatasetRun,
+  ReferenceAssetSummary,
+  ReviewStatus,
+} from "../types";
 import WorkspaceStatePanel from "./WorkspaceStatePanel";
 import {
   formatDurationCompact,
@@ -35,7 +41,12 @@ type InspectorPaneProps = {
   acceptedRejectedRatio: number | null;
   predictedOutputSeconds: number | null;
   progressPercent: number | null;
-  exportRuns: ExportRun[];
+  canonicalExportPreview: CanonicalExportPreview | null;
+  canonicalExportPreviewStatus: "idle" | "loading" | "ready" | "error";
+  canonicalExportFeedback: { tone: "error" | "success"; message: string } | null;
+  canTriggerCanonicalExport: boolean;
+  isCreatingCanonicalExport: boolean;
+  onCreateCanonicalExport: () => void;
   onRetryLoad: () => void;
   onStatusChange: (status: ReviewStatus) => void;
   onVariantSelect: (variantId: string) => void;
@@ -62,7 +73,12 @@ export default function InspectorPane({
   acceptedRejectedRatio,
   predictedOutputSeconds,
   progressPercent,
-  exportRuns,
+  canonicalExportPreview,
+  canonicalExportPreviewStatus,
+  canonicalExportFeedback,
+  canTriggerCanonicalExport,
+  isCreatingCanonicalExport,
+  onCreateCanonicalExport,
   onRetryLoad,
   onStatusChange,
   onVariantSelect,
@@ -135,12 +151,29 @@ export default function InspectorPane({
     );
   }
 
+  const exportButtonLabel = `Export accepted clips (${canonicalExportPreview?.accepted_clip_count ?? 0})`;
+
   return (
     <aside className="inspector-column panel">
       <div className="panel-header">
         <div>
           <p className="eyebrow">Inspector</p>
           <h2>Clip Review</h2>
+        </div>
+        <div className="inspector-header-actions">
+          <button
+            type="button"
+            className="primary-button"
+            disabled={!canTriggerCanonicalExport || isCreatingCanonicalExport}
+            onClick={onCreateCanonicalExport}
+          >
+            {isCreatingCanonicalExport ? "Exporting..." : exportButtonLabel}
+          </button>
+          {canonicalExportFeedback ? (
+            <p className={`inspector-inline-feedback ${canonicalExportFeedback.tone}`}>
+              {canonicalExportFeedback.message}
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -229,6 +262,45 @@ export default function InspectorPane({
           </section>
 
           {renderDatasetRunPicker()}
+
+          <section className="inspector-block">
+            <h3>Canonical Export</h3>
+            {canonicalExportPreviewStatus === "loading" ? (
+              <p className="muted-copy">Checking accepted export set...</p>
+            ) : canonicalExportPreviewStatus === "error" ? (
+              <p className="muted-copy">Canonical export preview unavailable.</p>
+            ) : canonicalExportPreview ? (
+              <div className="stats-table">
+                <div className="stats-row">
+                  <span>Accepted clips</span>
+                  <span>-</span>
+                  <span>{canonicalExportPreview.accepted_clip_count}</span>
+                </div>
+                <div className="stats-row">
+                  <span>Accepted duration</span>
+                  <span>-</span>
+                  <span>{formatDurationCompact(canonicalExportPreview.total_duration_sec)}</span>
+                </div>
+                <div className="stats-row">
+                  <span>Original audio</span>
+                  <span>-</span>
+                  <span>{canonicalExportPreview.original_audio_count}</span>
+                </div>
+                <div className="stats-row">
+                  <span>Edited audio</span>
+                  <span>-</span>
+                  <span>{canonicalExportPreview.edited_audio_count}</span>
+                </div>
+                <div className="stats-row">
+                  <span>Blocked clips</span>
+                  <span>-</span>
+                  <span>{canonicalExportPreview.blocked_clip_count}</span>
+                </div>
+              </div>
+            ) : (
+              <p className="muted-copy">Select a dataset run to preview canonical export.</p>
+            )}
+          </section>
 
           <section className="inspector-block">
             <h3>Waveform EDL</h3>
@@ -386,29 +458,6 @@ export default function InspectorPane({
                 </div>
               </form>
             ) : null}
-          </section>
-
-          <section className="inspector-block">
-            <h3>Export Runs</h3>
-            {exportRuns.length > 0 ? (
-              <div className="commit-list">
-                {[...exportRuns].reverse().map((run) => (
-                  <div key={run.id} className="commit-card">
-                    <div className="commit-row">
-                      <strong>{run.id}</strong>
-                      <span>{run.status}</span>
-                    </div>
-                    <p>{run.manifest_path}</p>
-                    <span className="commit-time">
-                      {run.accepted_clip_count} slice(s)
-                      {run.completed_at ? ` • ${new Date(run.completed_at).toLocaleString()}` : ""}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="muted-copy">No export runs yet.</p>
-            )}
           </section>
 
           <section className="inspector-block">

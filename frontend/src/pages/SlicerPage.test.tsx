@@ -68,7 +68,7 @@ const slicedRun = {
 function renderPage() {
   return render(
     <SlicerPage
-      activeProject={{ id: "project-1", name: "Project", created_at: "", updated_at: "", export_status: null }}
+      activeProject={{ id: "project-1", name: "Project", created_at: "", updated_at: "" }}
       projectLoadStatus="ready"
       projectLoadError={null}
       onRetryProjects={() => {}}

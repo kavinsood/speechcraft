@@ -1,4 +1,6 @@
 import type {
+  CanonicalExportPreview,
+  CanonicalExportSummary,
   ClipLabItem,
   DatasetClipLabClipRow,
   DatasetClipLabAudioOperationRequest,
@@ -17,8 +19,6 @@ import type {
   DatasetRunLog,
   DatasetSpeakerSelection,
   DatasetSlicerResults,
-  ExportPreview,
-  ExportRun,
   ImportBatch,
   MediaCleanupResult,
   ProjectAlignmentSettings,
@@ -307,6 +307,27 @@ export async function fetchDatasetClipLab(runId: string): Promise<DatasetClipLab
   return await requestJson<DatasetClipLabView>(`${API_BASE}/api/dataset-runs/${runId}/clip-lab`);
 }
 
+export async function fetchCanonicalExportPreview(runId: string): Promise<CanonicalExportPreview> {
+  return await requestJson<CanonicalExportPreview>(
+    `${API_BASE}/api/dataset-runs/${runId}/canonical-export-preview`,
+  );
+}
+
+export async function createCanonicalExport(runId: string): Promise<CanonicalExportSummary> {
+  return await requestJson<CanonicalExportSummary>(
+    `${API_BASE}/api/dataset-runs/${runId}/canonical-exports`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export async function fetchCanonicalExports(runId: string): Promise<CanonicalExportSummary[]> {
+  return await requestJson<CanonicalExportSummary[]>(
+    `${API_BASE}/api/dataset-runs/${runId}/canonical-exports`,
+  );
+}
+
 export async function patchDatasetClipLabClip(
   runId: string,
   clipId: string,
@@ -554,23 +575,6 @@ export async function fetchSliceDetail(sliceId: string): Promise<Slice> {
 export async function fetchClipLabItem(sliceId: string): Promise<ClipLabItem> {
   const response = await fetch(`${API_BASE}/api/slices/${sliceId}/clip-lab`);
   return await parseJson<ClipLabItem>(response);
-}
-
-export async function fetchProjectExports(projectId: string): Promise<ExportRun[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/exports`);
-  return await parseJson<ExportRun[]>(response);
-}
-
-export async function fetchExportPreview(projectId: string): Promise<ExportPreview> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/export-preview`);
-  return await parseJson<ExportPreview>(response);
-}
-
-export async function runProjectExport(projectId: string): Promise<ExportRun> {
-  const response = await fetch(`${API_BASE}/api/projects/${projectId}/export`, {
-    method: "POST",
-  });
-  return await parseJson<ExportRun>(response);
 }
 
 export async function cleanupProjectMedia(projectId: string): Promise<MediaCleanupResult> {

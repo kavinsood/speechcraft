@@ -8,7 +8,6 @@ import {
   type PipelineSelectionState,
   type PipelineStage,
 } from "./pipeline/PipelineContext";
-import ExportPage from "./pages/ExportPage";
 import IngestPage from "./pages/IngestPage";
 import LabelPage from "./pages/LabelPage";
 import OverviewPage from "./pages/OverviewPage";
@@ -55,7 +54,6 @@ const stepDefinitions: StepDefinition[] = [
   { id: "slicer", label: "Slicer", shortLabel: "Sl", glyph: "C", tone: "Generate candidate review clips" },
   { id: "qc", label: "QC", shortLabel: "QC", glyph: "Q", tone: "Machine triage for one run" },
   { id: "lab", label: "Lab", shortLabel: "La", glyph: "L", tone: "Human review and override" },
-  { id: "export", label: "Export", shortLabel: "Ex", glyph: "E", tone: "Emit training-ready data" },
 ];
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -102,8 +100,6 @@ function readLocationState(): AppLocationState {
     enhance: "overview",
     segment: "slicer",
     label: "lab",
-    train: "export",
-    deploy: "export",
   };
   const maybeStep = path.length > 0 ? legacyStepMap[path] ?? path : "ingest";
   const step = isAppStep(maybeStep) ? maybeStep : "ingest";
@@ -242,9 +238,10 @@ function getPageHeaderContent(step: AppStep, activeProject: Project | null): Pag
   }
 
   return {
-    eyebrow: "Step 08",
-    title: "Export",
-    description: "Emit the selected reviewed or machine-triaged dataset for downstream training.",
+    eyebrow: "Reference",
+    title: activeProject?.name ?? "Reference Workstation",
+    description:
+      "Reference remains available as its existing workstation, outside the current sprint path.",
   };
 }
 
@@ -479,7 +476,7 @@ export default function App() {
   } else if (route.step === "reference") {
     pageContent = <ReferencePage {...pageProps} />;
   } else {
-    pageContent = <ExportPage {...pageProps} />;
+    pageContent = <IngestPage {...pageProps} onImportComplete={handleImportComplete} />;
   }
 
   return (
@@ -592,9 +589,6 @@ export default function App() {
         <footer className="workstation-footer">
           <span>{activeProject.name}</span>
           <span>updated {new Date(activeProject.updated_at).toLocaleDateString()}</span>
-          <span>
-            export {activeProject.export_status ? activeProject.export_status.replace(/_/g, " ") : "n/a"}
-          </span>
           <span>{stepDefinitions[visibleStepIndex]?.shortLabel ?? "In"} active</span>
         </footer>
       ) : null}

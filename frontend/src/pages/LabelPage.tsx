@@ -3,12 +3,13 @@ import {
   ApiError,
   appendClipEdlOperation,
   appendDatasetAudioOperation,
+  createCanonicalExport,
   fetchClipLabItem,
+  fetchCanonicalExportPreview,
   fetchDatasetClipLab,
   fetchDatasetQc,
   fetchDatasetSlicerResults,
   fetchProjectDatasetRuns,
-  fetchProjectExports,
   fetchProjectRecordings,
   fetchProjectReferenceAssets,
   markDatasetClipAsReferenceCandidate,
@@ -54,6 +55,7 @@ import {
   type DatasetQcScores,
 } from "../workspace/workspace-helpers";
 import type {
+  CanonicalExportPreview,
   ClipLabItem,
   ClipLabItemRef,
   ClipLabCapabilities,
@@ -67,7 +69,6 @@ import type {
   DatasetQcPayload,
   DatasetRun,
   DatasetSlicerResults,
-  ExportRun,
   Project,
   ReferenceAssetSummary,
   ReviewStatus,
@@ -418,7 +419,6 @@ export default function LabelPage({
   const [recordings, setRecordings] = useState<SourceRecordingQueue[]>([]);
   const [activeClip, setActiveClip] = useState<ClipLabItem | null>(null);
   const [visibleQueueClipIds, setVisibleQueueClipIds] = useState<string[]>([]);
-  const [exportRuns, setExportRuns] = useState<ExportRun[]>([]);
   const [referenceAssets, setReferenceAssets] = useState<ReferenceAssetSummary[]>([]);
   const [datasetSlicerResults, setDatasetSlicerResults] = useState<DatasetSlicerResults | null>(null);
   const [datasetRuns, setDatasetRuns] = useState<DatasetRun[]>([]);
@@ -435,6 +435,14 @@ export default function LabelPage({
   const [datasetClipLab, setDatasetClipLabState] = useState<DatasetClipLabView | null>(null);
   const [datasetClipLabLoadState, setDatasetClipLabLoadStateInternal] =
     useState<DatasetClipLabLoadState>("idle");
+  const [canonicalExportPreview, setCanonicalExportPreview] = useState<CanonicalExportPreview | null>(null);
+  const [canonicalExportPreviewStatus, setCanonicalExportPreviewStatus] =
+    useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [canonicalExportFeedback, setCanonicalExportFeedback] = useState<{
+    tone: "error" | "success";
+    message: string;
+  } | null>(null);
+  const [isCreatingCanonicalExport, setIsCreatingCanonicalExport] = useState(false);
   const datasetClipLabRef = useRef<DatasetClipLabView | null>(null);
   const datasetClipLabLoadStateRef = useRef<DatasetClipLabLoadState>("idle");
   const activeClipItemRef = useRef(activeClipItem);
@@ -455,6 +463,30 @@ export default function LabelPage({
   function setDatasetClipLabLoadState(next: DatasetClipLabLoadState) {
     datasetClipLabLoadStateRef.current = next;
     setDatasetClipLabLoadStateInternal(next);
+  }
+
+  async function refreshCanonicalExportPreview(
+    runId: string,
+    options?: { suppress409Notice?: boolean },
+  ): Promise<void> {
+    setCanonicalExportPreviewStatus("loading");
+    try {
+      const preview = await fetchCanonicalExportPreview(runId);
+      if (datasetClipLabRef.current?.run_id !== runId) {
+        return;
+      }
+      setCanonicalExportPreview(preview);
+      setCanonicalExportPreviewStatus("ready");
+    } catch (error) {
+      if (datasetClipLabRef.current?.run_id !== runId) {
+        return;
+      }
+      setCanonicalExportPreview(null);
+      setCanonicalExportPreviewStatus("error");
+      if (!(error instanceof ApiError && error.status === 409 && options?.suppress409Notice)) {
+        setWorkspaceNotice(getErrorMessage(error, "Canonical export preview failed to load."));
+      }
+    }
   }
 
   const patchCoordinator = useMemo(
@@ -510,6 +542,7 @@ export default function LabelPage({
     if (activeClipItemRef.current?.id === updated.clip_id) {
       refreshActiveDatasetClip(updated.clip_id, updated);
     }
+    void refreshCanonicalExportPreview(runId, { suppress409Notice: true });
   };
 
   conflictRef.current = async (runId, clipId) => {
@@ -537,6 +570,7 @@ export default function LabelPage({
         refreshActiveDatasetClip(clipId, refreshedRow);
       }
     }
+    await refreshCanonicalExportPreview(runId, { suppress409Notice: true });
     setWorkspaceNotice("Clip Lab state was out of date and has been reloaded.");
   };
 
@@ -626,10 +660,11 @@ export default function LabelPage({
     if (!projectId) {
       setSlices([]);
       setRecordings([]);
-      setExportRuns([]);
       setReferenceAssets([]);
       setDatasetClipLab(null);
       setDatasetClipLabLoadState("idle");
+      setCanonicalExportPreview(null);
+      setCanonicalExportPreviewStatus("idle");
       onActiveClipItemChange(null);
       setVisibleQueueClipIds([]);
       setWorkspaceStatus("ready");
@@ -645,9 +680,10 @@ export default function LabelPage({
         setDatasetSlicerResults(null);
         setDatasetClipLab(null);
         setDatasetClipLabLoadState("idle");
+        setCanonicalExportPreview(null);
+        setCanonicalExportPreviewStatus("idle");
         setSlices([]);
         setRecordings([]);
-        setExportRuns([]);
         setReferenceAssets([]);
         onActiveClipItemChange(null);
         setVisibleQueueClipIds([]);
@@ -656,10 +692,9 @@ export default function LabelPage({
         return;
       }
 
-      const [results, nextRecordings, nextExports] = await Promise.all([
+      const [results, nextRecordings] = await Promise.all([
         fetchDatasetSlicerResults(datasetRunId),
         fetchProjectRecordings(projectId),
-        fetchProjectExports(projectId),
       ]);
       let nextReferenceAssets: ReferenceAssetSummary[] = [];
       let datasetQcPayload: DatasetQcPayload | null = null;
@@ -699,6 +734,10 @@ export default function LabelPage({
 
       setDatasetClipLab(nextClipLab);
       setDatasetClipLabLoadState(nextClipLabLoadState);
+      await refreshCanonicalExportPreview(datasetRunId, { suppress409Notice: true });
+      if (latestWorkspaceRequestRef.current !== requestId) {
+        return;
+      }
       if (nextClipLabLoadState === "unavailable") {
         setWorkspaceNotice(
           getErrorMessage(
@@ -727,7 +766,6 @@ export default function LabelPage({
       if (!options?.silent) {
         setActiveClip(null);
       }
-      setExportRuns(nextExports);
       setReferenceAssets(nextReferenceAssets);
       const sortedSlices = sortClipsForQueue(nextSlices, queueSortMode);
       const nextActiveClip =
@@ -759,7 +797,6 @@ export default function LabelPage({
       setSlices([]);
       setRecordings([]);
       setActiveClip(null);
-      setExportRuns([]);
       setReferenceAssets([]);
       onActiveClipItemChange(null);
       setVisibleQueueClipIds([]);
@@ -806,6 +843,9 @@ export default function LabelPage({
     selectLabDatasetRun(runId);
     setDatasetClipLab(null);
     setDatasetClipLabLoadState("idle");
+    setCanonicalExportPreview(null);
+    setCanonicalExportPreviewStatus("idle");
+    setCanonicalExportFeedback(null);
     onActiveClipItemChange(null);
     setActiveClip(null);
   }
@@ -1349,6 +1389,14 @@ export default function LabelPage({
       : null;
   const canUndo = Boolean(activeClip?.can_undo);
   const canRedo = Boolean(activeClip?.can_redo);
+  const canTriggerCanonicalExport =
+    Boolean(datasetRunId)
+    && canonicalExportPreviewStatus === "ready"
+    && (canonicalExportPreview?.accepted_clip_count ?? 0) > 0
+    && (canonicalExportPreview?.blocked_clip_count ?? 0) === 0
+    && !datasetClipLab?.stale_state
+    && !datasetClipLab?.invalid_state
+    && !isCreatingCanonicalExport;
   const activeCommitId = activeClip?.active_commit?.id ?? null;
   const existingReferenceForCurrentState = useMemo(() => {
     if (!activeCommitId || !activeClip) {
@@ -1370,6 +1418,29 @@ export default function LabelPage({
     };
   }, [onHeaderActionsChange]);
 
+  async function handleCreateCanonicalExport() {
+    if (!datasetRunId || !canTriggerCanonicalExport) {
+      return;
+    }
+    setCanonicalExportFeedback(null);
+    setIsCreatingCanonicalExport(true);
+    try {
+      const result = await createCanonicalExport(datasetRunId);
+      await refreshCanonicalExportPreview(datasetRunId, { suppress409Notice: true });
+      setCanonicalExportFeedback({
+        tone: "success",
+        message: `Exported ${result.accepted_clip_count} clips.`,
+      });
+    } catch (error) {
+      setCanonicalExportFeedback({
+        tone: "error",
+        message: getErrorMessage(error, "Canonical export failed."),
+      });
+    } finally {
+      setIsCreatingCanonicalExport(false);
+    }
+  }
+
   const datasetClipLabEditable = isDatasetClipLabEditable(datasetMode, datasetClipLabLoadState, datasetClipLab);
   const activeClipLabRow =
     datasetClipLabEditable && activeClipItem ? clipLabRowById.get(activeClipItem.id) : undefined;
@@ -1379,18 +1450,21 @@ export default function LabelPage({
         machineFindings: activeClipLabRow.pipeline_findings,
         reviewerTags: activeClipLabRow.reviewer_tags,
         acceptanceStale: activeClipLabRow.acceptance_stale,
-        onReviewStatusChange: (status: ReviewStatus) =>
-          patchDatasetClipLab(activeClipLabRow.clip_id, () => ({ review_status: status })),
-        onAddReviewerTag: (tag: string) =>
-          patchDatasetClipLab(activeClipLabRow.clip_id, (row) => ({
+        onReviewStatusChange: async (status: ReviewStatus) => {
+          await patchDatasetClipLab(activeClipLabRow.clip_id, () => ({ review_status: status }));
+        },
+        onAddReviewerTag: async (tag: string) => {
+          await patchDatasetClipLab(activeClipLabRow.clip_id, (row) => ({
             reviewer_tags: [...row.reviewer_tags, tag],
-          })),
-        onRemoveReviewerTag: (tag: string) =>
-          patchDatasetClipLab(activeClipLabRow.clip_id, (row) => ({
+          }));
+        },
+        onRemoveReviewerTag: async (tag: string) => {
+          await patchDatasetClipLab(activeClipLabRow.clip_id, (row) => ({
             reviewer_tags: row.reviewer_tags.filter(
               (entry) => entry.toLowerCase() !== tag.toLowerCase(),
             ),
-          })),
+          }));
+        },
       }
     : undefined;
   const datasetTagReadOnly = buildDatasetTagReadOnlyConfig(
@@ -1496,7 +1570,12 @@ export default function LabelPage({
             acceptedRejectedRatio={acceptedRejectedRatio}
             predictedOutputSeconds={predictedOutputSeconds}
             progressPercent={progressPercent}
-            exportRuns={exportRuns}
+            canonicalExportPreview={canonicalExportPreview}
+            canonicalExportPreviewStatus={canonicalExportPreviewStatus}
+            canonicalExportFeedback={canonicalExportFeedback}
+            canTriggerCanonicalExport={canTriggerCanonicalExport}
+            isCreatingCanonicalExport={isCreatingCanonicalExport}
+            onCreateCanonicalExport={() => void handleCreateCanonicalExport()}
             onRetryLoad={() => void loadWorkspace(activeProject?.id)}
             onStatusChange={(status) => {
               if (!activeClip) {

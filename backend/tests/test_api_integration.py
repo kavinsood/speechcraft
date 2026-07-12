@@ -37,14 +37,8 @@ class ApiIntegrationTests(LiveServerTestCase):
         self.assertGreaterEqual(len(recordings), 1)
         self.assertEqual(recordings[0]["slice_count"], 0)
 
-        preview_response = self.client.get("/api/projects/phase1-demo/export-preview")
-        self.assertEqual(preview_response.status_code, 200)
-        preview = preview_response.json()
-        self.assertEqual(preview["project_id"], "phase1-demo")
-        self.assertEqual(preview["accepted_slice_count"], 0)
-
     def test_missing_project_route_returns_404(self) -> None:
-        response = self.client.get("/api/projects/missing-project/export-preview")
+        response = self.client.get("/api/projects/missing-project")
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"], "Project not found")

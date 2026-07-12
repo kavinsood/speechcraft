@@ -46,7 +46,7 @@ export function buildDatasetTagReadOnlyConfig(
   }
 
   return {
-    reviewStatus: activeClip.status,
+    reviewStatus: activeClip.status ?? "unresolved",
     tags: activeClip.tags.filter(isReviewerDisplayTag),
     message: buildDatasetTagReadOnlyMessage(view, loadState),
   };

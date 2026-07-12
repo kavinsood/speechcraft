@@ -300,6 +300,32 @@ export type DatasetClipLabView = {
   clips: DatasetClipLabClipRow[];
 };
 
+export type CanonicalExportBlockedReason = {
+  clip_id: string;
+  reasons: string[];
+};
+
+export type CanonicalExportPreview = {
+  run_id: string;
+  accepted_clip_count: number;
+  total_duration_sec: number;
+  original_audio_count: number;
+  edited_audio_count: number;
+  blocked_clip_count: number;
+  blocked_reasons: CanonicalExportBlockedReason[];
+};
+
+export type CanonicalExportSummary = {
+  export_id: string;
+  run_id: string;
+  project_id: string;
+  created_at: string;
+  accepted_clip_count: number;
+  total_duration_sec: number;
+  snapshot_dir: string;
+  manifest_path: string;
+};
+
 export type DatasetClipLabPatchRequest = {
   expected_manifest_sha256: string;
   expected_clip_version: number;
@@ -527,31 +553,11 @@ export type ImportBatch = {
   name: string;
   created_at: string;
   updated_at: string;
-  export_status?: "pending" | "running" | "completed" | "failed" | null;
   active_prepared_output_group_id?: string | null;
   active_preparation_job_id?: string | null;
 };
 
 export type Project = ImportBatch;
-
-export type ExportRun = {
-  id: string;
-  batch_id: string;
-  status: "pending" | "running" | "completed" | "failed";
-  output_root: string;
-  manifest_path: string;
-  accepted_clip_count: number;
-  failed_clip_count: number;
-  created_at: string;
-  completed_at?: string | null;
-};
-
-export type ExportPreview = {
-  project_id: string;
-  manifest_path: string;
-  accepted_slice_count: number;
-  lines: string[];
-};
 
 export type MediaCleanupResult = {
   project_id: string;

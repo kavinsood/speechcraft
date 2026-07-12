@@ -2,7 +2,13 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ClipLabItemRef, DatasetClipLabClipRow, DatasetClipLabView, Project } from "../types";
+import type {
+  CanonicalExportPreview,
+  ClipLabItemRef,
+  DatasetClipLabClipRow,
+  DatasetClipLabView,
+  Project,
+} from "../types";
 import LabelPage from "./LabelPage";
 
 const pipelineState = {
@@ -17,6 +23,10 @@ const clipLabStore = vi.hoisted(() => ({
 
 const clipLabFetchControls = vi.hoisted(() => ({
   staleRun1Fetch: null as Promise<DatasetClipLabView> | null,
+}));
+
+const canonicalExportStore = vi.hoisted(() => ({
+  preview: null as CanonicalExportPreview | null,
 }));
 
 vi.mock("../pipeline/PipelineContext", () => ({
@@ -53,7 +63,18 @@ vi.mock("../api", () => ({
   API_BASE: "http://127.0.0.1:8010",
   appendClipEdlOperation: vi.fn(),
   appendDatasetAudioOperation: vi.fn(),
+  createCanonicalExport: vi.fn(async () => ({
+    export_id: "canonical_export_2026-07-08_120000",
+    run_id: "dataset-run-1",
+    project_id: "project-1",
+    created_at: "2026-07-08T12:00:00Z",
+    accepted_clip_count: canonicalExportStore.preview?.accepted_clip_count ?? 0,
+    total_duration_sec: canonicalExportStore.preview?.total_duration_sec ?? 0,
+    snapshot_dir: "/tmp/canonical",
+    manifest_path: "/tmp/canonical/speechcraft_dataset.jsonl",
+  })),
   fetchClipLabItem: vi.fn(),
+  fetchCanonicalExportPreview: vi.fn(async () => canonicalExportStore.preview),
   fetchDatasetClipLab: vi.fn(async () => clipLabStore.view),
   fetchDatasetQc: vi.fn(async () => ({
     run_id: "dataset-run-1",
@@ -66,7 +87,6 @@ vi.mock("../api", () => ({
   })),
   fetchDatasetSlicerResults: vi.fn(),
   fetchProjectDatasetRuns: vi.fn(),
-  fetchProjectExports: vi.fn(async () => []),
   fetchProjectRecordings: vi.fn(),
   fetchProjectReferenceAssets: vi.fn(async () => []),
   markDatasetClipAsReferenceCandidate: vi.fn(),
@@ -92,6 +112,8 @@ vi.mock("../api", () => ({
 }));
 
 import {
+  createCanonicalExport,
+  fetchCanonicalExportPreview,
   fetchDatasetClipLab,
   fetchDatasetSlicerResults,
   fetchProjectDatasetRuns,
@@ -104,7 +126,6 @@ const activeProject: Project = {
   name: "Test Project",
   created_at: "2026-01-01T00:00:00.000Z",
   updated_at: "2026-01-01T00:00:00.000Z",
-  export_status: null,
 };
 
 const datasetRun = {
@@ -157,6 +178,8 @@ const recording = {
   num_samples: 160000,
   processing_recipe: null,
   duration_seconds: 10,
+  slice_count: 0,
+  processing_state: "idle",
 };
 
 function makeClipLabRow(overrides: Partial<DatasetClipLabClipRow> = {}): DatasetClipLabClipRow {
@@ -210,6 +233,27 @@ function makeClipLabView(overrides: Partial<DatasetClipLabView> = {}): DatasetCl
   };
 }
 
+function makeCanonicalExportPreview(
+  overrides: Partial<CanonicalExportPreview> = {},
+): CanonicalExportPreview {
+  return {
+    run_id: "dataset-run-1",
+    accepted_clip_count: 1,
+    total_duration_sec: 1.5,
+    original_audio_count: 1,
+    edited_audio_count: 0,
+    blocked_clip_count: 0,
+    blocked_reasons: [],
+    ...overrides,
+  };
+}
+
+function canonicalPreviewFromClipLabView(view: DatasetClipLabView | null): CanonicalExportPreview {
+  const acceptedClipCount =
+    view?.clips.filter((clip) => clip.review_status === "accepted").length ?? 0;
+  return makeCanonicalExportPreview({ accepted_clip_count: acceptedClipCount });
+}
+
 function Harness({
   datasetRunId = "dataset-run-1",
   remountKey,
@@ -247,6 +291,7 @@ afterEach(() => {
 beforeEach(() => {
   clipLabFetchControls.staleRun1Fetch = null;
   clipLabStore.view = makeClipLabView();
+  canonicalExportStore.preview = canonicalPreviewFromClipLabView(clipLabStore.view);
 
   vi.mocked(fetchProjectDatasetRuns).mockResolvedValue([datasetRun, datasetRun2]);
   vi.mocked(fetchProjectRecordings).mockResolvedValue([recording]);
@@ -282,6 +327,9 @@ beforeEach(() => {
     }
     return clipLabStore.view ?? makeClipLabView();
   });
+  vi.mocked(fetchCanonicalExportPreview).mockImplementation(
+    async () => canonicalExportStore.preview ?? canonicalPreviewFromClipLabView(clipLabStore.view),
+  );
   vi.mocked(patchDatasetClipLabClip).mockImplementation(async (_runId, clipId, payload) => {
     const current = clipLabStore.view?.clips.find((clip) => clip.clip_id === clipId);
     if (!current) {
@@ -305,6 +353,7 @@ beforeEach(() => {
       ...clipLabStore.view!,
       clips: clipLabStore.view!.clips.map((clip) => (clip.clip_id === clipId ? updated : clip)),
     };
+    canonicalExportStore.preview = canonicalPreviewFromClipLabView(clipLabStore.view);
     return updated;
   });
 });
@@ -326,7 +375,8 @@ describe("LabelPage dataset Clip Lab integration", () => {
       expect(patchDatasetClipLabClip).toHaveBeenCalled();
     });
 
-    const lastCall = vi.mocked(patchDatasetClipLabClip).mock.calls.at(-1);
+    const patchCalls = vi.mocked(patchDatasetClipLabClip).mock.calls;
+    const lastCall = patchCalls[patchCalls.length - 1];
     expect(lastCall?.[2]).toMatchObject({
       expected_clip_version: 0,
       reviewer_tags: ["good energy", "mouth noise"],
@@ -426,6 +476,37 @@ describe("LabelPage dataset Clip Lab integration", () => {
       expect(input).not.toMatch(/^https?:\/\//);
       expect(input).not.toMatch(/https?:\/\/.+https?:\/\//);
     }
+  });
+
+  it("shows the canonical export button and runs export from the inspector header", async () => {
+    render(<Harness />);
+
+    const button = await screen.findByRole("button", { name: "Export accepted clips (1)" });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(createCanonicalExport).toHaveBeenCalledWith("dataset-run-1");
+    });
+    expect(await screen.findByText("Exported 1 clips.")).toBeTruthy();
+  });
+
+  it("refreshes the canonical export count after accepting a clip", async () => {
+    clipLabStore.view = makeClipLabView({
+      clips: [makeClipLabRow({ review_status: "unresolved", accepted_content_hash: null, accepted_at: null })],
+    });
+    canonicalExportStore.preview = canonicalPreviewFromClipLabView(clipLabStore.view);
+
+    render(<Harness />);
+
+    expect(await screen.findByRole("button", { name: "Export accepted clips (0)" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Accepted" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Export accepted clips (1)" })).toBeTruthy();
+    });
   });
 
   it("treats stale clip lab state as read-only across editor and inspector", async () => {

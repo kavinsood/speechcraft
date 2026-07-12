@@ -141,7 +141,7 @@ function makeCandidate(runId: string, candidateId: string) {
 function renderReferencePage() {
   return render(
     <ReferencePage
-      activeProject={{ id: "project-1", name: "Project 1", created_at: "", updated_at: "", export_status: null }}
+      activeProject={{ id: "project-1", name: "Project 1", created_at: "", updated_at: "" }}
       projectLoadStatus="ready"
       projectLoadError={null}
       onRetryProjects={() => {}}

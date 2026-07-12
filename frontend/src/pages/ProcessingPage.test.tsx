@@ -93,7 +93,7 @@ function runWithStatus(status: "pending" | "running" | "completed" | "failed", s
 function renderPage(onOpenSlicerWithRun = vi.fn(), onOpenSpeakers = vi.fn()) {
   return render(
     <ProcessingPage
-      activeProject={{ id: "project-1", name: "Project 1", created_at: "", updated_at: "", export_status: null }}
+      activeProject={{ id: "project-1", name: "Project 1", created_at: "", updated_at: "" }}
       projectLoadStatus="ready"
       projectLoadError={null}
       onRetryProjects={() => {}}

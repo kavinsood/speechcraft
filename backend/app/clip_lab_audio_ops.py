@@ -76,6 +76,13 @@ def _manifest_wav_path(run_root: Path, manifest_row: dict[str, Any]) -> Path:
     return run_root / str(manifest_row["audio_path"])
 
 
+NATIVE_EXPORT_CLIPS_DIR = "artifacts/native_export_clips"
+
+
+def _native_export_wav_path(run_root: Path, clip_id: str) -> Path:
+    return run_root / NATIVE_EXPORT_CLIPS_DIR / f"{clip_id}.wav"
+
+
 def _source_identity(manifest_row: dict[str, Any], *, clip_id: str) -> str:
     source_sha = resolve_manifest_source_audio_hash(manifest_row, clip_id=clip_id)
     if source_sha is None:
@@ -705,6 +712,9 @@ def resolve_revision_media_bytes(
         raise ClipLabRevisionNotFoundError(f"revision key {revision_key!r} is not current for clip {clip_id}")
     source_sha = _source_identity(manifest_row, clip_id=clip_id)
     if revision_key == source_sha:
+        native_wav = _native_export_wav_path(run_root, clip_id)
+        if native_wav.is_file():
+            return native_wav.read_bytes()
         return _manifest_wav_path(run_root, manifest_row).read_bytes()
     cache_path = render_cache_path(run_root, clip_id, revision_key)
     if not cache_path.is_file():
