@@ -40,6 +40,8 @@ def inspect_wav(path: Path) -> dict[str, Any]:
 
 
 def create_analysis_audio_variants(run_root: Path, sources: list[dict[str, Any]], analysis_sample_rate: int) -> dict[str, Any]:
+    from .channel_resolver import ffmpeg_channel_args, resolve_source_channel
+
     variants: list[dict[str, Any]] = []
     for source in sources:
         source_audio_id = str(source["source_audio_id"])
@@ -47,14 +49,17 @@ def create_analysis_audio_variants(run_root: Path, sources: list[dict[str, Any]]
         relative_path = f"audio/analysis/{source_audio_id}.mono{analysis_sample_rate}.wav"
         output_path = resolve_under_root(run_root, relative_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        resolution = resolve_source_channel(source_path, int(source.get("num_channels") or 1))
+        channel_args = ffmpeg_channel_args(resolution.decision) if resolution else ["-ac", "1"]
+        channel_mode = resolution.decision if resolution else "mono_average"
+        channel_reason_codes = list(resolution.reason_codes) if resolution else []
         run_command(
             [
                 "ffmpeg",
                 "-y",
                 "-i",
                 str(source_path),
-                "-ac",
-                "1",
+                *channel_args,
                 "-ar",
                 str(analysis_sample_rate),
                 "-c:a",
@@ -88,7 +93,8 @@ def create_analysis_audio_variants(run_root: Path, sources: list[dict[str, Any]]
                 },
                 "recipe": {
                     "backend": "ffmpeg",
-                    "channel_mode": "mono_average",
+                    "channel_mode": channel_mode,
+                    "channel_reason_codes": channel_reason_codes,
                     "target_sample_rate": analysis_sample_rate,
                     "sample_format": "s16",
                     "codec": "pcm_s16le",
