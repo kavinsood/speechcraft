@@ -299,8 +299,10 @@ def create_dataset_run(repository: Any, project_id: str, request: DatasetRunCrea
             raise KeyError(f"Source recordings not found: {', '.join(missing)}")
         if not selected_ids:
             raise ValueError("Dataset run requires at least one source recording")
-        if not request.single_speaker and len(selected_ids) != 1:
-            raise ValueError("Multi-speaker diarization currently supports exactly one source WAV per run")
+        # Multi-file diarization is supported (option C): the worker concatenates
+        # the per-source analysis variants into a single timeline, diarizes once
+        # (so speaker identity is consistent across files), then remaps regions
+        # back per source. No per-run WAV-count limit.
         reserved = sorted(RESERVED_WORKER_CONFIG_KEYS.intersection(request.config))
         if reserved:
             raise ValueError(f"Dataset run config contains backend-controlled keys: {', '.join(reserved)}")

@@ -68,7 +68,7 @@ make dev-frontend
 
 Default frontend URL:
 
-- `http://127.0.0.1:5173`
+- `http://127.0.0.1:3002`
 
 The Makefile points the frontend at `http://127.0.0.1:8010` by default.
 
@@ -105,7 +105,7 @@ FRONTEND_API_BASE_URL=http://127.0.0.1:8000 make dev-frontend
 The frontend can also be configured directly with:
 
 ```bash
-VITE_API_BASE_URL=http://127.0.0.1:8010 npm run dev
+SPEECHCRAFT_BACKEND_URL=http://127.0.0.1:8010 bun run dev
 ```
 
 ## ASR Configuration
@@ -176,7 +176,7 @@ uv run python -m unittest discover -s tests -p 'test_*.py'
 
 ```bash
 cd frontend
-npm run build
+bun run build
 ```
 
 Smoke test against a running backend:
@@ -197,7 +197,7 @@ Expected local files/directories:
 
 - `backend/.venv/`
 - `frontend/node_modules/`
-- `frontend/dist/`
+- `frontend/.next/`
 - `backend/data/project.db`
 - `backend/data/media/`
 - `backend/exports/`

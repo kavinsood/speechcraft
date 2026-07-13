@@ -28,7 +28,7 @@ help:
 	@printf "  make dev-backend     Run the FastAPI API and ProcessingJob worker\n"
 	@printf "  make dev-api         Run only the FastAPI API with reload\n"
 	@printf "  make dev-worker      Run only the ProcessingJob worker\n"
-	@printf "  make dev-frontend    Run the Vite frontend dev server\n"
+	@printf "  make dev-frontend    Run the Next.js frontend dev server (http://127.0.0.1:3002)\n"
 	@printf "  make check           Run backend and frontend verification\n"
 	@printf "  make check-backend   Compile-check backend Python code\n"
 	@printf "  make check-frontend  Build the frontend production bundle\n"
@@ -44,7 +44,7 @@ setup-backend:
 	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) uv sync
 
 setup-frontend:
-	cd $(FRONTEND_DIR) && npm install
+	cd $(FRONTEND_DIR) && bun install
 
 dev-backend:
 	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) sh -c 'set -e; mkdir -p logs; : > logs/dev-backend.log; (uv run uvicorn app.main:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT) 2>&1 | tee -a logs/dev-backend.log) & api_pid=$$!; (uv run python -m app.worker 2>&1 | tee -a logs/dev-backend.log) & worker_pid=$$!; trap "kill $$api_pid $$worker_pid 2>/dev/null || true" INT TERM EXIT; wait'
@@ -58,7 +58,7 @@ dev-worker:
 backend-docs: dev-backend
 
 dev-frontend:
-	cd $(FRONTEND_DIR) && VITE_API_BASE_URL=$(FRONTEND_API_BASE_URL) npm run dev
+	cd $(FRONTEND_DIR) && SPEECHCRAFT_BACKEND_URL=$(FRONTEND_API_BASE_URL) bun run dev
 
 check: check-backend check-frontend
 
@@ -68,7 +68,7 @@ check-backend:
 	cd $(WORKER_ROOT) && PYTHONPATH=. $(BACKEND_DIR)/.venv/bin/python tests/test_clip_lab_coordination.py
 
 check-frontend:
-	cd $(FRONTEND_DIR) && npm run build
+	cd $(FRONTEND_DIR) && bun run build
 
 smoke-backend:
 	cd $(BACKEND_DIR) && UV_CACHE_DIR=$(UV_CACHE_DIR) uv run python scripts/smoke_backend.py --base-url $(SMOKE_BACKEND_BASE_URL) --project-id $(SMOKE_BACKEND_PROJECT_ID)

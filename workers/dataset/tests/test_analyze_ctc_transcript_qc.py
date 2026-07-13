@@ -280,6 +280,104 @@ class AnalyzeCtcTranscriptQcTests(unittest.TestCase):
             self.assertEqual(artifact["clips"][0]["bucket_hint"], "pass")
             self.assertTrue((artifacts / "transcript_qc_summary.json").exists())
 
+    def test_run_transcript_qc_uses_local_cache_only_by_default(self) -> None:
+        from speechcraft_dataset.analyze_ctc_transcript_qc import CtcModelBundle
+
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw)
+            artifacts = run_root / "artifacts"
+            audio_dir = artifacts / "candidate_review_clips"
+            audio_dir.mkdir(parents=True)
+            clip_path = audio_dir / "candidate_review_clip_000000.wav"
+            write_pcm16_mono(clip_path, [0.0] * 16000, 16000)
+            manifest = [
+                {
+                    "id": "candidate_review_clip_000000",
+                    "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000000.wav",
+                    "alignment_text": "hello",
+                    "duration_sec": 1.0,
+                    "buffer_id": "buffer_000000",
+                    "word_ids": [],
+                    "review_reason_codes": [],
+                }
+            ]
+            (artifacts / "candidate_review_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            fake_bundle = CtcModelBundle(model=object(), processor=object(), char_list=["H", "E", "L", "O", "|"], device="cpu")
+            fake_metrics = {
+                "transcript_score_method": TRANSCRIPT_SCORE_METHOD,
+                "ctc_mean_score": 0.91,
+                "ctc_min_span_score": 0.88,
+                "ctc_min_window_score": 0.88,
+                "ctc_min_token_score": 0.75,
+                "unaligned_token_count": 0,
+                "weak_span_count": 0,
+                "segment_confidence": 0.9,
+                "transcript_match_score": 88.0,
+                "bucket": "accepted",
+                "bucket_hint": "pass",
+                "reason_codes": [],
+            }
+            with patch(
+                "speechcraft_dataset.analyze_ctc_transcript_qc.load_ctc_model",
+                return_value=fake_bundle,
+            ) as load_model, patch(
+                "speechcraft_dataset.analyze_ctc_transcript_qc.score_clip",
+                return_value=fake_metrics,
+            ):
+                run_transcript_qc(run_root, {})
+
+            self.assertEqual(load_model.call_args.kwargs["local_files_only"], True)
+
+    def test_run_transcript_qc_allows_download_when_overridden(self) -> None:
+        from speechcraft_dataset.analyze_ctc_transcript_qc import CtcModelBundle
+
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            run_root = Path(temp_dir_raw)
+            artifacts = run_root / "artifacts"
+            audio_dir = artifacts / "candidate_review_clips"
+            audio_dir.mkdir(parents=True)
+            clip_path = audio_dir / "candidate_review_clip_000000.wav"
+            write_pcm16_mono(clip_path, [0.0] * 16000, 16000)
+            manifest = [
+                {
+                    "id": "candidate_review_clip_000000",
+                    "audio_path": "artifacts/candidate_review_clips/candidate_review_clip_000000.wav",
+                    "alignment_text": "hello",
+                    "duration_sec": 1.0,
+                    "buffer_id": "buffer_000000",
+                    "word_ids": [],
+                    "review_reason_codes": [],
+                }
+            ]
+            (artifacts / "candidate_review_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            fake_bundle = CtcModelBundle(model=object(), processor=object(), char_list=["H", "E", "L", "O", "|"], device="cpu")
+            fake_metrics = {
+                "transcript_score_method": TRANSCRIPT_SCORE_METHOD,
+                "ctc_mean_score": 0.91,
+                "ctc_min_span_score": 0.88,
+                "ctc_min_window_score": 0.88,
+                "ctc_min_token_score": 0.75,
+                "unaligned_token_count": 0,
+                "weak_span_count": 0,
+                "segment_confidence": 0.9,
+                "transcript_match_score": 88.0,
+                "bucket": "accepted",
+                "bucket_hint": "pass",
+                "reason_codes": [],
+            }
+            with patch(
+                "speechcraft_dataset.analyze_ctc_transcript_qc.load_ctc_model",
+                return_value=fake_bundle,
+            ) as load_model, patch(
+                "speechcraft_dataset.analyze_ctc_transcript_qc.score_clip",
+                return_value=fake_metrics,
+            ):
+                run_transcript_qc(run_root, {"transcript_qc_local_files_only": False})
+
+            self.assertEqual(load_model.call_args.kwargs["local_files_only"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

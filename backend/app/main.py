@@ -8,6 +8,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
+from .canonical_export import (
+    CanonicalExportConflictError,
+    create_canonical_export,
+    list_canonical_exports,
+    preview_canonical_export,
+)
 from .reference_clip_candidates import mark_dataset_clip_as_reference_candidate
 from .dataset_worker_client import run_dataset_worker_preflight
 from .defaults import resolve_asr_device_and_compute_type, resolve_whisper_model
@@ -54,6 +60,8 @@ from .clip_lab_audio_ops import (
 )
 from .native_cliplab import NativeClipLabStore
 from .models import (
+    CanonicalExportPreviewView,
+    CanonicalExportSummaryView,
     DatasetClipLabClipView,
     DatasetClipLabAudioOperationRequest,
     DatasetClipLabAudioStackRequest,
@@ -74,8 +82,6 @@ from .models import (
     DatasetRunView,
     DatasetSlicerResultsView,
     DatasetSlicerRerunRequest,
-    ExportPreview,
-    ExportRun,
     ImportBatchCreate,
     MarkReferenceClipCandidateRequest,
     ProcessingJobView,
@@ -349,6 +355,42 @@ def read_dataset_clip_lab(run_id: str) -> DatasetClipLabView:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ClipLabStateError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/dataset-runs/{run_id}/canonical-export-preview", response_model=CanonicalExportPreviewView)
+def read_canonical_export_preview(run_id: str) -> CanonicalExportPreviewView:
+    try:
+        return preview_canonical_export(repository, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CanonicalExportConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/dataset-runs/{run_id}/canonical-exports", response_model=CanonicalExportSummaryView)
+def post_canonical_export(run_id: str) -> CanonicalExportSummaryView:
+    try:
+        return create_canonical_export(repository, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CanonicalExportConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ClipLabValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ClipLabStateError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/dataset-runs/{run_id}/canonical-exports", response_model=list[CanonicalExportSummaryView])
+def read_canonical_exports(run_id: str) -> list[CanonicalExportSummaryView]:
+    try:
+        return list_canonical_exports(repository, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post(
@@ -694,22 +736,6 @@ def get_source_recording_artifact(recording_id: str) -> SourceRecordingArtifactV
         raise HTTPException(status_code=404, detail="Source recording not found") from exc
 
 
-@app.get("/api/projects/{project_id}/export-preview", response_model=ExportPreview)
-def get_export_preview(project_id: str) -> ExportPreview:
-    try:
-        return repository.get_export_preview(project_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Project not found") from exc
-
-
-@app.get("/api/projects/{project_id}/exports", response_model=list[ExportRun])
-def list_export_runs(project_id: str) -> list[ExportRun]:
-    try:
-        return repository.list_export_runs(project_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Project not found") from exc
-
-
 @app.post("/api/projects/{project_id}/media-cleanup")
 def cleanup_project_media(project_id: str) -> dict[str, object]:
     try:
@@ -815,16 +841,6 @@ def redo_slice(clip_id: str) -> dict[str, object]:
         return native_cliplab_store.redo_slice(clip_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Slice not found") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/projects/{project_id}/export", response_model=ExportRun)
-def export_project(project_id: str) -> ExportRun:
-    try:
-        return repository.export_project(project_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Project not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

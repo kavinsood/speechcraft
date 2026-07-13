@@ -10,7 +10,9 @@ Runtime boundary:
 - `workers/dataset/`: CUDA/audio stack for VAD, NeMo, ASR, MFA glue, alignment
   QC, SafeCutPoints, candidate assembly, and native-rate export.
 - MFA is configured as an external binary through `SPEECHCRAFT_MFA_BIN`.
-- MFA's model/temp root can be configured through `SPEECHCRAFT_MFA_ROOT_DIR`.
+- MFA's shared pretrained model root can be configured through `SPEECHCRAFT_MFA_MODEL_ROOT_DIR`.
+- `SPEECHCRAFT_MFA_ROOT_DIR` remains as a legacy alias for the shared model root.
+- MFA uses a per-run temporary directory under `artifacts/mfa_runtime` by default.
 - MFA runs with `--single_speaker` by default for processing-buffer WAVs.
 
 Initial check:

@@ -45,8 +45,6 @@ from .reference_cutpoint_assembly import (
     load_cutpoint_windows,
 )
 from .models import (
-    ExportRun,
-    ExportPreview,
     ImportBatch,
     ImportBatchCreate,
     JobKind,
@@ -827,45 +825,6 @@ class SQLiteRepository:
             ).all()
             return [self._processing_job_view(job) for job in jobs]
 
-    def list_export_runs(self, project_id: str) -> list[ExportRun]:
-        with self._session() as session:
-            self._get_batch(session, project_id)
-            runs = session.exec(
-                select(ExportRun).where(ExportRun.batch_id == project_id).order_by(ExportRun.created_at)
-            ).all()
-            return [self._normalize_export_run(run) for run in runs]
-
-    def get_export_preview(self, project_id: str) -> ExportPreview:
-        with self._session() as session:
-            batch = self._get_batch(session, project_id)
-            return ExportPreview(
-                project_id=batch.id,
-                manifest_path=f"exports/{batch.id}/dataset.list",
-                accepted_slice_count=0,
-                lines=[],
-            )
-
-
-    def export_project(self, project_id: str) -> ExportRun:
-        with self._session() as session:
-            self._get_batch(session, project_id)
-            export_id = self._new_id("export")
-            output_root = self.exports_root / project_id / export_id
-            manifest_path = output_root / "dataset.list"
-            export_run = ExportRun(
-                id=export_id,
-                batch_id=project_id,
-                status=JobStatus.COMPLETED,
-                output_root=str(output_root),
-                manifest_path=str(manifest_path),
-                accepted_clip_count=0,
-                completed_at=utc_now(),
-            )
-            session.add(export_run)
-            session.commit()
-            return self._normalize_export_run(export_run)
-
-
     def get_source_recording_window_media_path(
         self,
         recording_id: str,
@@ -927,7 +886,6 @@ class SQLiteRepository:
                 session.exec(delete(SourceRecordingArtifact).where(SourceRecordingArtifact.source_recording_id.in_(recording_ids)))
                 session.exec(delete(ProcessingJob).where(ProcessingJob.source_recording_id.in_(recording_ids)))
                 session.exec(delete(SourceRecording).where(SourceRecording.id.in_(recording_ids)))
-            session.exec(delete(ExportRun).where(ExportRun.batch_id == project_id))
             session.exec(delete(ImportBatch).where(ImportBatch.id == project_id))
             session.commit()
 
@@ -1936,7 +1894,6 @@ class SQLiteRepository:
         source_recordings: dict[tuple[str, str], SourceRecording] = {}
         projects = legacy.get("projects", {})
         clips_by_project = legacy.get("clips_by_project", {})
-        exports_by_project = legacy.get("exports_by_project", {})
         source_audio_overrides = self._legacy_seed_source_audio_overrides(clips_by_project)
 
         for project_id, batch_payload in projects.items():
@@ -1995,24 +1952,6 @@ class SQLiteRepository:
                 source_recordings[source_key] = source_recording
 
             session.flush()
-            for export_payload in exports_by_project.get(batch.id, []):
-                session.add(
-                    ExportRun(
-                        id=export_payload["id"],
-                        batch_id=batch.id,
-                        status=self._job_status_from_legacy(export_payload["status"]),
-                        output_root=export_payload["output_root"],
-                        manifest_path=export_payload["manifest_path"],
-                        accepted_clip_count=export_payload["accepted_clip_count"],
-                        failed_clip_count=export_payload["failed_clip_count"],
-                        created_at=datetime.fromisoformat(export_payload["created_at"].replace("Z", "+00:00")),
-                        completed_at=(
-                            datetime.fromisoformat(export_payload["completed_at"].replace("Z", "+00:00"))
-                            if export_payload.get("completed_at")
-                            else None
-                        ),
-                    )
-                )
 
     def _seed_demo(self, session: Session) -> None:
         batch = ImportBatch(id="phase1-demo", name="Phase 1 Demo Project")
@@ -2080,32 +2019,14 @@ class SQLiteRepository:
     def _project_summary(self, session: Session, batch: ImportBatch) -> ProjectSummary:
         created_at = self._as_utc(batch.created_at)
         updated_at = created_at
-        latest_export = session.exec(
-            select(ExportRun).where(ExportRun.batch_id == batch.id).order_by(ExportRun.created_at.desc())
-        ).first()
-        export_status = None
-        if latest_export is not None:
-            export_status = latest_export.status
-            updated_at = max(
-                updated_at,
-                self._as_utc(latest_export.completed_at or latest_export.created_at),
-            )
         return ProjectSummary(
             id=batch.id,
             name=batch.name,
             created_at=created_at,
             updated_at=updated_at,
-            export_status=export_status,
             active_prepared_output_group_id=batch.active_prepared_output_group_id,
             active_preparation_job_id=batch.active_preparation_job_id,
         )
-
-
-    def _normalize_export_run(self, run: ExportRun) -> ExportRun:
-        run.created_at = self._as_utc(run.created_at)
-        if run.completed_at is not None:
-            run.completed_at = self._as_utc(run.completed_at)
-        return run
 
 
 
@@ -4502,15 +4423,6 @@ class SQLiteRepository:
             JobStatus.RUNNING: "running",
             JobStatus.COMPLETED: "succeeded",
             JobStatus.FAILED: "failed",
-        }
-        return mapping[status]
-
-    def _export_status_from_job(self, status: JobStatus) -> str:
-        mapping = {
-            JobStatus.PENDING: "export_in_progress",
-            JobStatus.RUNNING: "export_in_progress",
-            JobStatus.COMPLETED: "export_succeeded",
-            JobStatus.FAILED: "export_failed",
         }
         return mapping[status]
 

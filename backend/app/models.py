@@ -293,7 +293,6 @@ class ImportBatch(SQLModel, table=True):
     active_preparation_job_id: str | None = None
 
     recordings: list["SourceRecording"] = Relationship(back_populates="batch", cascade_delete=True)
-    exports: list["ExportRun"] = Relationship(back_populates="batch", cascade_delete=True)
 
 
 class SourceRecording(SQLModel, table=True):
@@ -913,6 +912,32 @@ class DatasetClipLabView(SQLModel):
     clips: list[DatasetClipLabClipView] = Field(default_factory=list)
 
 
+class CanonicalExportBlockedReasonView(SQLModel):
+    clip_id: str
+    reasons: list[str] = Field(default_factory=list)
+
+
+class CanonicalExportPreviewView(SQLModel):
+    run_id: str
+    accepted_clip_count: int = 0
+    total_duration_sec: float = 0.0
+    original_audio_count: int = 0
+    edited_audio_count: int = 0
+    blocked_clip_count: int = 0
+    blocked_reasons: list[CanonicalExportBlockedReasonView] = Field(default_factory=list)
+
+
+class CanonicalExportSummaryView(SQLModel):
+    export_id: str
+    run_id: str
+    project_id: str
+    created_at: str
+    accepted_clip_count: int
+    total_duration_sec: float
+    snapshot_dir: str
+    manifest_path: str
+
+
 class DatasetClipLabPatchRequest(SQLModel):
     expected_manifest_sha256: str
     expected_clip_version: int
@@ -1011,29 +1036,6 @@ class ReferenceVariant(SQLModel, table=True):
         return self.num_samples / self.sample_rate if self.sample_rate else 0.0
 
 
-class ExportRun(SQLModel, table=True):
-    """Project-level export history for the current UI."""
-
-    id: str = Field(primary_key=True)
-    batch_id: str = Field(foreign_key="importbatch.id")
-    status: JobStatus = Field(default=JobStatus.PENDING, sa_column=Column(sql_enum(JobStatus)))
-    output_root: str
-    manifest_path: str
-    accepted_clip_count: int = 0
-    failed_clip_count: int = 0
-    created_at: datetime = Field(default_factory=utc_now)
-    completed_at: datetime | None = None
-
-    batch: ImportBatch | None = Relationship(back_populates="exports")
-
-
-class ExportPreview(SQLModel):
-    project_id: str
-    manifest_path: str
-    accepted_slice_count: int
-    lines: list[str]
-
-
 class ImportBatchCreate(SQLModel):
     id: str
     name: str
@@ -1044,7 +1046,6 @@ class ProjectSummary(SQLModel):
     name: str
     created_at: datetime
     updated_at: datetime
-    export_status: JobStatus | None = None
     active_prepared_output_group_id: str | None = None
     active_preparation_job_id: str | None = None
 

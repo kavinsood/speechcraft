@@ -77,14 +77,20 @@ def resolve_device(device_arg: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_ctc_model(model_name: str, device_arg: str) -> CtcModelBundle:
+def load_ctc_model(
+    model_name: str,
+    device_arg: str,
+    *,
+    local_files_only: bool = True,
+) -> CtcModelBundle:
     import torch
     from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
     device = resolve_device(device_arg)
-    log(f"loading CTC model {model_name!r} on {device} (download/cache via Hugging Face if needed)")
-    processor = Wav2Vec2Processor.from_pretrained(model_name)
-    model = Wav2Vec2ForCTC.from_pretrained(model_name)
+    source_mode = "local cache only" if local_files_only else "download/cache via Hugging Face if needed"
+    log(f"loading CTC model {model_name!r} on {device} ({source_mode})")
+    processor = Wav2Vec2Processor.from_pretrained(model_name, local_files_only=local_files_only)
+    model = Wav2Vec2ForCTC.from_pretrained(model_name, local_files_only=local_files_only)
     model.to(device)
     model.eval()
     vocab = processor.tokenizer.get_vocab()
@@ -811,6 +817,7 @@ def analyze_ctc_transcript_qc(
     export_best: int = 20,
     device: str = "auto",
     batch_size: int = 1,
+    local_files_only: bool = True,
 ) -> dict[str, Any]:
     del batch_size  # reserved for later batching; keep CLI stable
 
@@ -822,7 +829,7 @@ def analyze_ctc_transcript_qc(
         candidates = candidates[: max(0, max_clips)]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    bundle = load_ctc_model(model_name, device)
+    bundle = load_ctc_model(model_name, device, local_files_only=local_files_only)
 
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -943,7 +950,13 @@ def run_transcript_qc(
     device: str = "auto",
 ) -> dict[str, Any]:
     model = str(model_name or config.get("transcript_qc_model") or DEFAULT_MODEL)
-    bundle = load_ctc_model(model, device)
+    local_files_only = bool(
+        config.get(
+            "transcript_qc_local_files_only",
+            config.get("asr_local_files_only", True),
+        )
+    )
+    bundle = load_ctc_model(model, device, local_files_only=local_files_only)
     manifest_path = resolve_under_root(run_root, "artifacts/candidate_review_manifest.json")
     candidates = read_json_value(manifest_path)
     if not isinstance(candidates, list):
@@ -1019,6 +1032,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--export-best", type=int, default=20)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--allow-download",
+        action="store_true",
+        help="Allow Hugging Face downloads instead of requiring the model to already exist in the local cache.",
+    )
     return parser
 
 
@@ -1033,6 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
         export_best=args.export_best,
         device=args.device,
         batch_size=args.batch_size,
+        local_files_only=not args.allow_download,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

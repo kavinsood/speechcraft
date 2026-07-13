@@ -13,6 +13,7 @@ from .io import read_json_value, read_jsonl, resolve_under_root, sha256_file, wr
 
 DEFAULT_MFA_DICTIONARY = "english_us_mfa"
 DEFAULT_MFA_ACOUSTIC_MODEL = "english_mfa"
+DEFAULT_MFA_CONDA_BIN = Path.home() / ".conda/envs/speechcraft-mfa/bin/mfa"
 ANALYSIS_SAMPLE_RATE = 16000
 
 
@@ -98,9 +99,28 @@ def mfa_binary(config: dict[str, Any]) -> str:
             raise RuntimeError(f"MFA binary not found on PATH: {configured}")
         return binary
     binary = shutil.which("mfa")
+    if not binary and DEFAULT_MFA_CONDA_BIN.is_file():
+        return str(DEFAULT_MFA_CONDA_BIN.resolve())
     if not binary:
         raise RuntimeError("MFA binary not configured and not found on PATH")
     return binary
+
+
+def configured_mfa_model_root(config: dict[str, Any]) -> str:
+    return str(
+        config.get("mfa_model_root_dir")
+        or os.environ.get("SPEECHCRAFT_MFA_MODEL_ROOT_DIR")
+        or config.get("mfa_root_dir")
+        or os.environ.get("SPEECHCRAFT_MFA_ROOT_DIR")
+        or ""
+    ).strip()
+
+
+def configured_mfa_temp_dir(run_root: Path, config: dict[str, Any]) -> Path:
+    configured = str(config.get("mfa_temp_dir") or os.environ.get("SPEECHCRAFT_MFA_TEMP_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return resolve_under_root(run_root, "artifacts/mfa_runtime")
 
 
 def mfa_runtime_env(config: dict[str, Any], *, binary: str | None = None) -> dict[str, str]:
@@ -111,22 +131,51 @@ def mfa_runtime_env(config: dict[str, Any], *, binary: str | None = None) -> dic
     path_entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
     if bin_dir not in path_entries:
         env["PATH"] = os.pathsep.join([bin_dir, *path_entries])
-    mfa_root_dir = str(config.get("mfa_root_dir") or os.environ.get("SPEECHCRAFT_MFA_ROOT_DIR") or "").strip()
-    if mfa_root_dir:
-        root = Path(mfa_root_dir).expanduser()
+    mfa_model_root_dir = configured_mfa_model_root(config)
+    if mfa_model_root_dir:
+        root = Path(mfa_model_root_dir).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         env["MFA_ROOT_DIR"] = str(root.resolve())
     env.setdefault("TMPDIR", "/tmp")
     return env
 
 
+def ensure_mfa_models_available(binary: str, env: dict[str, str], dictionary: str, acoustic_model: str) -> None:
+    checks = [
+        ("dictionary", dictionary),
+        ("acoustic", acoustic_model),
+    ]
+    missing: list[str] = []
+    errors: list[str] = []
+    for kind, name in checks:
+        completed = subprocess.run(
+            [binary, "model", "inspect", kind, name],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            env=env,
+        )
+        if completed.returncode != 0:
+            missing.append(f"{kind}:{name}")
+            tail = (completed.stderr or completed.stdout or "").strip()
+            if tail:
+                errors.append(f"{kind}:{name}: {tail.splitlines()[-1]}")
+    if missing:
+        detail = "; ".join(errors) if errors else ", ".join(missing)
+        raise RuntimeError(f"MFA pretrained models unavailable ({', '.join(missing)}). {detail}")
+
+
 def run_mfa_command(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     binary = mfa_binary(config)
     corpus_dir = resolve_under_root(run_root, "artifacts/mfa_corpus")
     output_dir = resolve_under_root(run_root, "artifacts/mfa_output")
+    temp_dir = configured_mfa_temp_dir(run_root, config)
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     dictionary = str(config.get("mfa_dictionary") or os.environ.get("SPEECHCRAFT_MFA_DICTIONARY") or DEFAULT_MFA_DICTIONARY)
     acoustic_model = str(
         config.get("mfa_acoustic_model") or os.environ.get("SPEECHCRAFT_MFA_ACOUSTIC_MODEL") or DEFAULT_MFA_ACOUSTIC_MODEL
@@ -137,12 +186,15 @@ def run_mfa_command(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "align",
         "--clean",
         "--overwrite",
+        "--temporary_directory",
+        str(temp_dir),
     ]
     if bool(config.get("mfa_single_speaker", True)):
         command.append("--single_speaker")
     command.extend([str(corpus_dir), dictionary, acoustic_model, str(output_dir)])
     env = mfa_runtime_env(config, binary=binary)
     try:
+        ensure_mfa_models_available(binary, env, dictionary, acoustic_model)
         completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout_seconds, env=env)
         status = "ok" if completed.returncode == 0 else "failed"
         summary = {
@@ -158,10 +210,12 @@ def run_mfa_command(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
             "stderr_tail": completed.stderr[-4000:],
             "corpus_dir": "artifacts/mfa_corpus",
             "output_dir": "artifacts/mfa_output",
+            "temp_dir": str(temp_dir.relative_to(run_root)),
             "dictionary": dictionary,
             "acoustic_model": acoustic_model,
             "single_speaker": bool(config.get("mfa_single_speaker", True)),
-            "mfa_root_dir": env.get("MFA_ROOT_DIR"),
+            "mfa_model_root_dir": env.get("MFA_ROOT_DIR"),
+            "mfa_temp_dir": str(temp_dir),
             "reason_codes": [] if completed.returncode == 0 else ["mfa_command_failed"],
         }
     except subprocess.TimeoutExpired as exc:
@@ -178,11 +232,35 @@ def run_mfa_command(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
             "stderr_tail": decode_tail(exc.stderr),
             "corpus_dir": "artifacts/mfa_corpus",
             "output_dir": "artifacts/mfa_output",
+            "temp_dir": str(temp_dir.relative_to(run_root)),
             "dictionary": dictionary,
             "acoustic_model": acoustic_model,
             "single_speaker": bool(config.get("mfa_single_speaker", True)),
-            "mfa_root_dir": env.get("MFA_ROOT_DIR"),
+            "mfa_model_root_dir": env.get("MFA_ROOT_DIR"),
+            "mfa_temp_dir": str(temp_dir),
             "reason_codes": ["mfa_timeout"],
+        }
+    except RuntimeError as exc:
+        summary = {
+            "stage": "mfa",
+            "config_hash": str(config.get("config_hash") or ""),
+            "input_artifact_hashes": {
+                "mfa_corpus_manifest_json": sha256_file(resolve_under_root(run_root, "artifacts/mfa_corpus_manifest.json")),
+            },
+            "status": "failed",
+            "returncode": None,
+            "command": command,
+            "stdout_tail": "",
+            "stderr_tail": str(exc),
+            "corpus_dir": "artifacts/mfa_corpus",
+            "output_dir": "artifacts/mfa_output",
+            "temp_dir": str(temp_dir.relative_to(run_root)),
+            "dictionary": dictionary,
+            "acoustic_model": acoustic_model,
+            "single_speaker": bool(config.get("mfa_single_speaker", True)),
+            "mfa_model_root_dir": env.get("MFA_ROOT_DIR"),
+            "mfa_temp_dir": str(temp_dir),
+            "reason_codes": ["mfa_model_setup_failed"],
         }
     summary_path = resolve_under_root(run_root, "artifacts/mfa_summary.json")
     write_json(summary_path, summary)
@@ -236,9 +314,12 @@ def parse_oov_count_file(path: Path) -> dict[str, int]:
 def discover_mfa_oov_artifacts(run_root: Path, config: dict[str, Any]) -> dict[str, list[Path]]:
     run_artifacts = resolve_under_root(run_root, "artifacts")
     search_roots = [run_artifacts]
-    mfa_root_dir = str(config.get("mfa_root_dir") or os.environ.get("SPEECHCRAFT_MFA_ROOT_DIR") or "").strip()
-    if mfa_root_dir:
-        search_roots.append(Path(mfa_root_dir).expanduser())
+    temp_dir = configured_mfa_temp_dir(run_root, config)
+    if temp_dir not in search_roots:
+        search_roots.append(temp_dir)
+    mfa_model_root_dir = configured_mfa_model_root(config)
+    if mfa_model_root_dir:
+        search_roots.append(Path(mfa_model_root_dir).expanduser())
     names = {
         "oov_counts": ["oov_counts*.txt"],
         "oovs_found": ["oovs_found*.txt"],

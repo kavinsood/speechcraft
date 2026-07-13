@@ -235,12 +235,17 @@ class DatasetRunTests(TestCase):
             )
             session.commit()
 
-        with self.assertRaisesRegex(ValueError, "exactly one source WAV"):
-            create_dataset_run(
-                self.repository,
-                "project-1",
-                DatasetRunCreateRequest(single_speaker=False, source_recording_ids=["recording-1", "recording-2"]),
-            )
+        # Option C: multi-file diarization is supported (worker concatenates the
+        # per-source analysis variants, diarizes once, remaps regions per file).
+        run = create_dataset_run(
+            self.repository,
+            "project-1",
+            DatasetRunCreateRequest(single_speaker=False, source_recording_ids=["recording-1", "recording-2"]),
+        )
+        self.assertFalse(run.input_summary["single_speaker"])
+        self.assertEqual(
+            run.input_summary["source_recording_ids"], ["recording-1", "recording-2"]
+        )
 
     def test_refresh_indexes_rejected_manifest_and_completed_status(self) -> None:
         run = create_dataset_run(self.repository, "project-1", DatasetRunCreateRequest())

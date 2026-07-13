@@ -278,7 +278,6 @@ class RepositoryMediaTests(TestCase):
                     "id": "project-a",
                     "name": "Project A",
                     "status": "ready",
-                    "export_status": "idle",
                     "created_at": "2026-03-18T15:16:30Z",
                     "updated_at": "2026-03-18T15:16:30Z",
                 },
@@ -286,7 +285,6 @@ class RepositoryMediaTests(TestCase):
                     "id": "project-b",
                     "name": "Project B",
                     "status": "ready",
-                    "export_status": "idle",
                     "created_at": "2026-03-18T15:16:30Z",
                     "updated_at": "2026-03-18T15:16:30Z",
                 },
@@ -336,7 +334,6 @@ class RepositoryMediaTests(TestCase):
                     "id": "project-a",
                     "name": "Project A",
                     "status": "ready",
-                    "export_status": "idle",
                     "created_at": "2026-03-18T15:16:30Z",
                     "updated_at": "2026-03-18T15:16:30Z",
                 }
@@ -387,7 +384,6 @@ class RepositoryMediaTests(TestCase):
                     "id": "project-a",
                     "name": "Project A",
                     "status": "ready",
-                    "export_status": "idle",
                     "created_at": "2026-03-18T15:16:30Z",
                     "updated_at": "2026-03-18T15:16:30Z",
                 }
