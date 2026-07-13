@@ -13,6 +13,22 @@ venv/
 node_modules/
 dist/
 build/
+
+# Next.js (frontend/)
+frontend/.next/
+frontend/next-env.d.ts
+frontend/out/
+frontend/.turbo/
+frontend/tsconfig.tsbuildinfo
+frontend/*.tsbuildinfo
+
+# Editor / OS
+*.swp
+*.swo
+.idea/
+.vscode/
+Thumbs.db
+
 backend/data/*.json
 backend/data/*.db
 backend/data/*.db-shm
@@ -28,6 +44,3 @@ backend/data/qc_graph_exploration.zip
 backend/logs/
 repomix-output.xml
 docs/review_bundles/*.patch
-frontend/*.tsbuildinfo
-frontend/vite.config.js
-frontend/vite.config.d.ts

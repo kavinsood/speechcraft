@@ -62,7 +62,7 @@ Export is present in navigation as the downstream handoff stage. The backend has
 ## Project Layout
 
 - `backend/`: FastAPI API, SQLite persistence, media management, processing worker, slicing/QC/export logic
-- `frontend/`: React + Vite UI for the staged workstation
+- `frontend/`: Next.js UI — the setup wizard and the Lab workstation.
 - `docs/`: product, workflow, and implementation notes
 
 ## Core Docs
@@ -104,11 +104,11 @@ The combined backend/API dev output is also written to `backend/logs/dev-backend
 
 By default the Makefile uses:
 
-- frontend: `http://127.0.0.1:5173`
+- frontend: `http://127.0.0.1:3002`
 - backend: `http://127.0.0.1:8010`
 - backend docs: `http://127.0.0.1:8010/docs`
 
-The frontend API target can be overridden with `VITE_API_BASE_URL`.
+The frontend reaches the backend same-origin through the `/sc-api` rewrite (see `frontend/next.config.ts`); override the target with `SPEECHCRAFT_BACKEND_URL`.
 
 ## Local State
 
@@ -148,7 +148,7 @@ Useful focused checks:
 ```bash
 python3 -m compileall backend/app
 cd backend && uv run python -m unittest discover -s tests -p 'test_*.py'
-cd frontend && npm run build
+cd frontend && bun run build
 ```
 
 ## Current Status
