@@ -442,6 +442,269 @@ def build_summary(rows: list[dict[str, Any]], sample_rows: list[dict[str, Any]],
     return summary
 
 
+def plan_concat_layout(
+    variants: list[dict[str, Any]], gap_sec: float
+) -> list[dict[str, Any]]:
+    """Cumulative concat offsets (seconds) for each source variant, separated by
+    a silence gap so no speech region spans a file boundary. Pure/testable."""
+    layout: list[dict[str, Any]] = []
+    cursor = 0.0
+    for variant in variants:
+        duration = float(variant["analysis_duration_sec"])
+        start = cursor
+        end = start + duration
+        layout.append(
+            {
+                "source_audio_id": str(variant["source_audio_id"]),
+                "path": str(variant["path"]),
+                "start_sec": round(start, 6),
+                "end_sec": round(end, 6),
+                "duration_sec": round(duration, 6),
+            }
+        )
+        cursor = end + gap_sec
+    return layout
+
+
+def offset_vad_for_concat(
+    vad_segments: list[dict[str, Any]], layout: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Shift each source's VAD segments into concat time. Pure/testable."""
+    start_by_source = {row["source_audio_id"]: float(row["start_sec"]) for row in layout}
+    rows: list[dict[str, Any]] = []
+    for segment in vad_segments:
+        source_audio_id = str(segment["source_audio_id"])
+        offset = start_by_source.get(source_audio_id)
+        if offset is None:
+            continue
+        rows.append(
+            {
+                "id": str(segment["id"]),
+                "source_audio_id": "concat",
+                "analysis_start_sec": float(segment["analysis_start_sec"]) + offset,
+                "analysis_end_sec": float(segment["analysis_end_sec"]) + offset,
+            }
+        )
+    return rows
+
+
+def remap_concat_regions_to_sources(
+    regions: list[dict[str, Any]], layout: list[dict[str, Any]], sample_rate: int
+) -> list[dict[str, Any]]:
+    """Map concat-time speaker regions back to per-source local coordinates,
+    dropping anything that falls in an inter-file gap. Pure/testable."""
+    rows: list[dict[str, Any]] = []
+    for region in regions:
+        r_start = float(region["start_sec"])
+        r_end = float(region["end_sec"])
+        mid = (r_start + r_end) / 2.0
+        entry = next(
+            (e for e in layout if float(e["start_sec"]) <= mid < float(e["end_sec"])),
+            None,
+        )
+        if entry is None:
+            continue  # region sits in the silence gap between files
+        offset = float(entry["start_sec"])
+        local_start = max(r_start, float(entry["start_sec"])) - offset
+        local_end = min(r_end, float(entry["end_sec"])) - offset
+        if local_end <= local_start:
+            continue
+        start_sample = sec_to_sample(local_start, sample_rate)
+        end_sample = sec_to_sample(local_end, sample_rate)
+        speaker_id = str(region["speaker_id"])
+        source_audio_id = str(entry["source_audio_id"])
+        rows.append(
+            {
+                **region,
+                "speaker_id": speaker_id,
+                "source_audio_id": source_audio_id,
+                "analysis_audio_path": str(entry["path"]),
+                "start_sec": sample_to_sec(start_sample, sample_rate),
+                "end_sec": sample_to_sec(end_sample, sample_rate),
+                "start_sample": start_sample,
+                "end_sample": end_sample,
+                "id": f"{speaker_id}-{source_audio_id}-{start_sample}-{end_sample}",
+            }
+        )
+    return rows
+
+
+def build_concat_analysis_wav(
+    run_root: Path,
+    layout: list[dict[str, Any]],
+    *,
+    sample_rate: int,
+    gap_sec: float,
+) -> Path:
+    """Concatenate the per-source analysis variants (uniform mono @ sample_rate)
+    into one WAV with silence gaps between sources, via the ffmpeg concat demuxer."""
+    concat_dir = resolve_under_root(run_root, "artifacts/diarization/_concat")
+    if concat_dir.exists():
+        shutil.rmtree(concat_dir)
+    concat_dir.mkdir(parents=True, exist_ok=True)
+
+    silence_path = concat_dir / "silence.wav"
+    run_command(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", f"anullsrc=r={sample_rate}:cl=mono",
+            "-t", f"{gap_sec:.3f}", "-c:a", "pcm_s16le", str(silence_path),
+        ]
+    )
+
+    list_lines: list[str] = []
+    for index, entry in enumerate(layout):
+        abs_path = resolve_under_root(run_root, str(entry["path"])).resolve()
+        list_lines.append(f"file '{abs_path}'")
+        if index < len(layout) - 1:
+            list_lines.append(f"file '{silence_path.resolve()}'")
+    list_path = concat_dir / "concat_list.txt"
+    list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+
+    concat_path = concat_dir / "concat_analysis.wav"
+    run_command(
+        [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_path), "-ac", "1", "-ar", str(sample_rate),
+            "-c:a", "pcm_s16le", str(concat_path),
+        ]
+    )
+    return concat_path
+
+
+def _run_multi_file_diarization(
+    run_root: Path,
+    config: dict[str, Any],
+    variants: list[dict[str, Any]],
+    vad_segments: list[dict[str, Any]],
+    *,
+    sample_rate_by_source: dict[str, int],
+    analysis_path_by_source: dict[str, str],
+    sample_count: int,
+    sample_duration_sec: float,
+) -> dict[str, Any]:
+    """Diarize multiple sources on one concatenated timeline so speaker identity
+    is consistent across files, then remap regions back per source, and write
+    the same samples/selection/summary artifacts as the single-file path."""
+    import nemo  # noqa: F401
+    import torch
+
+    sample_rate = int(variants[0]["analysis_sample_rate"])
+    gap_sec = float(config.get("diarization_concat_gap_sec") or 1.0)
+    layout = plan_concat_layout(variants, gap_sec)
+    concat_path = build_concat_analysis_wav(run_root, layout, sample_rate=sample_rate, gap_sec=gap_sec)
+    concat_vad = offset_vad_for_concat(vad_segments, layout)
+    concat_duration = float(layout[-1]["end_sec"]) if layout else 0.0
+
+    window_sec = float(config.get("diarization_window_sec") or 900.0)
+    overlap_sec = float(config.get("diarization_window_overlap_sec") or 30.0)
+    diarization_device = str(config.get("diarization_device") or ("cuda" if torch.cuda.is_available() else "cpu"))
+    speaker_model = str(config.get("diarization_speaker_model") or "titanet_large")
+    max_speakers = int(config.get("diarization_max_speakers") or 6)
+    batch_size = int(config.get("diarization_batch_size") or 16)
+    save_embeddings = bool(config.get("diarization_save_embeddings", False))
+
+    diarization_dir = resolve_under_root(run_root, "artifacts/diarization/concat")
+    if diarization_dir.exists():
+        shutil.rmtree(diarization_dir)
+    diarization_dir.mkdir(parents=True, exist_ok=True)
+
+    window_summaries: list[dict[str, Any]] = []
+    for window_index, (start_sec, end_sec) in enumerate(window_ranges(concat_duration, window_sec, overlap_sec)):
+        window_summaries.append(
+            run_nemo_window(
+                analysis_path=concat_path,
+                source_audio_id="concat",
+                window_dir=diarization_dir / f"window_{window_index:03d}",
+                window_index=window_index,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                sample_rate=sample_rate,
+                vad_segments=concat_vad,
+                backend_version=getattr(nemo, "__version__", None),
+                diarization_device=diarization_device,
+                speaker_model=speaker_model,
+                max_speakers=max_speakers,
+                batch_size=batch_size,
+                save_embeddings=save_embeddings,
+            )
+        )
+
+    concat_rows, _stitching = stitch_window_speaker_labels(
+        window_summaries, getattr(nemo, "__version__", None), sample_rate, overlap_sec
+    )
+    rows = remap_concat_regions_to_sources(concat_rows, layout, sample_rate)
+
+    speaker_regions_path = resolve_under_root(run_root, "artifacts/speaker_regions.jsonl")
+    samples_manifest_path = resolve_under_root(run_root, "artifacts/speaker_samples_manifest.json")
+    selection_path = resolve_under_root(run_root, "artifacts/speaker_selection.json")
+    audio_variants_manifest_path = resolve_under_root(run_root, "artifacts/audio_variants_manifest.json")
+    vad_segments_path = resolve_under_root(run_root, "artifacts/vad_segments.jsonl")
+
+    sample_rows = write_speaker_samples(
+        run_root,
+        rows,
+        sample_rate_by_source=sample_rate_by_source,
+        analysis_path_by_source=analysis_path_by_source,
+        sample_count=sample_count,
+        sample_duration_sec=sample_duration_sec,
+    )
+    write_jsonl(speaker_regions_path, rows)
+    write_json(samples_manifest_path, sample_rows)
+
+    available_speaker_ids = sorted({str(row["speaker_id"]) for row in rows})
+    selection: dict[str, Any] = {
+        "mode": "diarization",
+        "selected": False,
+        "target_speaker_id": None,
+        "source": "pending_user_selection",
+        "available_speaker_ids": available_speaker_ids,
+        "updated_at": None,
+    }
+    if selection_path.exists():
+        existing = read_json(selection_path)
+        existing_target = str(existing.get("target_speaker_id") or "").strip()
+        if existing_target in available_speaker_ids:
+            selection = {
+                "mode": "diarization",
+                "selected": True,
+                "target_speaker_id": existing_target,
+                "source": str(existing.get("source") or "user"),
+                "available_speaker_ids": available_speaker_ids,
+                "updated_at": existing.get("updated_at"),
+            }
+    write_json(selection_path, selection)
+
+    summary = build_summary(
+        rows,
+        sample_rows,
+        stage="diarization",
+        config=config,
+        input_hashes={
+            "audio_variants_manifest": sha256_file(audio_variants_manifest_path),
+            "vad_segments_jsonl": sha256_file(vad_segments_path),
+        },
+        backend="nemo_clustering_diarizer_concat_multifile",
+        backend_version=getattr(nemo, "__version__", None),
+        mode=str(config.get("mode") or "diarization"),
+        reason_codes=[] if selection["selected"] else ["speaker_selection_required"],
+        extra={
+            "selection_written": True,
+            "multi_file": True,
+            "source_count": len(variants),
+            "source_audio_ids": [str(v["source_audio_id"]) for v in variants],
+            "concat_gap_sec": gap_sec,
+        },
+    )
+    summary["output_hashes"] = {
+        "speaker_regions_jsonl": sha256_file(speaker_regions_path),
+        "speaker_samples_manifest_json": sha256_file(samples_manifest_path),
+        "speaker_selection_json": sha256_file(selection_path),
+    }
+    write_json(resolve_under_root(run_root, "artifacts/speaker_regions_summary.json"), summary)
+    return summary
+
+
 def run_diarization(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     audio_variants_manifest_path = resolve_under_root(run_root, "artifacts/audio_variants_manifest.json")
     vad_segments_path = resolve_under_root(run_root, "artifacts/vad_segments.jsonl")
@@ -500,8 +763,17 @@ def run_diarization(run_root: Path, config: dict[str, Any]) -> dict[str, Any]:
         write_json(resolve_under_root(run_root, "artifacts/speaker_regions_summary.json"), summary)
         return summary
 
-    if len(variants) != 1:
-        raise ValueError("Multi-speaker diarization currently supports exactly one source WAV per run")
+    if len(variants) > 1:
+        return _run_multi_file_diarization(
+            run_root,
+            config,
+            variants,
+            vad_segments,
+            sample_rate_by_source=sample_rate_by_source,
+            analysis_path_by_source=analysis_path_by_source,
+            sample_count=sample_count,
+            sample_duration_sec=sample_duration_sec,
+        )
 
     try:
         import nemo

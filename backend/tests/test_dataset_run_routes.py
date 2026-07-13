@@ -114,12 +114,10 @@ class DatasetRunRouteTests(TestCase):
         self.assertEqual(log.text, "worker output")
         self.assertTrue(create.call_args.args[2].single_speaker)
 
-    def test_create_route_surfaces_multi_speaker_validation_errors(self) -> None:
+    def test_create_route_surfaces_validation_errors(self) -> None:
         with patch(
             "app.main.create_dataset_run",
-            side_effect=ValueError(
-                "Multi-speaker diarization currently supports exactly one source WAV per run"
-            ),
+            side_effect=ValueError("Dataset run requires at least one source recording"),
         ):
             with self.assertRaises(HTTPException) as exc:
                 create_project_dataset_run(
@@ -128,7 +126,7 @@ class DatasetRunRouteTests(TestCase):
                 )
 
         self.assertEqual(exc.exception.status_code, 400)
-        self.assertIn("exactly one source WAV", str(exc.exception.detail))
+        self.assertIn("at least one source recording", str(exc.exception.detail))
 
     def test_slicer_rerun_and_results_routes_serialize(self) -> None:
         run = run_view()
